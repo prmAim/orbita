@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling==1.33.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "orbita"
+version = "0.1.0"
+description = "Orbita AI application foundation"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "httpx==0.28.1",
+    "langchain>=1.4.9,<2",
+    "langchain-core>=1.7.5,<2",
+    "langchain-openai>=1.7.4,<2",
+    "langfuse>=5.1.0,<6",
+    "langgraph>=1.2.19,<2",
+    "langsmith>=0.14.17,<1",
+    "pydantic>=2.14.2,<3",
+    "pydantic-settings>=2.16.2,<3",
+]
+
+[project.scripts]
+orbita-check = "orbita.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/orbita"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.17.3",
+]
+
+[tool.ruff]
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]
