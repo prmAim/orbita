@@ -58,6 +58,7 @@ uv run --offline --no-sync ruff format --check src tests tools
 
 ## Документация
 
+- [Локальная проверка исполнения по задаче №6](docs/operations/subscriber-execution-check.md).
 - [Запуск и остановка локальных сервисов](docs/operations/local-services.md).
 - [Автономная установка и восстановление](docs/operations/offline-environment.md).
 - [Приёмка подключения](docs/operations/acceptance-2026-11-08.md).
