@@ -39,7 +39,7 @@ Langfuse имеет доступ ко всем проектам. LangSmith Cloud
 
 - `src/orbita/`: настройки, модель, граф, трассировка и CLI.
 - `tests/`: проверки графа, конфигурации, маршрута локального API и offline-набора.
-- `tools/`: автономная установка и lockfile сборочных зависимостей.
+- `tools/`: автономная установка, lockfile сборочных зависимостей и офлайн-имитаторы Wayfinder (`simulate_*.py`).
 - `docs/operations/`: эксплуатационные инструкции и результаты приёмки.
 - `.github/workflows/ci.yml`: проверки без секретов и внешней модели.
 
@@ -59,6 +59,12 @@ uv run --offline --no-sync ruff format --check src tests tools
 ## Документация
 
 - [Локальная проверка исполнения по задаче №6](docs/operations/subscriber-execution-check.md).
+- [Термины пропорционального повторения сделок](GLOSSARY.md).
+- [Карта Wayfinder: независимое пропорциональное повторение сделок](https://github.com/prmAim/orbita/issues/1).
+- [Текущая спецификация повторения сделок](https://github.com/prmAim/orbita/issues/10) — правила, сценарии приёмки и задачи реализации.
+- [Технический протокол сверки и хранения v0.1](https://github.com/prmAim/orbita/issues/11#issuecomment-6725242827) — исходный проект. Офлайн-имитаторы в `tools/` воспроизводят отдельные сценарии на синтетических данных. Для первой версии [выбран PostgreSQL](https://github.com/prmAim/orbita/issues/17).
+- [Проект протокола комиссии и доступных ресурсов v0.2](https://github.com/prmAim/orbita/issues/3#issuecomment-6725611872) — формулы, резервы и открытые условия проверки API/тарифа.
+- [Проектный протокол времени и возраста исполнений v0.1](https://github.com/prmAim/orbita/issues/15#issuecomment-6725904900) — правила времени и сбоев, требования к проверке часов на целевом ПК.
 - [Запуск и остановка локальных сервисов](docs/operations/local-services.md).
 - [Автономная установка и восстановление](docs/operations/offline-environment.md).
 - [Приёмка подключения](docs/operations/acceptance-2026-11-08.md).
