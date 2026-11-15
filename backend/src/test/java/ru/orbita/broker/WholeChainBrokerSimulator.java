@@ -23,10 +23,35 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
       INSTRUMENT = "[ТЕСТ] SBER";
   public static final BigDecimal PRICE = new BigDecimal("100"), COMMISSION = BigDecimal.ONE;
 
+  public record Security(String id, BigDecimal price) {}
+
+  private static final List<Security> SECURITIES =
+      List.of(
+          new Security("[ТЕСТ] SBER", new BigDecimal("100")),
+          new Security("[ТЕСТ] GAZP", new BigDecimal("150")),
+          new Security("[ТЕСТ] LKOH", new BigDecimal("200")),
+          new Security("[ТЕСТ] ROSN", new BigDecimal("250")),
+          new Security("[ТЕСТ] NVTK", new BigDecimal("300")),
+          new Security("[ТЕСТ] GMKN", new BigDecimal("350")),
+          new Security("[ТЕСТ] PLZL", new BigDecimal("400")),
+          new Security("[ТЕСТ] TATN", new BigDecimal("450")),
+          new Security("[ТЕСТ] SNGS", new BigDecimal("500")),
+          new Security("[ТЕСТ] VTBR", new BigDecimal("550")),
+          new Security("[ТЕСТ] MOEX", new BigDecimal("600")),
+          new Security("[ТЕСТ] AFLT", new BigDecimal("650")),
+          new Security("[ТЕСТ] CHMF", new BigDecimal("700")),
+          new Security("[ТЕСТ] MAGN", new BigDecimal("750")),
+          new Security("[ТЕСТ] ALRS", new BigDecimal("800")));
+
+  public List<Security> securities() {
+    return SECURITIES;
+  }
+
   public record Rpc(String method, Object request, String remoteAddress, Instant receivedAt) {}
 
   private record Execution(
       String account,
+      String instrument,
       String id,
       String order,
       BrokerGateway.Side side,
@@ -37,7 +62,16 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
   private final List<Rpc> audit = new CopyOnWriteArrayList<>();
   private final List<Execution> executions = new ArrayList<>();
   private final Map<UUID, SimulatedOrder> orders = new LinkedHashMap<>();
-  private final Map<String, Long> positions = new HashMap<>();
+
+  private record PositionKey(String account, String instrument) {}
+
+  private static final class Resources {
+    BigDecimal money = new BigDecimal("10000");
+    long buy = 100, sell = 100, nextFill = Long.MAX_VALUE;
+  }
+
+  private final Map<PositionKey, Long> positions = new HashMap<>();
+  private final Map<String, Resources> resources = new LinkedHashMap<>();
   private final Map<String, BigDecimal> capitals = new HashMap<>();
   private final List<StreamObserver<TradesStreamResponse>> streams = new CopyOnWriteArrayList<>();
   private final BlockingQueue<Boolean> subscriptions = new LinkedBlockingQueue<>();
@@ -45,8 +79,6 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
       Executors.newSingleThreadScheduledExecutor(
           Thread.ofPlatform().daemon().name("whole-chain-bank-heartbeat").factory());
   private final BrokerTlsTestSupport.Simulator tls;
-  private BigDecimal ownMoney = new BigDecimal("10000");
-  private long maximumBuy = 100, maximumSell = 100, nextPostFill = Long.MAX_VALUE;
   private boolean closed;
 
   public static WholeChainBrokerSimulator open(Path certificateDirectory) throws Exception {
@@ -55,8 +87,7 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
   }
 
   private WholeChainBrokerSimulator(Path directory) throws Exception {
-    positions.put(SOURCE, 0L);
-    positions.put(MIRROR, 0L);
+    for (var security : SECURITIES) resources.put(security.id(), new Resources());
     capitals.put(SOURCE, new BigDecimal("10000"));
     capitals.put(MIRROR, new BigDecimal("10000"));
     var interceptor =
@@ -135,7 +166,7 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
         "synthetic localhost whole-chain fixture",
         Set.of(SOURCE, MIRROR),
         MIRROR,
-        Set.of(INSTRUMENT),
+        SECURITIES.stream().map(Security::id).collect(java.util.stream.Collectors.toSet()),
         "RUB",
         expiresAt,
         true,
@@ -166,16 +197,28 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
   }
 
   public synchronized void setResources(BigDecimal money, long buyLots, long sellLots) {
+    setResources(INSTRUMENT, money, buyLots, sellLots);
+  }
+
+  public synchronized void setResources(
+      String instrument, BigDecimal money, long buyLots, long sellLots) {
+    checkInstrument(instrument);
     if (money == null || money.signum() < 0 || buyLots < 0 || sellLots < 0)
       throw new IllegalArgumentException("Nonnegative resources required");
-    ownMoney = money;
-    maximumBuy = buyLots;
-    maximumSell = sellLots;
+    var value = resources.get(instrument);
+    value.money = money;
+    value.buy = buyLots;
+    value.sell = sellLots;
   }
 
   public synchronized void setNextPostFill(long lots) {
+    setNextPostFill(INSTRUMENT, lots);
+  }
+
+  public synchronized void setNextPostFill(String instrument, long lots) {
+    checkInstrument(instrument);
     if (lots < 0) throw new IllegalArgumentException("Nonnegative fill required");
-    nextPostFill = lots;
+    resources.get(instrument).nextFill = lots;
   }
 
   public synchronized String brokerOrderId(UUID requestId) {
@@ -183,7 +226,13 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
   }
 
   public synchronized long position(String account) {
-    return positions.getOrDefault(account, 0L);
+    return position(account, INSTRUMENT);
+  }
+
+  public synchronized long position(String account, String instrument) {
+    checkAccount(account);
+    checkInstrument(instrument);
+    return positions.getOrDefault(new PositionKey(account, instrument), 0L);
   }
 
   public synchronized void disconnectSource() {
@@ -209,6 +258,18 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
       long lots,
       BigDecimal price,
       Instant at) {
+    emitSource(INSTRUMENT, tradeId, sourceOrderId, side, lots, price, at);
+  }
+
+  public synchronized void emitSource(
+      String instrument,
+      String tradeId,
+      String sourceOrderId,
+      BrokerGateway.Side side,
+      long lots,
+      BigDecimal price,
+      Instant at) {
+    checkInstrument(instrument);
     if (closed
         || tradeId == null
         || tradeId.isBlank()
@@ -220,7 +281,8 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
     positive(price);
     if (executions.stream().anyMatch(e -> e.account().equals(SOURCE) && e.id().equals(tradeId)))
       throw new IllegalArgumentException("Duplicate natural trade");
-    var execution = new Execution(SOURCE, tradeId, sourceOrderId, side, lots, price, at);
+    var execution =
+        new Execution(SOURCE, instrument, tradeId, sourceOrderId, side, lots, price, at);
     addExecution(execution);
     sendSource(execution);
   }
@@ -232,7 +294,7 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
                 OrderTrades.newBuilder()
                     .setAccountId(SOURCE)
                     .setOrderId(execution.order())
-                    .setInstrumentUid(INSTRUMENT)
+                    .setInstrumentUid(execution.instrument())
                     .setDirection(direction(execution.side()))
                     .addTrades(
                         OrderTrade.newBuilder()
@@ -250,10 +312,11 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
 
   private void addExecution(Execution execution) {
     long delta = execution.side() == BrokerGateway.Side.BUY ? execution.lots() : -execution.lots();
-    long position = Math.addExact(positions.getOrDefault(execution.account(), 0L), delta);
+    var key = new PositionKey(execution.account(), execution.instrument());
+    long position = Math.addExact(positions.getOrDefault(key, 0L), delta);
     if (position < 0)
       throw new IllegalArgumentException("Simulator does not permit short positions");
-    positions.put(execution.account(), position);
+    positions.put(key, position);
     executions.add(execution);
   }
 
@@ -288,8 +351,22 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
   }
 
   private void checkInstrument(String id) {
-    if (!INSTRUMENT.equals(id))
-      throw Status.NOT_FOUND.withDescription("Synthetic instrument only").asRuntimeException();
+    security(id);
+  }
+
+  private Security security(String id) {
+    return SECURITIES.stream()
+        .filter(s -> s.id().equals(id))
+        .findFirst()
+        .orElseThrow(
+            () ->
+                Status.NOT_FOUND.withDescription("Synthetic instrument only").asRuntimeException());
+  }
+
+  private BigDecimal securitiesValue(String account) {
+    return SECURITIES.stream()
+        .map(s -> s.price().multiply(BigDecimal.valueOf(position(account, s.id()))))
+        .reduce(BigDecimal.ZERO, BigDecimal::add);
   }
 
   private SimulatedOrder requireOrder(UUID id) {
@@ -318,7 +395,7 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
           OrderState.newBuilder()
               .setOrderId(bankId)
               .setOrderRequestId(request.getOrderId())
-              .setInstrumentUid(INSTRUMENT)
+              .setInstrumentUid(request.getInstrumentId())
               .setDirection(request.getDirection())
               .setLotsRequested(request.getQuantity())
               .setLotsExecuted(filled())
@@ -345,6 +422,7 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
     var fill =
         new Execution(
             MIRROR,
+            order.request.getInstrumentId(),
             "TEST-FILL-" + order.request.getOrderId() + "-" + (order.fills.size() + 1),
             order.bankId,
             order.request.getDirection() == OrderDirection.ORDER_DIRECTION_BUY
@@ -393,8 +471,8 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
             InstrumentResponse.newBuilder()
                 .setInstrument(
                     ru.tinkoff.piapi.contract.v1.Instrument.newBuilder()
-                        .setUid(INSTRUMENT)
-                        .setTicker(INSTRUMENT)
+                        .setUid(request.getId())
+                        .setTicker(request.getId())
                         .setLot(1)
                         .setCurrency("rub")
                         .setInstrumentType("share")
@@ -414,13 +492,25 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
       public void getPortfolio(PortfolioRequest request, StreamObserver<PortfolioResponse> out) {
         synchronized (WholeChainBrokerSimulator.this) {
           checkAccount(request.getAccountId());
-          reply(
-              out,
+          BigDecimal shares = securitiesValue(request.getAccountId());
+          var portfolio =
               PortfolioResponse.newBuilder()
                   .setAccountId(request.getAccountId())
                   .setTotalAmountPortfolio(money(capitals.get(request.getAccountId())))
-                  .setTotalAmountCurrencies(money(capitals.get(request.getAccountId())))
-                  .build());
+                  .setTotalAmountShares(money(shares))
+                  .setTotalAmountCurrencies(
+                      money(capitals.get(request.getAccountId()).subtract(shares)));
+          for (var security : SECURITIES) {
+            long lots = position(request.getAccountId(), security.id());
+            if (lots != 0)
+              portfolio.addPositions(
+                  PortfolioPosition.newBuilder()
+                      .setInstrumentUid(security.id())
+                      .setInstrumentType("share")
+                      .setQuantity(TInvestBrokerGateway.quotation(BigDecimal.valueOf(lots)))
+                      .setCurrentPrice(money(security.price())));
+          }
+          reply(out, portfolio.build());
         }
       }
 
@@ -428,13 +518,15 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
         synchronized (WholeChainBrokerSimulator.this) {
           checkAccount(request.getAccountId());
           var result = PositionsResponse.newBuilder().setAccountId(request.getAccountId());
-          long pieces = positions.get(request.getAccountId());
-          if (pieces != 0)
-            result.addSecurities(
-                PositionsSecurities.newBuilder()
-                    .setInstrumentUid(INSTRUMENT)
-                    .setBalance(pieces)
-                    .setBlocked(0));
+          for (var security : SECURITIES) {
+            long pieces = position(request.getAccountId(), security.id());
+            if (pieces != 0)
+              result.addSecurities(
+                  PositionsSecurities.newBuilder()
+                      .setInstrumentUid(security.id())
+                      .setBalance(pieces)
+                      .setBlocked(0));
+          }
           reply(out, result.build());
         }
       }
@@ -458,7 +550,7 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
                 OperationItem.newBuilder()
                     .setId("TEST-OP-" + execution.id())
                     .setBrokerAccountId(execution.account())
-                    .setInstrumentUid(INSTRUMENT)
+                    .setInstrumentUid(execution.instrument())
                     .setType(
                         execution.side() == BrokerGateway.Side.BUY
                             ? OperationType.OPERATION_TYPE_BUY
@@ -486,14 +578,18 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
         reply(
             out,
             GetOrderBookResponse.newBuilder()
-                .setInstrumentUid(INSTRUMENT)
+                .setInstrumentUid(request.getInstrumentId())
                 .addAsks(
                     Order.newBuilder()
-                        .setPrice(TInvestBrokerGateway.quotation(PRICE))
+                        .setPrice(
+                            TInvestBrokerGateway.quotation(
+                                security(request.getInstrumentId()).price()))
                         .setQuantity(100))
                 .addBids(
                     Order.newBuilder()
-                        .setPrice(TInvestBrokerGateway.quotation(PRICE))
+                        .setPrice(
+                            TInvestBrokerGateway.quotation(
+                                security(request.getInstrumentId()).price()))
                         .setQuantity(100))
                 .build());
       }
@@ -504,7 +600,7 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
         reply(
             out,
             GetTradingStatusResponse.newBuilder()
-                .setInstrumentUid(INSTRUMENT)
+                .setInstrumentUid(request.getInstrumentId())
                 .setTradingStatus(SecurityTradingStatus.SECURITY_TRADING_STATUS_NORMAL_TRADING)
                 .setLimitOrderAvailableFlag(true)
                 .setMarketOrderAvailableFlag(true)
@@ -534,16 +630,34 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
         synchronized (WholeChainBrokerSimulator.this) {
           checkAccount(request.getAccountId());
           checkInstrument(request.getInstrumentId());
+          var limit = resources.get(request.getInstrumentId());
+          BigDecimal cash =
+              capitals
+                  .get(request.getAccountId())
+                  .subtract(securitiesValue(request.getAccountId()))
+                  .max(BigDecimal.ZERO)
+                  .min(limit.money);
+          BigDecimal price =
+              TInvestBrokerGateway.decimal(
+                  request.getPrice().getUnits(), request.getPrice().getNano());
+          long maxBuy =
+              price.signum() > 0
+                  ? Math.min(limit.buy, cash.divideToIntegralValue(price).longValueExact())
+                  : 0;
           reply(
               out,
               GetMaxLotsResponse.newBuilder()
                   .setCurrency("rub")
                   .setBuyLimits(
                       GetMaxLotsResponse.BuyLimitsView.newBuilder()
-                          .setBuyMoneyAmount(TInvestBrokerGateway.quotation(ownMoney))
-                          .setBuyMaxLots(maximumBuy))
+                          .setBuyMoneyAmount(TInvestBrokerGateway.quotation(cash))
+                          .setBuyMaxLots(maxBuy))
                   .setSellLimits(
-                      GetMaxLotsResponse.SellLimitsView.newBuilder().setSellMaxLots(maximumSell))
+                      GetMaxLotsResponse.SellLimitsView.newBuilder()
+                          .setSellMaxLots(
+                              Math.min(
+                                  limit.sell,
+                                  position(request.getAccountId(), request.getInstrumentId()))))
                   .build());
         }
       }
@@ -575,13 +689,14 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
           if (orders.containsKey(id)) throw Status.ALREADY_EXISTS.asRuntimeException();
           var order = new SimulatedOrder(request);
           orders.put(id, order);
-          fill(order, Math.min(request.getQuantity(), nextPostFill), Instant.now());
-          nextPostFill = Long.MAX_VALUE;
+          var limit = resources.get(request.getInstrumentId());
+          fill(order, Math.min(request.getQuantity(), limit.nextFill), Instant.now());
+          limit.nextFill = Long.MAX_VALUE;
           reply(
               out,
               PostOrderResponse.newBuilder()
                   .setOrderId(order.bankId)
-                  .setInstrumentUid(INSTRUMENT)
+                  .setInstrumentUid(request.getInstrumentId())
                   .setDirection(request.getDirection())
                   .setLotsRequested(request.getQuantity())
                   .setLotsExecuted(order.filled())

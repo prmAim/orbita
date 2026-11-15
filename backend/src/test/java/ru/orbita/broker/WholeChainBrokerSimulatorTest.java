@@ -14,6 +14,89 @@ class WholeChainBrokerSimulatorTest {
   @TempDir Path directory;
 
   @Test
+  void realSdkDistinguishesSecurityIdentityAndQuotes() throws Exception {
+    try (var bank = WholeChainBrokerSimulator.open(directory);
+        var gateway = bank.gateway(Clock.systemUTC(), BrokerTlsTestSupport.NO_EVENTS)) {
+      assertThat(gateway.instrument("[ТЕСТ] SBER").id()).isEqualTo("[ТЕСТ] SBER");
+      assertThat(gateway.instrument("[ТЕСТ] GAZP").id()).isEqualTo("[ТЕСТ] GAZP");
+      assertThat(gateway.bestOppositePrice("[ТЕСТ] SBER", BrokerGateway.Side.BUY))
+          .contains(new BigDecimal("100.000000000"));
+      assertThat(gateway.bestOppositePrice("[ТЕСТ] GAZP", BrokerGateway.Side.SELL))
+          .contains(new BigDecimal("150.000000000"));
+      var request =
+          new BrokerGateway.OrderRequest(
+              WholeChainBrokerSimulator.MIRROR,
+              UUID.randomUUID(),
+              "[ТЕСТ] GAZP",
+              BrokerGateway.Side.BUY,
+              2,
+              new BigDecimal("150.45"));
+      assertThat(gateway.resources(request).instrument().id()).isEqualTo("[ТЕСТ] GAZP");
+      assertThat(gateway.resources(request).qualified()).isTrue();
+    }
+  }
+
+  @Test
+  void realOrdersResourcesPositionsAndHistoryStayWithinTheirSecurity() throws Exception {
+    try (var bank = WholeChainBrokerSimulator.open(directory);
+        var gateway = bank.gateway(Clock.systemUTC(), BrokerTlsTestSupport.NO_EVENTS)) {
+      var sber =
+          new BrokerGateway.OrderRequest(
+              WholeChainBrokerSimulator.MIRROR,
+              UUID.randomUUID(),
+              "[ТЕСТ] SBER",
+              BrokerGateway.Side.BUY,
+              4,
+              new BigDecimal("100.30"));
+      var gazp =
+          new BrokerGateway.OrderRequest(
+              WholeChainBrokerSimulator.MIRROR,
+              UUID.randomUUID(),
+              "[ТЕСТ] GAZP",
+              BrokerGateway.Side.BUY,
+              3,
+              new BigDecimal("150.45"));
+      bank.setNextPostFill(0);
+      assertThat(gateway.post(sber).status()).isEqualTo(BrokerGateway.OrderStatus.NEW);
+      assertThat(gateway.post(gazp).status()).isEqualTo(BrokerGateway.OrderStatus.FILLED);
+      bank.fillOrder(sber.requestId(), 2, Instant.now());
+      assertThat(gateway.cancel(sber, bank.brokerOrderId(sber.requestId())).lotsExecuted())
+          .isEqualTo(2);
+      assertThat(gateway.reconcile(gazp).status()).isEqualTo(BrokerGateway.OrderStatus.FILLED);
+      assertThat(gateway.reconcile(gazp).lotsExecuted()).isEqualTo(3);
+      var positions =
+          gateway.positions(WholeChainBrokerSimulator.MIRROR).positions().stream()
+              .collect(
+                  java.util.stream.Collectors.toMap(
+                      BrokerGateway.Position::instrumentId, BrokerGateway.Position::totalPieces));
+      assertThat(positions).containsOnlyKeys("[ТЕСТ] SBER", "[ТЕСТ] GAZP");
+      assertThat(positions.get("[ТЕСТ] SBER")).isEqualByComparingTo("2");
+      assertThat(positions.get("[ТЕСТ] GAZP")).isEqualByComparingTo("3");
+      var history =
+          gateway.mirrorHistory(Instant.now().minusSeconds(60), Instant.now()).executions();
+      assertThat(history).hasSize(2);
+      assertThat(history)
+          .anySatisfy(
+              e -> {
+                assertThat(e.instrumentId()).isEqualTo("[ТЕСТ] SBER");
+                assertThat(e.lots()).isEqualByComparingTo("2");
+              });
+      assertThat(history)
+          .anySatisfy(
+              e -> {
+                assertThat(e.instrumentId()).isEqualTo("[ТЕСТ] GAZP");
+                assertThat(e.lots()).isEqualByComparingTo("3");
+              });
+      bank.setResources(BigDecimal.ZERO, 0, 0);
+      assertThat(gateway.resources(sber).buyMaxLots()).isZero();
+      assertThat(gateway.resources(gazp).ownMoney()).isEqualByComparingTo("9350");
+      assertThat(gateway.resources(gazp).buyMaxLots()).isEqualTo(62);
+      assertThat(gateway.capital(WholeChainBrokerSimulator.MIRROR).totalRub())
+          .isEqualByComparingTo("10000");
+    }
+  }
+
+  @Test
   void realSdkReadsQualifiedCapitalResourcesAndNaturalSourceExecutionHistory() throws Exception {
     try (var bank = WholeChainBrokerSimulator.open(directory);
         var gateway = bank.gateway(Clock.systemUTC(), BrokerTlsTestSupport.NO_EVENTS)) {

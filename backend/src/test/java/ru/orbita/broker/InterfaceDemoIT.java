@@ -36,6 +36,41 @@ class InterfaceDemoIT {
   @TempDir Path temporary;
   private static final String SYNTHETIC_PASSWORD = "synthetic-whole-chain-owner-password";
 
+  private record ExpectedSecurity(
+      String ticker,
+      String price,
+      long sourceLots,
+      long copiedLots,
+      int executions,
+      int posts,
+      int fills,
+      long skipped,
+      int buys,
+      int sells) {
+    String id() {
+      return "[ТЕСТ] " + ticker;
+    }
+  }
+
+  // Independent literal outcomes from the worked preview matrix, never recomputed from orders.
+  private static final List<ExpectedSecurity> EXPECTED_SECURITIES =
+      List.of(
+          new ExpectedSecurity("SBER", "100", 5, 2, 6, 3, 4, 3, 4, 2),
+          new ExpectedSecurity("GAZP", "150", 4, 4, 3, 3, 3, 0, 2, 1),
+          new ExpectedSecurity("LKOH", "200", 4, 4, 3, 3, 3, 0, 2, 1),
+          new ExpectedSecurity("ROSN", "250", 7, 5, 3, 3, 3, 2, 2, 1),
+          new ExpectedSecurity("NVTK", "300", 4, 1, 3, 2, 2, 3, 2, 1),
+          new ExpectedSecurity("GMKN", "350", 2, 2, 1, 1, 1, 0, 1, 0),
+          new ExpectedSecurity("PLZL", "400", 3, 3, 1, 1, 1, 0, 1, 0),
+          new ExpectedSecurity("TATN", "450", 4, 4, 1, 1, 1, 0, 1, 0),
+          new ExpectedSecurity("SNGS", "500", 5, 5, 1, 1, 1, 0, 1, 0),
+          new ExpectedSecurity("VTBR", "550", 6, 6, 1, 1, 1, 0, 1, 0),
+          new ExpectedSecurity("MOEX", "600", 7, 7, 1, 1, 1, 0, 1, 0),
+          new ExpectedSecurity("AFLT", "650", 8, 8, 1, 1, 1, 0, 1, 0),
+          new ExpectedSecurity("CHMF", "700", 9, 9, 1, 1, 1, 0, 1, 0),
+          new ExpectedSecurity("MAGN", "750", 10, 10, 1, 1, 1, 0, 1, 0),
+          new ExpectedSecurity("ALRS", "800", 11, 11, 1, 1, 1, 0, 1, 0));
+
   @Test
   void ownershipFinalizationRefusesAConnectionSurvivingTheApplicationClose() throws Exception {
     try (var postgres = new PostgreSQLContainer("postgres:17.11-alpine")) {
@@ -113,6 +148,7 @@ class InterfaceDemoIT {
             : SYNTHETIC_PASSWORD;
     try (var bank = WholeChainBrokerSimulator.open(temporary.resolve("tls"));
         var telegram = new WholeChainTelegramSimulator()) {
+      bank.setCapitals(new BigDecimal("1000000"), new BigDecimal("1000000"));
       Throwable scenarioFailure = null;
       try {
         if (!external) {
@@ -331,6 +367,14 @@ class InterfaceDemoIT {
                     "select reason from copy_intent where id=?", String.class, skipped))
             .contains("Недостаточно собственных");
         assertThat(bank.calls("PostOrder")).hasSize(3);
+        executeAdditionalSecurities(bank, db, worker, browser);
+        assertThat(bank.calls("PostOrder")).hasSize(24);
+        assertThat(bank.calls("CancelOrder")).hasSize(2);
+        assertThat(db.queryForObject("select count(*) from source_execution", Integer.class))
+            .isEqualTo(28);
+        assertThat(db.queryForObject("select count(*) from broker_fill", Integer.class))
+            .isEqualTo(25);
+        assertBankMatrix(bank);
         var tx = app.getBean(TransactionTemplate.class);
         UUID summary =
             tx.execute(
@@ -343,9 +387,8 @@ class InterfaceDemoIT {
         JsonNode positions = browser.json.readTree(browser.get("/api/positions").body());
         assertThat(positions.toString())
             .contains(WholeChainBrokerSimulator.INSTRUMENT, "\"copiedLots\":2");
-        JsonNode journal = browser.json.readTree(browser.get("/api/journal").body());
-        assertThat(journal.toString())
-            .contains("SOURCE_ACCEPTED", "ORDER_RECONCILED", "PREVIEW_TRADE", "[ТЕСТ]");
+        assertPortfolioMatrix(browser, db);
+        assertCompleteJournal(browser, db);
         JsonNode notices = browser.json.readTree(browser.get("/api/notifications").body());
         assertThat(notices.toString()).contains("DELIVERED", "PENDING");
         assertThat(browser.post("/api/control/stop").statusCode()).isEqualTo(200);
@@ -377,7 +420,8 @@ class InterfaceDemoIT {
         try (var viewer = start(url, username, dbPassword, null, null)) {
           var view = login(viewer, ownerPassword);
           assertThat(view.get("/api/positions").body()).contains("\"copiedLots\":2");
-          assertThat(view.get("/api/journal").body()).contains("PREVIEW_TRADE");
+          assertPortfolioMatrix(view, db);
+          assertCompleteJournal(view, db);
           assertThat(
                   view.post(
                           "/api/instruments/"
@@ -390,7 +434,14 @@ class InterfaceDemoIT {
                       .statusCode())
               .isEqualTo(200);
           assertThat(db.queryForList("select instrument_id from instrument_state", String.class))
-              .containsExactly(WholeChainBrokerSimulator.INSTRUMENT);
+              .containsExactlyInAnyOrderElementsOf(
+                  EXPECTED_SECURITIES.stream().map(ExpectedSecurity::id).toList());
+          assertThat(
+                  db.queryForObject(
+                      "select paused from instrument_state where instrument_id=?",
+                      Boolean.class,
+                      WholeChainBrokerSimulator.INSTRUMENT))
+              .isTrue();
           int previous =
               db.queryForObject(
                   "select count(*) from notification_attempt where notification_id=?",
@@ -495,6 +546,291 @@ class InterfaceDemoIT {
     return value;
   }
 
+  private static void assertPortfolioMatrix(Browser browser, JdbcTemplate db) throws Exception {
+    JsonNode positions = browser.json.readTree(browser.get("/api/positions").body());
+    JsonNode instruments = browser.json.readTree(browser.get("/api/instruments").body());
+    assertThat(positions.size()).isEqualTo(15);
+    assertThat(instruments.size()).isEqualTo(15);
+    var visibleInstruments = new ArrayList<String>();
+    for (var instrument : instruments)
+      visibleInstruments.add(instrument.get("instrumentId").asText());
+    assertThat(visibleInstruments)
+        .containsExactlyInAnyOrderElementsOf(
+            EXPECTED_SECURITIES.stream().map(ExpectedSecurity::id).toList());
+    Map<String, JsonNode> byInstrument = new LinkedHashMap<>();
+    for (var position : positions)
+      byInstrument.put(position.get("instrumentId").asText(), position);
+    assertThat(byInstrument.keySet())
+        .containsExactlyInAnyOrderElementsOf(
+            EXPECTED_SECURITIES.stream().map(ExpectedSecurity::id).toList());
+    for (var expected : EXPECTED_SECURITIES) {
+      var position = byInstrument.get(expected.id());
+      assertThat(position.get("copiedLots").asLong())
+          .as(expected.id())
+          .isEqualTo(expected.copiedLots());
+      assertThat(position.get("manualLots").asLong()).isZero();
+      assertThat(new BigDecimal(position.get("brokerLots").asText()))
+          .isEqualByComparingTo(BigDecimal.valueOf(expected.copiedLots()));
+      assertThat(
+              db.queryForObject(
+                  "select copied_lots from mirror_position where instrument_id=?",
+                  Long.class,
+                  expected.id()))
+          .isEqualTo(expected.copiedLots());
+      assertThat(
+              db.queryForObject(
+                  "select sum(case when side='BUY' then lots else -lots end) from source_execution where instrument_id=?",
+                  BigDecimal.class,
+                  expected.id()))
+          .isEqualByComparingTo(BigDecimal.valueOf(expected.sourceLots()));
+      assertThat(
+              db.queryForObject(
+                  "select count(*) from source_execution where instrument_id=?",
+                  Integer.class,
+                  expected.id()))
+          .isEqualTo(expected.executions());
+      assertThat(
+              db.queryForObject(
+                  "select count(*) from source_execution where instrument_id=? and side='BUY'",
+                  Integer.class,
+                  expected.id()))
+          .isEqualTo(expected.buys());
+      assertThat(
+              db.queryForObject(
+                  "select count(*) from source_execution where instrument_id=? and side='SELL'",
+                  Integer.class,
+                  expected.id()))
+          .isEqualTo(expected.sells());
+      assertThat(
+              db.queryForObject(
+                  "select count(*) from broker_fill f join copy_intent i on i.id=f.intent_id where i.instrument_id=?",
+                  Integer.class,
+                  expected.id()))
+          .isEqualTo(expected.fills());
+      assertThat(
+              db.queryForObject(
+                  "select coalesce(sum(i.skipped_lots),0) from copy_intent i join source_execution e on e.id=i.execution_id where i.instrument_id=? and e.trade_id not in ('[ТЕСТ] shadow-buy','[ТЕСТ] shadow-sell')",
+                  Long.class,
+                  expected.id()))
+          .isEqualTo(expected.skipped());
+      assertThat(
+              db.queryForList(
+                  "select distinct price from source_execution where instrument_id=?",
+                  BigDecimal.class,
+                  expected.id()))
+          .singleElement()
+          .satisfies(price -> assertThat(price).isEqualByComparingTo(expected.price()));
+      assertThat(
+              db.queryForList(
+                  "select distinct coefficient from source_execution where instrument_id=?",
+                  BigDecimal.class,
+                  expected.id()))
+          .singleElement()
+          .satisfies(coefficient -> assertThat(coefficient).isEqualByComparingTo("1"));
+    }
+    assertThat(db.queryForObject("select sum(copied_lots) from mirror_position", Long.class))
+        .isEqualTo(81);
+    assertThat(
+            db.queryForObject(
+                "select count(*) from (select instrument_id from source_execution group by instrument_id having count(*) filter(where side='BUY')>=2 and count(*) filter(where side='SELL')>=1) repeated",
+                Integer.class))
+        .isEqualTo(5);
+  }
+
+  private record PreviewOperation(
+      String ticker,
+      String label,
+      BrokerGateway.Side side,
+      long lots,
+      long filled,
+      boolean resourceSkip) {}
+
+  private static void executeAdditionalSecurities(
+      WholeChainBrokerSimulator bank, JdbcTemplate db, TradingWorker worker, Browser browser)
+      throws Exception {
+    var buy = BrokerGateway.Side.BUY;
+    var sell = BrokerGateway.Side.SELL;
+    var operations =
+        List.of(
+            new PreviewOperation("GAZP", "buy-1", buy, 3, 3, false),
+            new PreviewOperation("GAZP", "buy-2", buy, 2, 2, false),
+            new PreviewOperation("GAZP", "sell-1", sell, 1, 1, false),
+            new PreviewOperation("LKOH", "buy-1", buy, 5, 5, false),
+            new PreviewOperation("LKOH", "sell-1", sell, 2, 2, false),
+            new PreviewOperation("LKOH", "buy-2", buy, 1, 1, false),
+            new PreviewOperation("ROSN", "buy-1", buy, 4, 4, false),
+            new PreviewOperation("ROSN", "sell-1", sell, 1, 1, false),
+            new PreviewOperation("ROSN", "partial-buy-2", buy, 4, 2, false),
+            new PreviewOperation("NVTK", "buy-1", buy, 2, 2, false),
+            new PreviewOperation("NVTK", "sell-1", sell, 1, 1, false),
+            new PreviewOperation("NVTK", "skipped-buy-2", buy, 3, 0, true),
+            new PreviewOperation("GMKN", "buy-1", buy, 2, 2, false),
+            new PreviewOperation("PLZL", "buy-1", buy, 3, 3, false),
+            new PreviewOperation("TATN", "buy-1", buy, 4, 4, false),
+            new PreviewOperation("SNGS", "buy-1", buy, 5, 5, false),
+            new PreviewOperation("VTBR", "buy-1", buy, 6, 6, false),
+            new PreviewOperation("MOEX", "buy-1", buy, 7, 7, false),
+            new PreviewOperation("AFLT", "buy-1", buy, 8, 8, false),
+            new PreviewOperation("CHMF", "buy-1", buy, 9, 9, false),
+            new PreviewOperation("MAGN", "buy-1", buy, 10, 10, false),
+            new PreviewOperation("ALRS", "buy-1", buy, 11, 11, false));
+    for (var operation : operations) {
+      String instrument = "[ТЕСТ] " + operation.ticker();
+      String trade = operation.ticker() + "-" + operation.label();
+      if (operation.resourceSkip()) bank.setResources(instrument, BigDecimal.ZERO, 0, 100);
+      else
+        bank.setNextPostFill(
+            instrument, operation.filled() < operation.lots() ? operation.filled() : 0);
+      emit(
+          bank,
+          db,
+          instrument,
+          trade,
+          operation.ticker() + "-order-" + operation.label(),
+          operation.side(),
+          operation.lots());
+      worker.run();
+      UUID id = intent(db, "[ТЕСТ] " + trade);
+      if (operation.resourceSkip()) {
+        assertThat(
+                db.queryForMap(
+                    "select executed_lots,skipped_lots,status from copy_intent where id=?", id))
+            .containsEntry("executed_lots", 0L)
+            .containsEntry("skipped_lots", operation.lots())
+            .containsEntry("status", "FINAL");
+        assertThat(bank.calls("PostOrder"))
+            .noneMatch(
+                rpc -> ((PostOrderRequest) rpc.request()).getOrderId().equals(id.toString()));
+      } else {
+        assertPost(bank, id, operation.lots(), instrument);
+        if (operation.filled() == operation.lots()) bank.fillOrder(id, operation.filled(), now());
+        worker.run();
+        if (operation.filled() < operation.lots()) {
+          assertThat(browser.post("/api/control/stop").statusCode()).isEqualTo(200);
+          worker.run();
+          assertThat(browser.post("/api/control/start").statusCode()).isEqualTo(200);
+          assertThat(browser.post("/api/control/automatic").statusCode()).isEqualTo(200);
+        }
+        worker.run();
+        assertThat(
+                db.queryForMap(
+                    "select executed_lots,skipped_lots,status from copy_intent where id=?", id))
+            .containsEntry("executed_lots", operation.filled())
+            .containsEntry("skipped_lots", operation.lots() - operation.filled())
+            .containsEntry("status", "FINAL");
+      }
+    }
+  }
+
+  private static void assertBankMatrix(WholeChainBrokerSimulator bank) {
+    for (var expected : EXPECTED_SECURITIES) {
+      assertThat(bank.position(WholeChainBrokerSimulator.SOURCE, expected.id()))
+          .as(expected.id() + " source")
+          .isEqualTo(expected.sourceLots());
+      assertThat(bank.position(WholeChainBrokerSimulator.MIRROR, expected.id()))
+          .as(expected.id() + " mirror")
+          .isEqualTo(expected.copiedLots());
+      assertThat(
+              bank.calls("PostOrder").stream()
+                  .map(rpc -> (PostOrderRequest) rpc.request())
+                  .filter(request -> request.getInstrumentId().equals(expected.id()))
+                  .count())
+          .as(expected.id() + " orders")
+          .isEqualTo(expected.posts());
+    }
+    assertThat(
+            bank.calls("PostOrder").stream()
+                .map(rpc -> ((PostOrderRequest) rpc.request()).getOrderId())
+                .toList())
+        .doesNotHaveDuplicates();
+  }
+
+  private static void assertCompleteJournal(Browser browser, JdbcTemplate db) throws Exception {
+    var rows = new ArrayList<JsonNode>();
+    var ids = new HashSet<Long>();
+    long before = 0;
+    int pages = 0;
+    while (true) {
+      var response =
+          browser.get("/api/journal?limit=37" + (before == 0 ? "" : "&before=" + before));
+      assertThat(response.statusCode()).isEqualTo(200);
+      var page = browser.json.readTree(response.body());
+      if (page.isEmpty()) break;
+      pages++;
+      assertThat(pages).isLessThan(100);
+      for (var row : page) {
+        long id = row.get("id").asLong();
+        assertThat(ids.add(id)).isTrue();
+        if (before != 0) assertThat(id).isLessThan(before);
+        rows.add(row);
+      }
+      before = page.get(page.size() - 1).get("id").asLong();
+    }
+    assertThat(pages).isGreaterThan(1);
+    assertThat(rows.size())
+        .isEqualTo(db.queryForObject("select count(*) from journal_entry", Integer.class));
+    var sourceRows =
+        rows.stream()
+            .filter(row -> row.get("category").asText().equals("SOURCE_RECEIVED"))
+            .toList();
+    assertThat(sourceRows).hasSize(28);
+    assertThat(
+            sourceRows.stream()
+                .map(row -> row.get("instrument").asText())
+                .collect(java.util.stream.Collectors.toSet()))
+        .containsExactlyInAnyOrderElementsOf(
+            EXPECTED_SECURITIES.stream().map(ExpectedSecurity::id).toList());
+    assertThat(rows.toString())
+        .contains("SOURCE_ACCEPTED", "ORDER_RECONCILED", "PREVIEW_TRADE", "[ТЕСТ]");
+    assertNaturalNotice(
+        browser, db, rows, "[ТЕСТ] ROSN", "ORDER_FINAL_SKIP", "исполнено 2/4", "пропущено 2");
+    assertNaturalNotice(
+        browser,
+        db,
+        rows,
+        "[ТЕСТ] NVTK",
+        "COPY_SKIPPED",
+        "Недостаточно собственных",
+        "пропущено 3 лотов");
+  }
+
+  private static void assertNaturalNotice(
+      Browser browser,
+      JdbcTemplate db,
+      List<JsonNode> journal,
+      String instrument,
+      String category,
+      String... expectedText)
+      throws Exception {
+    var response = browser.get("/api/notifications?limit=200");
+    assertThat(response.statusCode()).isEqualTo(200);
+    var matches = new ArrayList<JsonNode>();
+    for (var notice : browser.json.readTree(response.body()))
+      if (notice.get("instrument").asText().equals(instrument)
+          && notice.get("category").asText().equals(category)) matches.add(notice);
+    assertThat(matches).hasSize(1);
+    var notice = matches.getFirst();
+    String text = notice.get("text").asText();
+    assertThat(text).contains(expectedText);
+    assertThat(
+            db.queryForObject(
+                "select j.detail from notification n join journal_entry j on j.id=n.journal_id where n.id=? and n.instrument=? and j.instrument=?",
+                String.class,
+                UUID.fromString(notice.get("id").asText()),
+                instrument,
+                instrument))
+        .isEqualTo(text);
+    assertThat(
+            journal.stream()
+                .filter(
+                    row ->
+                        row.get("category").asText().equals("NOTIFICATION_" + category)
+                            && row.get("instrument").asText().equals(instrument))
+                .map(row -> row.get("detail").asText())
+                .toList())
+        .contains(text);
+  }
+
   private static void captureAfterDrain(
       JdbcTemplate db, InterfaceDemoLedger ledger, Duration timeout) throws Exception {
     await(
@@ -520,9 +856,26 @@ class InterfaceDemoIT {
       BrokerGateway.Side side,
       long lots)
       throws Exception {
+    emit(bank, db, WholeChainBrokerSimulator.INSTRUMENT, trade, order, side, lots);
+  }
+
+  private static void emit(
+      WholeChainBrokerSimulator bank,
+      JdbcTemplate db,
+      String instrument,
+      String trade,
+      String order,
+      BrokerGateway.Side side,
+      long lots)
+      throws Exception {
     Thread.sleep(25);
-    bank.emitSource(
-        "[ТЕСТ] " + trade, "[ТЕСТ] " + order, side, lots, WholeChainBrokerSimulator.PRICE, now());
+    BigDecimal price =
+        bank.securities().stream()
+            .filter(s -> s.id().equals(instrument))
+            .findFirst()
+            .orElseThrow()
+            .price();
+    bank.emitSource(instrument, "[ТЕСТ] " + trade, "[ТЕСТ] " + order, side, lots, price, now());
     await(
         () ->
             db.queryForObject(
@@ -540,6 +893,11 @@ class InterfaceDemoIT {
   }
 
   private static void assertPost(WholeChainBrokerSimulator bank, UUID id, long lots) {
+    assertPost(bank, id, lots, WholeChainBrokerSimulator.INSTRUMENT);
+  }
+
+  private static void assertPost(
+      WholeChainBrokerSimulator bank, UUID id, long lots, String instrument) {
     assertThat(
             bank.audit().stream()
                 .filter(
@@ -553,7 +911,7 @@ class InterfaceDemoIT {
             request -> {
               assertThat(request.getQuantity()).isEqualTo(lots);
               assertThat(request.getAccountId()).isEqualTo(WholeChainBrokerSimulator.MIRROR);
-              assertThat(request.getInstrumentId()).isEqualTo(WholeChainBrokerSimulator.INSTRUMENT);
+              assertThat(request.getInstrumentId()).isEqualTo(instrument);
             });
   }
 
