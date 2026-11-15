@@ -1,0 +1,282 @@
+:root {
+  font-family: "Segoe UI Variable Text", "Segoe UI", sans-serif;
+  color: #172940;
+  background: #eef3f8;
+  font-synthesis: none;
+  --blue: #1d557f;
+  --line: #c1ceda;
+  --paper: #fff;
+  --danger: #9b2933;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+}
+header {
+  display: flex;
+  gap: 22px;
+  align-items: baseline;
+  padding: 22px 4vw;
+  background: #163950;
+  color: white;
+  border-bottom: 5px solid #86adca;
+}
+.brand {
+  font-size: 30px;
+  font-weight: 650;
+  letter-spacing: -1px;
+}
+header span {
+  color: #d6e5ef;
+}
+header button {
+  margin-left: auto;
+}
+main {
+  max-width: 1400px;
+  margin: 32px auto;
+  padding: 0 4vw;
+}
+h1 {
+  font-size: 32px;
+  line-height: 1.18;
+  letter-spacing: -0.7px;
+  margin: 0 0 14px;
+}
+h2 {
+  font-size: 21px;
+  margin: 28px 0 14px;
+}
+p {
+  max-width: 80ch;
+  line-height: 1.6;
+  color: #4b6074;
+}
+button,
+input {
+  font: inherit;
+  min-height: 43px;
+  border: 1px solid #91a9bc;
+  border-radius: 5px;
+  padding: 10px 17px;
+}
+button {
+  cursor: pointer;
+  background: white;
+  color: #14394f;
+  font-weight: 600;
+}
+button:hover {
+  background: #e6f0f7;
+}
+button:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+input {
+  background: white;
+  color: #172940;
+}
+label {
+  display: block;
+  font-weight: 600;
+  margin: 0 0 8px;
+}
+button:focus-visible,
+input:focus-visible {
+  outline: 3px solid #f2b442;
+  outline-offset: 3px;
+}
+.actions {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.stop {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: white;
+}
+.stop:hover {
+  background: #7c2028;
+}
+#login {
+  max-width: 530px;
+  margin: 7vh auto;
+  background: white;
+  border: 1px solid var(--line);
+  padding: 32px;
+}
+#login form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+#login label {
+  margin: 0;
+}
+#login button {
+  background: var(--blue);
+  color: white;
+}
+.state {
+  display: grid;
+  grid-template-columns: 1fr 1.3fr;
+  gap: 24px;
+  border-left: 6px solid #5488aa;
+  background: var(--paper);
+  padding: 24px;
+}
+.state dl {
+  display: flex;
+  gap: 28px;
+  flex-wrap: wrap;
+  margin: 0;
+}
+.state dt {
+  font-size: 14px;
+  color: #52677a;
+  margin: 4px 0 9px;
+}
+.state dd {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.state > div,
+.state dl,
+.state dl > div {
+  min-width: 0;
+}
+nav {
+  display: flex;
+  gap: 5px;
+  border-bottom: 1px solid var(--line);
+  margin-top: 28px;
+}
+nav button {
+  border: 0;
+  border-radius: 5px 5px 0 0;
+  background: transparent;
+  font-size: 16px;
+}
+nav button[aria-current="page"] {
+  background: white;
+  box-shadow: inset 0 3px var(--blue);
+}
+.page {
+  background: white;
+  padding: 8px 24px 30px;
+}
+.page h2:first-child {
+  margin-top: 20px;
+}
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 14px;
+}
+th,
+td {
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid #dae2e9;
+  padding: 12px 9px;
+}
+th {
+  color: #456077;
+  background: #f2f6fa;
+}
+td:last-child {
+  white-space: pre-wrap;
+  line-height: 1.5;
+}
+.table-scroll {
+  overflow: auto;
+}
+.notification {
+  border-top: 1px solid var(--line);
+  padding: 20px 0;
+}
+.notification pre {
+  font: inherit;
+  white-space: pre-wrap;
+  line-height: 1.55;
+  max-width: 85ch;
+}
+.metadata {
+  font-size: 14px;
+  color: #4b6074;
+  overflow-wrap: anywhere;
+}
+.notification button {
+  margin: 7px 10px 0 0;
+}
+.instrument {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 13px 0;
+  border-top: 1px solid var(--line);
+}
+.instrument p {
+  margin: 0;
+  flex: 1;
+}
+.instrument strong {
+  min-width: 100px;
+}
+#message:not(:empty) {
+  padding: 13px 18px;
+  border: 1px solid #b89044;
+  background: #fff1d3;
+  color: #4d3916;
+}
+footer {
+  padding: 25px 4vw;
+  color: #5e7386;
+  font-size: 13px;
+}
+[hidden] {
+  display: none !important;
+}
+@media (max-width: 760px) {
+  header {
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .state {
+    grid-template-columns: 1fr;
+  }
+  .state dl {
+    gap: 20px;
+  }
+  nav {
+    overflow: auto;
+  }
+  .page {
+    padding: 8px 16px 25px;
+  }
+  h1 {
+    font-size: 28px;
+  }
+  .actions {
+    align-items: stretch;
+  }
+  .actions button,
+  .actions input {
+    flex: 1;
+  }
+  .instrument {
+    flex-wrap: wrap;
+  }
+}
+@media (prefers-reduced-motion: no-preference) {
+  button {
+    transition: background-color 0.12s;
+  }
+}

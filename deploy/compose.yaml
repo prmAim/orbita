@@ -1,0 +1,62 @@
+name: orbita
+services:
+  db:
+    build:
+      context: ..
+      dockerfile: deploy/postgres.Dockerfile
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: orbita
+      POSTGRES_USER: orbita_admin
+      POSTGRES_PASSWORD: ${ORBITA_DB_ADMIN_PASSWORD:?Set a separate ORBITA_DB_ADMIN_PASSWORD in local deploy/.env}
+      ORBITA_APP_PASSWORD: ${ORBITA_DB_PASSWORD:?Set ORBITA_DB_PASSWORD in the local deploy/.env}
+    volumes:
+      - database:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orbita -d orbita"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [private]
+  app:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    init: true
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${ORBITA_HTTP_PORT:-8086}:8080"
+    environment:
+      SERVER_ADDRESS: 0.0.0.0
+      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/orbita
+      SPRING_DATASOURCE_USERNAME: orbita
+      SPRING_DATASOURCE_PASSWORD: ${ORBITA_DB_PASSWORD}
+      ORBITA_SOURCE_ACCOUNT: ${ORBITA_SOURCE_ACCOUNT:-}
+      ORBITA_MIRROR_ACCOUNT: ${ORBITA_MIRROR_ACCOUNT:-}
+      ORBITA_TELEGRAM_ENABLED: ${ORBITA_TELEGRAM_ENABLED:-false}
+      ORBITA_TELEGRAM_TOKEN: ${ORBITA_TELEGRAM_TOKEN:-}
+      ORBITA_TELEGRAM_CHAT_ID: ${ORBITA_TELEGRAM_CHAT_ID:-}
+      ORBITA_BACKUP_ENABLED: "true"
+      ORBITA_BACKUP_LOCAL_DIRECTORY: /var/lib/orbita/backups
+      ORBITA_BACKUP_USB_DIRECTORY: /usb
+      ORBITA_BACKUP_DATABASE: orbita
+      ORBITA_BACKUP_HOST: db
+      ORBITA_BACKUP_PORT: "5432"
+      ORBITA_BACKUP_USERNAME: orbita
+    volumes:
+      - backups:/var/lib/orbita/backups
+      - type: bind
+        source: ${ORBITA_USB_DIRECTORY:?Set the existing USB backup directory}
+        target: /usb
+        bind:
+          create_host_path: false
+    networks: [private]
+volumes:
+  database:
+  backups:
+networks:
+  private:
+    driver: bridge

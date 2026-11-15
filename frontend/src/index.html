@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Орбита · Повторение сделок</title>
+    <link rel="stylesheet" href="/app.css" />
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <header>
+      <div class="brand">Орбита</div>
+      <span>Повторение собственных сделок</span
+      ><button id="logout" hidden>Выйти</button>
+    </header>
+    <main>
+      <section id="login">
+        <h1>Доступ владельца</h1>
+        <p>Журнал и управление доступны после ввода локального пароля.</p>
+        <form id="login-form">
+          <label for="password">Пароль</label
+          ><input
+            id="password"
+            name="password"
+            type="password"
+            autocomplete="current-password"
+            required
+          /><button type="submit">Войти</button>
+        </form>
+        <p>
+          Первый пароль и восстановление доступа задаются локальной командой на
+          ПК.
+        </p>
+      </section>
+      <p id="message" role="status" aria-live="polite"></p>
+      <div id="workspace" hidden>
+        <section class="state">
+          <div>
+            <h1 id="mode">Получение статуса</h1>
+            <p id="state-description"></p>
+          </div>
+          <dl>
+            <div>
+              <dt>Коэффициент</dt>
+              <dd id="coefficient">—</dd>
+            </div>
+            <div>
+              <dt>Сверка</dt>
+              <dd id="reconciled">—</dd>
+            </div>
+            <div>
+              <dt>Разовый допуск</dt>
+              <dd id="permit">—</dd>
+            </div>
+          </dl>
+        </section>
+        <nav aria-label="Разделы">
+          <button data-page="control" aria-current="page">Управление</button
+          ><button data-page="journal">Журнал</button
+          ><button data-page="notifications">Уведомления</button
+          ><button data-page="backup">Копии</button>
+        </nav>
+        <section id="control" class="page">
+          <h2>Повторение</h2>
+          <div class="actions">
+            <button data-command="start">Начать</button
+            ><button data-command="recalculate">Пересчитать коэффициент</button
+            ><button data-command="stop" class="stop">
+              Остановить повторение
+            </button>
+          </div>
+          <p>
+            Остановка запрещает новые заявки и запрашивает отмену активных
+            заявок программы. Бумаги остаются на счёте.
+          </p>
+          <h2>Живая приёмка</h2>
+          <form id="permit-form">
+            <label for="rub-limit">Новый рублёвый предел с комиссией</label>
+            <div class="actions">
+              <input
+                id="rub-limit"
+                type="number"
+                min="0.01"
+                step="0.01"
+                required
+              /><button type="submit">Выдать разовый допуск</button
+              ><button type="button" data-command="revoke-permit">
+                Отозвать допуск
+              </button>
+            </div>
+          </form>
+          <p>
+            Первая попытка — один расчётный лот в RUB. Допуск действует только
+            на исполнения строго после его выдачи.
+          </p>
+          <button data-command="automatic">
+            Включить автоматическую отправку
+          </button>
+          <p>
+            Доступно после подтверждённой живой приёмки. После ручной остановки
+            запуск возвращается в теневой режим.
+          </p>
+          <h2>Инструменты</h2>
+          <div id="instruments"></div>
+          <h2>Теневая сверка покупки и продажи</h2>
+          <p>
+            Приложение сверяет сохранённые естественные исполнения с независимой
+            историей брокера при запуске текущей версии.
+          </p>
+          <div id="shadow-checks"></div>
+        </section>
+        <section id="journal" class="page" hidden>
+          <h2>Журнал решений</h2>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Время МСК</th>
+                  <th>Событие</th>
+                  <th>Инструмент</th>
+                  <th>Результат и причина</th>
+                </tr>
+              </thead>
+              <tbody id="journal-rows"></tbody>
+            </table>
+          </div>
+          <button id="older-journal">Показать более ранние записи</button>
+        </section>
+        <section id="notifications" class="page" hidden>
+          <h2>Доставка в Telegram</h2>
+          <p>
+            Уведомления направляются в один личный чат. Успешные сделки
+            записываются в журнал без отдельного сообщения.
+          </p>
+          <div id="notification-list"></div>
+        </section>
+        <section id="backup" class="page" hidden>
+          <h2>Резервные копии</h2>
+          <p>
+            Ежемесячно 1-го числа в 03:00 МСК. Проверенная копия переносится в
+            сохранённую USB-папку обычным файлом.
+          </p>
+          <div id="backup-list"></div>
+          <h2>Проверка переноса после приёмки на ПК</h2>
+          <p>
+            На ПК сохраните протокол по проверенному исполнению. После переноса
+            загрузите тот же файл на сервере: приложение сравнит журнал,
+            настройки, сделку из истории брокера и повторный теневой расчёт. Эта
+            проверка не включает торговлю.
+          </p>
+          <form id="migration-export">
+            <label for="migration-execution"
+              >Идентификатор проверенного исходного исполнения</label
+            >
+            <div class="actions">
+              <input
+                id="migration-execution"
+                type="text"
+                maxlength="500"
+                required
+              /><button type="submit">Сохранить протокол с ПК</button>
+            </div>
+          </form>
+          <form id="migration-compare">
+            <label for="migration-file">Протокол с ПК</label>
+            <div class="actions">
+              <input
+                id="migration-file"
+                type="file"
+                accept="application/json,.json"
+                required
+              /><button type="submit">Сверить после переноса</button>
+            </div>
+          </form>
+          <div id="migration-proofs"></div>
+        </section>
+      </div>
+    </main>
+    <footer>Локальная панель владельца. Время событий — московское.</footer>
+  </body>
+</html>

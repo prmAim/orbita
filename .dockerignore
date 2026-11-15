@@ -1,0 +1,15 @@
+.git
+.agents
+.codex
+.scratch
+.venv
+**/node_modules
+**/target
+**/.env
+**/.env.*
+**/dist
+.offline
+dist
+build
+.ruff_cache
+**/__pycache__
