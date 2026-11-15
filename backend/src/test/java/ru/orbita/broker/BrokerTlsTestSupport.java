@@ -73,7 +73,13 @@ final class BrokerTlsTestSupport {
     var server =
         NettyServerBuilder.forAddress(new InetSocketAddress("127.0.0.1", 0))
             .useTransportSecurity(cert.toFile(), key.toFile());
-    if (Arrays.stream(services).noneMatch(s -> s instanceof UsersServiceGrpc.UsersServiceImplBase))
+    if (Arrays.stream(services)
+        .noneMatch(
+            s ->
+                s.bindService()
+                    .getServiceDescriptor()
+                    .getName()
+                    .equals(UsersServiceGrpc.SERVICE_NAME)))
       server.addService(
           new UsersServiceGrpc.UsersServiceImplBase() {
             @Override
@@ -101,6 +107,23 @@ final class BrokerTlsTestSupport {
 
   static TInvestBrokerGateway gateway(int port, Clock clock, BrokerConnectivityEvents events)
       throws Exception {
+    return gateway(port, clock, events, BrokerQualifications.unconfirmed());
+  }
+
+  static TInvestBrokerGateway gateway(
+      int port, Clock clock, BrokerConnectivityEvents events, BrokerQualifications qualifications)
+      throws Exception {
+    return gateway(port, clock, events, qualifications, "source", "mirror");
+  }
+
+  static TInvestBrokerGateway gateway(
+      int port,
+      Clock clock,
+      BrokerConnectivityEvents events,
+      BrokerQualifications qualifications,
+      String sourceAccount,
+      String mirrorAccount)
+      throws Exception {
     var properties = new Properties();
     properties.setProperty("target", "127.0.0.1:" + port);
     properties.setProperty("token", "synthetic-offline-token");
@@ -125,7 +148,7 @@ final class BrokerTlsTestSupport {
       state = channel.getState(true);
     }
     return new TInvestBrokerGateway(
-        factory, "source", "mirror", clock, BrokerQualifications.unconfirmed(), events);
+        factory, sourceAccount, mirrorAccount, clock, qualifications, events);
   }
 
   static final BrokerConnectivityEvents NO_EVENTS =
