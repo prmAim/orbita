@@ -295,6 +295,21 @@ class AccountReadStore {
         .orElseThrow(NoSuchElementException::new);
   }
 
+  List<Map<String, Object>> relatedOperations(String account, String kind, String id) {
+    Map<String, Object> proof =
+        switch (kind) {
+          case "ORDER" -> Map.of("orderIds", List.of(id));
+          case "FILL" -> Map.of("fills", List.of(Map.of("id", id)));
+          case "JOURNAL" -> Map.of("journalId", id);
+          default -> throw new IllegalArgumentException("Unsupported exact relationship");
+        };
+    return db.query(
+        "select payload::text from account_read_document where account_id=? and kind='OPERATION' and current and payload @> cast(? as jsonb) order by id",
+        (rs, n) -> decode(rs.getString(1)),
+        account,
+        json.writeValueAsString(proof));
+  }
+
   private static Timestamp ts(Instant value) {
     return value == null ? null : Timestamp.from(value);
   }

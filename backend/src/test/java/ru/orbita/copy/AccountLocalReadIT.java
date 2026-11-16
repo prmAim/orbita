@@ -15,6 +15,7 @@ import ru.orbita.broker.*;
 import ru.orbita.control.*;
 
 @SpringBootTest(
+    webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
     properties = {
       "orbita.source-account=source",
       "orbita.mirror-account=mirror",
@@ -34,6 +35,8 @@ class AccountLocalReadIT {
   @Autowired JdbcTemplate db;
   @Autowired AlgorithmVersion algorithms;
   @Autowired ManualReconciliationService manual;
+  @Autowired ru.orbita.web.OwnerCredentials credentials;
+  @org.springframework.boot.test.web.server.LocalServerPort int port;
 
   @BeforeEach
   void reset() {
@@ -43,7 +46,7 @@ class AccountLocalReadIT {
   }
 
   @Test
-  void unknownOwnIntentHasStableIdentityWithoutBankIdAndFinalMovesToHistory() {
+  void unknownOwnIntentHasStableIdentityWithoutBankIdAndFinalMovesToHistory() throws Exception {
     control.markReconciled();
     control.start();
     control.markFeedReady(true);
@@ -85,10 +88,17 @@ class AccountLocalReadIT {
     assertThat(group.get("executedLots")).isEqualTo("1");
     assertThat(((Map<?, ?>) group.get("executionPrice")).get("value")).isEqualTo("100.5");
     assertThat(((List<?>) group.get("fills"))).hasSize(1);
+    var http = ownerClient();
+    var linkedOrder = httpJson(http, "/api/account/order?id=" + encodedQuery(waiting.get("id")));
+    var fillId = ((Map<?, ?>) ((List<?>) group.get("fills")).getFirst()).get("id");
+    var linkedFill = httpJson(http, "/api/account/fill?id=" + encodedQuery(fillId));
+    assertThat(linkedOrder.get("operationIds").get(0).asText()).isEqualTo(group.get("id"));
+    assertThat(linkedFill.get("operationIds").get(0).asText()).isEqualTo(group.get("id"));
   }
 
   @Test
-  void manualOriginRequiresExactDurableReceiptAndNeverInventsSourceOrCoefficient() {
+  void manualOriginRequiresExactDurableReceiptAndNeverInventsSourceOrCoefficient()
+      throws Exception {
     control.markReconciled();
     control.start();
     control.pauseInstrument("instrument", "Synthetic manual reconciliation");
@@ -145,6 +155,21 @@ class AccountLocalReadIT {
     assertThat(operation.get("origin")).isEqualTo("MANUAL");
     assertThat(operation.get("sourceExecutionId")).isNull();
     assertThat(operation.get("coefficient")).isNull();
+    var http = ownerClient();
+    var linkedOrder =
+        httpJson(
+            http,
+            "/api/account/order?id="
+                + encodedQuery(((List<?>) operation.get("orderIds")).getFirst()));
+    var linkedFill =
+        httpJson(
+            http,
+            "/api/account/fill?id="
+                + encodedQuery(
+                    ((Map<?, ?>) ((List<?>) operation.get("fills")).getFirst()).get("id")));
+    assertThat(linkedOrder.get("origin").asText()).isEqualTo("MANUAL");
+    assertThat(linkedOrder.get("operationIds").get(0).asText()).isEqualTo(operation.get("id"));
+    assertThat(linkedFill.get("operationIds").get(0).asText()).isEqualTo(operation.get("id"));
     assertThat(broker.posts).isZero();
   }
 
@@ -226,7 +251,7 @@ class AccountLocalReadIT {
   }
 
   @Test
-  void skippedSourceWithoutIntentRetainsExactReasonAndJournalAssociation() {
+  void skippedSourceWithoutIntentRetainsExactReasonAndJournalAssociation() throws Exception {
     var source =
         copies.accept(
             new BrokerGateway.SourceExecution(
@@ -246,6 +271,10 @@ class AccountLocalReadIT {
     assertThat(group.get("reason")).isEqualTo("Исполнение до границы наблюдения или возобновления");
     var journal = reads.journal(Long.parseLong(group.get("journalId").toString()));
     assertThat(journal.get("category")).isEqualTo("SOURCE_SKIPPED");
+    var linked = httpJson(ownerClient(), "/api/account/journal?id=" + group.get("journalId"));
+    assertThat(linked.get("operationIds").get(0).asText()).isEqualTo(group.get("id"));
+    assertThat(linked.get("orderIds").isEmpty()).isTrue();
+    assertThat(linked.get("fillIds").isEmpty()).isTrue();
     assertThat(journal.get("detail"))
         .isEqualTo(source.executionId() + " Исполнение до границы наблюдения или возобновления");
   }
@@ -301,6 +330,45 @@ class AccountLocalReadIT {
     assertThat(longGroup.get("reason").toString()).contains("не подтверждена");
     assertThat(longGroup.get("journalId")).isNull();
     assertThat(longGroup.get("complete")).isEqualTo(false);
+  }
+
+  private java.net.http.HttpClient ownerClient() throws Exception {
+    credentials.replace("synthetic-local-links-password".toCharArray());
+    var client =
+        java.net.http.HttpClient.newBuilder()
+            .cookieHandler(new java.net.CookieManager(null, java.net.CookiePolicy.ACCEPT_ALL))
+            .build();
+    var token = httpJson(client, "/api/csrf");
+    var login =
+        client.send(
+            java.net.http.HttpRequest.newBuilder(
+                    java.net.URI.create("http://127.0.0.1:" + port + "/api/login"))
+                .header(token.get("headerName").asText(), token.get("token").asText())
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .POST(
+                    java.net.http.HttpRequest.BodyPublishers.ofString(
+                        "username=owner&password=synthetic-local-links-password"))
+                .build(),
+            java.net.http.HttpResponse.BodyHandlers.ofString());
+    assertThat(login.statusCode()).isEqualTo(204);
+    return client;
+  }
+
+  private tools.jackson.databind.JsonNode httpJson(java.net.http.HttpClient client, String path)
+      throws Exception {
+    var response =
+        client.send(
+            java.net.http.HttpRequest.newBuilder(
+                    java.net.URI.create("http://127.0.0.1:" + port + path))
+                .GET()
+                .build(),
+            java.net.http.HttpResponse.BodyHandlers.ofString());
+    assertThat(response.statusCode()).isEqualTo(200);
+    return tools.jackson.databind.json.JsonMapper.builder().build().readTree(response.body());
+  }
+
+  private static String encodedQuery(Object value) {
+    return java.net.URLEncoder.encode(value.toString(), java.nio.charset.StandardCharsets.UTF_8);
   }
 
   @TestConfiguration(proxyBeanMethods = false)

@@ -123,7 +123,19 @@ stream total/available. Такой опрос не меняет время по�
 ## HTTP и проверки
 
 Контракт ниже реализован в AccountReadController; точные query-ID получают
-запись вне текущей страницы/фильтров, неизвестный ID даёт 404. Journal link
+запись вне текущей страницы/фильтров, неизвестный ID даёт 404.
+Exact Order и Fill дополнительно содержат operationIds: массив непрозрачных
+ID доступных операций, в которых сохранена точная связь с этой записью.
+Сервер проверяет orderIds/вложенные fills.id в проекциях OPERATION текущего
+счёта через параметризованный JSONB-запрос. Он не применяет страницу, период
+или поиск списка и не поручает UI кодировать source ID либо сканировать страницы.
+Связь работает для собственных, внешних и непривязанных исполнений; у последних
+orderId остаётся null. Пустой operationIds означает отсутствие подтверждённой
+доступной связи, а не выбор последней/соседней операции.
+Exact Journal дополнен operationIds/orderIds/fillIds. Связи берутся только из
+уже доказанного operation.journalId и полей этой группы. Совпадение инструмента
+или произвольный текст другой категории журнала не создаёт связи; пустые массивы
+явно сохраняют отсутствие подтверждения. Все эти GET используют прежний OWNER. Journal link
 паузы использует существующее полное событие с точным совпадением причины.
 Для пропуска исходного исполнения без намерения причина восстанавливается из
 SOURCE_SKIPPED; nullable operation.journalId связывает именно этот журнал.
@@ -171,6 +183,6 @@ Cash: `{currency,total,available,blocked,reportedMoney,bankAt,updatedAt,source,l
 
 `freshness` maps assets/orders/history/executions/cash to `{status,lastAttemptAt,lastSuccessAt,from,through,complete,detail}`. Status NEVER/FRESH/PARTIAL/ERROR/STALE. Partial/error import retains known rows and last successful time.
 
-Exact retrieval independent of filters/pages: GET `/api/account/order?id=<opaqueOrderId>`, `/api/account/operation?id=<opaqueOperationId>`, `/api/account/fill?id=<opaqueFillId>`, `/api/account/journal?id=<numericId>`. Unknown exact ID404. Journal returns existing `{id,occurredAt,category,instrument,detail}`. Exact fill includes orderId for navigation.
+Exact retrieval independent of filters/pages: GET `/api/account/order?id=<opaqueOrderId>`, `/api/account/operation?id=<opaqueOperationId>`, `/api/account/fill?id=<opaqueFillId>`, `/api/account/journal?id=<numericId>`. Unknown exact ID404. Journal returns existing `{id,occurredAt,category,instrument,detail}`. Exact order and fill additionally return `operationIds:string[]`, obtained from persisted current-account operation membership independently of page/period. Exact fill retains nullable orderId, including unlinked executions. Empty operationIds means no confirmed available association, never a guessed group. Journal additionally returns `operationIds:string[]`, `orderIds:string[]`, `fillIds:string[]` from already proven operation.journalId membership only; instrument-only/text guesses are not used.
 
 This file is the agreed implementation contract for frontend integration. Verified by AccountReadIT and AccountLocalReadIT through real PostgreSQL and the declared application seams; live broker availability remains separate.

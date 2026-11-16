@@ -337,30 +337,60 @@ public class AccountReadService {
         _ -> {
           store.lock(account);
           project(false);
-          return store.exact(account, kind, id);
+          var row = new LinkedHashMap<>(store.exact(account, kind, id));
+          if (kind.equals("ORDER") || kind.equals("FILL"))
+            row.put(
+                "operationIds",
+                store.relatedOperations(account, kind, id).stream()
+                    .map(operation -> operation.get("id"))
+                    .toList());
+          return row;
         });
   }
 
   public Map<String, Object> journal(long id) {
-    return db
-        .query(
-            "select * from journal_entry where id=?",
-            (rs, n) ->
-                fields(
-                    "id",
-                    rs.getLong("id"),
-                    "occurredAt",
-                    rs.getTimestamp("occurred_at").toInstant(),
-                    "category",
-                    rs.getString("category"),
-                    "instrument",
-                    rs.getString("instrument"),
-                    "detail",
-                    rs.getString("detail")),
-            id)
-        .stream()
-        .findFirst()
-        .orElseThrow(NoSuchElementException::new);
+    resolveAccount();
+    return transaction(
+        _ -> {
+          store.lock(account);
+          project(false);
+          Map<String, Object> row =
+              db
+                  .query(
+                      "select * from journal_entry where id=?",
+                      (rs, n) ->
+                          fields(
+                              "id",
+                              rs.getLong("id"),
+                              "occurredAt",
+                              rs.getTimestamp("occurred_at").toInstant(),
+                              "category",
+                              rs.getString("category"),
+                              "instrument",
+                              rs.getString("instrument"),
+                              "detail",
+                              rs.getString("detail")),
+                      id)
+                  .stream()
+                  .findFirst()
+                  .orElseThrow(NoSuchElementException::new);
+          var operations = store.relatedOperations(account, "JOURNAL", Long.toString(id));
+          row.put(
+              "operationIds", operations.stream().map(operation -> operation.get("id")).toList());
+          var orderIds = new LinkedHashSet<String>();
+          var fillIds = new LinkedHashSet<String>();
+          for (var operation : operations) {
+            if (operation.get("orderIds") instanceof List<?> linked)
+              for (var order : linked) if (order instanceof String value) orderIds.add(value);
+            if (operation.get("fills") instanceof List<?> linked)
+              for (var fill : linked)
+                if (fill instanceof Map<?, ?> value && value.get("id") instanceof String fillId)
+                  fillIds.add(fillId);
+          }
+          row.put("orderIds", List.copyOf(orderIds));
+          row.put("fillIds", List.copyOf(fillIds));
+          return row;
+        });
   }
 
   private List<Map<String, Object>> cashViews() {

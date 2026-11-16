@@ -447,6 +447,129 @@ class AccountReadIT {
     throw new AssertionError("Cash observation was not persisted");
   }
 
+  @Test
+  void exactOldOrderAndFillResolveOperationOutsidePageAndPeriodWithOpaqueIds() throws Exception {
+    bank.orders.clear();
+    String rawId = "[ТЕСТ] старая / заявка +?&=#";
+    long oldTime = Instant.now().getEpochSecond() - 900;
+    bank.orders.put(
+        rawId,
+        order(rawId).toBuilder()
+            .setOrderDate(timestamp(oldTime))
+            .clearStages()
+            .addStages(stage("[ТЕСТ] сделка /+?&=#", 5, 106, oldTime + 1))
+            .build());
+    reads.refresh();
+    credentials.replace("synthetic-exact-link-password".toCharArray());
+    var client =
+        HttpClient.newBuilder()
+            .cookieHandler(new CookieManager(null, CookiePolicy.ACCEPT_ALL))
+            .build();
+    login(client, "synthetic-exact-link-password");
+    var mapper = JsonMapper.builder().build();
+    var first = mapper.readTree(get(client, "/api/account/operations").body()).get("items").get(0);
+    String operationId = first.get("id").asText();
+    String orderId = first.get("orderIds").get(0).asText();
+    String fillId = first.get("fills").get(0).get("id").asText();
+    for (int i = 0; i < 123; i++) {
+      var next = order("new/" + i);
+      bank.orders.put(next.getOrderId(), next);
+    }
+    reads.refresh();
+    var filtered =
+        mapper.readTree(
+            get(
+                    client,
+                    "/api/account/operations?size=25&from="
+                        + URLEncoder.encode(
+                            Instant.now().minusSeconds(300).toString(),
+                            java.nio.charset.StandardCharsets.UTF_8))
+                .body());
+    assertThat(filtered.get("total").asInt()).isEqualTo(123);
+    assertThat(filtered.get("items").size()).isEqualTo(25);
+    var exactOrder =
+        mapper.readTree(
+            get(
+                    client,
+                    "/api/account/order?id="
+                        + URLEncoder.encode(orderId, java.nio.charset.StandardCharsets.UTF_8))
+                .body());
+    assertThat(exactOrder.get("operationIds")).isNotNull();
+    assertThat(exactOrder.get("operationIds").get(0).asText()).isEqualTo(operationId);
+    var exactFill =
+        mapper.readTree(
+            get(
+                    client,
+                    "/api/account/fill?id="
+                        + URLEncoder.encode(fillId, java.nio.charset.StandardCharsets.UTF_8))
+                .body());
+    assertThat(exactFill.get("operationIds").get(0).asText()).isEqualTo(operationId);
+    var exactOperation =
+        mapper.readTree(
+            get(
+                    client,
+                    "/api/account/operation?id="
+                        + URLEncoder.encode(operationId, java.nio.charset.StandardCharsets.UTF_8))
+                .body());
+    assertThat(exactOperation.get("fills").get(0).get("id").asText()).isEqualTo(fillId);
+    assertThat(exactFill.get("tradeId").asText()).isEqualTo("[ТЕСТ] сделка /+?&=#");
+    assertThat(get(client, "/api/account/order?id=missing").statusCode()).isEqualTo(404);
+    assertThat(get(client, "/api/account/fill?id=missing").statusCode()).isEqualTo(404);
+    assertThat(get(client, "/api/account/operation?id=missing").statusCode()).isEqualTo(404);
+    control.pauseInstrument("security", "[ТЕСТ] Пауза без доказанной связи с заявкой");
+    var asset = mapper.readTree(get(client, "/api/account/assets").body()).get("items").get(0);
+    var journal =
+        mapper.readTree(
+            get(client, "/api/account/journal?id=" + asset.get("journalId").asText()).body());
+    assertThat(journal.get("operationIds").isEmpty()).isTrue();
+    assertThat(journal.get("orderIds").isEmpty()).isTrue();
+    assertThat(journal.get("fillIds").isEmpty()).isTrue();
+    assertThat(bank.mutations).isZero();
+  }
+
+  @Test
+  void exactUnlinkedFillResolvesItsOwnOperationWithoutInventingOrder() throws Exception {
+    bank.orders.clear();
+    bank.unlinked =
+        OperationItem.newBuilder()
+            .setBrokerAccountId("mirror")
+            .setId("[ТЕСТ] unlinked /+")
+            .setInstrumentUid("security")
+            .setType(OperationType.OPERATION_TYPE_SELL)
+            .setState(OperationState.OPERATION_STATE_EXECUTED)
+            .setTradesInfo(
+                OperationItemTrades.newBuilder()
+                    .addTrades(
+                        OperationItemTrade.newBuilder()
+                            .setNum("[ТЕСТ] unlinked fill /+?&=#")
+                            .setQuantity(10)
+                            .setPrice(MoneyValue.newBuilder().setCurrency("rub").setUnits(112))
+                            .setDate(timestamp(bank.at))))
+            .build();
+    reads.refresh();
+    credentials.replace("synthetic-unlinked-links-password".toCharArray());
+    var client =
+        HttpClient.newBuilder()
+            .cookieHandler(new CookieManager(null, CookiePolicy.ACCEPT_ALL))
+            .build();
+    assertThat(get(client, "/api/account/fill?id=missing").statusCode()).isEqualTo(401);
+    login(client, "synthetic-unlinked-links-password");
+    var mapper = JsonMapper.builder().build();
+    var group = mapper.readTree(get(client, "/api/account/operations").body()).get("items").get(0);
+    assertThat(group.get("result").asText()).isEqualTo("UNLINKED_EVIDENCE");
+    String fill = group.get("fills").get(0).get("id").asText();
+    var detail =
+        mapper.readTree(
+            get(
+                    client,
+                    "/api/account/fill?id="
+                        + URLEncoder.encode(fill, java.nio.charset.StandardCharsets.UTF_8))
+                .body());
+    assertThat(detail.get("orderId").isNull()).isTrue();
+    assertThat(detail.get("operationIds").get(0)).isEqualTo(group.get("id"));
+    assertThat(bank.mutations).isZero();
+  }
+
   private void captureExample(String name, String body) throws Exception {
     String target = System.getProperty("orbita.http.examples.dir");
     if (target == null) return;
