@@ -8,6 +8,10 @@ declare
     restored timestamptz;
     column_list text;
     item text[];
+    manifest_version integer;
+    schema_version text;
+    key_expression text;
+    ambiguous boolean;
 begin
     if current_setting('orbita.demo.expected_database',true) is distinct from current_database()
        or current_setting('orbita.demo.expected_role',true) is distinct from current_user
@@ -25,9 +29,16 @@ begin
         raise exception 'Demo manifest is incomplete; no cleanup was performed';
     end if;
     perform 1 from public.control_state where id=1 for update;
-    select b.captured,b.restored_at into captured,restored from orbita_demo_preview.batch b where b.singleton and b.version=1 for update;
-    if not found or not captured then
+    select b.captured,b.restored_at,b.version into captured,restored,manifest_version from orbita_demo_preview.batch b where b.singleton and b.version in (1,2) for update;
+    if not found or captured is distinct from true then
         raise exception 'Demo ownership must be captured after all harness workers close; no cleanup was performed';
+    end if;
+    select version into schema_version from public.flyway_schema_history where success order by installed_rank desc limit 1;
+    if manifest_version=1 and schema_version is distinct from '15' then
+        raise exception 'Remove the legacy version 1 preview on schema 15 before upgrading';
+    elsif manifest_version=2 and (schema_version is distinct from '16' or to_regclass('public.account_read_document') is null
+       or to_regclass('public.account_read_freshness') is null or to_regclass('public.account_read_revision') is null) then
+        raise exception 'Version 2 preview requires qualified schema 16 read tables';
     end if;
     -- Only the unfinished harness teardown may restore its snapshot. A later Remove must
     -- preserve subsequent owner state instead of replaying an old control snapshot.
@@ -50,6 +61,58 @@ begin
        or exists(select 1 from public.mirror_trade_receipt r join orbita_demo_preview.instrument i on i.instrument_id=r.instrument_id
               where not exists(select 1 from orbita_demo_preview.owned o where o.relation='mirror_trade_receipt' and o.row_id=r.id)) then
         raise exception 'Demo cleanup found unrelated new trading facts on a demonstration instrument';
+    end if;
+
+    if manifest_version=2 then
+        -- These statements are planned only in v2/schema16. A v1/schema15 removal
+        -- never resolves an absent account_read_* relation or row_snapshot column.
+        foreach item slice 1 in array array[
+            array['account_read_document','jsonb_build_array(t.account_id,t.kind,t.id)::text'],
+            array['account_read_freshness','jsonb_build_array(t.account_id,t.section)::text'],
+            array['account_read_revision','jsonb_build_array(t.account_id)::text']
+        ] loop
+            key_expression=item[2];
+            execute format('select exists(select 1 from orbita_demo_preview.baseline b where b.relation=%L and b.row_snapshot is not null and not exists(select 1 from public.%I t where %s=b.row_id and to_jsonb(t)=b.row_snapshot))',item[1],item[1],key_expression) into ambiguous;
+            if ambiguous then raise exception 'Demo cleanup refuses changed baseline read data: %',item[1]; end if;
+            if item[1]<>'account_read_revision' then
+                execute format('select exists(select 1 from orbita_demo_preview.owned o where o.relation=%L and o.row_snapshot is not null %s and not exists(select 1 from public.%I t where %s=o.row_id and to_jsonb(t)=o.row_snapshot))',item[1],case when item[1]='account_read_document' then 'and o.row_snapshot->>''kind'' in (''SECURITY'',''CASH'',''BANK_ORDER'',''BANK_FILL'')' else '' end,item[1],key_expression) into ambiguous;
+                if ambiguous then raise exception 'Demo cleanup refuses changed captured broker observations: %',item[1]; end if;
+            end if;
+        end loop;
+        if exists(
+            select 1 from public.account_read_document d
+             where d.kind in ('SECURITY','CASH','BANK_ORDER','BANK_FILL')
+               and d.account_id in (select o.row_id::jsonb->>0 from orbita_demo_preview.owned o where o.relation in ('account_read_document','account_read_freshness','account_read_revision'))
+               and not exists(select 1 from orbita_demo_preview.owned o where o.relation='account_read_document' and o.row_id=jsonb_build_array(d.account_id,d.kind,d.id)::text)
+               and not exists(select 1 from orbita_demo_preview.baseline b where b.relation='account_read_document' and b.row_id=jsonb_build_array(d.account_id,d.kind,d.id)::text)
+        ) or exists(
+            select 1 from public.account_read_freshness f
+             where f.account_id in (select o.row_id::jsonb->>0 from orbita_demo_preview.owned o where o.relation in ('account_read_document','account_read_freshness','account_read_revision'))
+               and not exists(select 1 from orbita_demo_preview.owned o where o.relation='account_read_freshness' and o.row_id=jsonb_build_array(f.account_id,f.section)::text)
+               and not exists(select 1 from orbita_demo_preview.baseline b where b.relation='account_read_freshness' and b.row_id=jsonb_build_array(f.account_id,f.section)::text)
+        ) then raise exception 'Demo cleanup found unrelated new broker read data on a preview account'; end if;
+
+        -- Offline owner actions can rebuild projections after capture. Adopt only
+        -- derived records in already captured account/instrument scopes, never raw facts.
+        insert into orbita_demo_preview.owned(relation,row_id)
+          select 'account_read_document',jsonb_build_array(d.account_id,d.kind,d.id)::text
+            from public.account_read_document d join orbita_demo_preview.instrument i on i.instrument_id=d.instrument_id
+           where d.kind in ('ASSET','ORDER','OPERATION','FILL')
+             and d.account_id in (select o.row_id::jsonb->>0 from orbita_demo_preview.owned o where o.relation in ('account_read_document','account_read_freshness','account_read_revision'))
+             and not exists(select 1 from orbita_demo_preview.baseline b where b.relation='account_read_document' and b.row_id=jsonb_build_array(d.account_id,d.kind,d.id)::text)
+          on conflict do nothing;
+        insert into orbita_demo_preview.owned(relation,row_id)
+          select 'account_read_revision',jsonb_build_array(r.account_id)::text from public.account_read_revision r
+           where r.account_id in (select o.row_id::jsonb->>0 from orbita_demo_preview.owned o where o.relation='account_read_document')
+             and not exists(select 1 from orbita_demo_preview.baseline b where b.relation='account_read_revision' and b.row_id=jsonb_build_array(r.account_id)::text)
+          on conflict do nothing;
+        foreach item slice 1 in array array[
+            array['account_read_document','jsonb_build_array(t.account_id,t.kind,t.id)::text'],
+            array['account_read_freshness','jsonb_build_array(t.account_id,t.section)::text'],
+            array['account_read_revision','jsonb_build_array(t.account_id)::text']
+        ] loop
+            execute format('delete from public.%I t using orbita_demo_preview.owned o where o.relation=%L and o.row_id=%s',item[1],item[1],item[2]);
+        end loop;
     end if;
 
     -- Later manual retries and explicit instrument pause actions belong to these exact
@@ -82,6 +145,10 @@ begin
       on conflict do nothing;
     insert into orbita_demo_preview.owned(relation,row_id)
       select 'migration_verification',m.id::text from public.migration_verification m join orbita_demo_preview.owned o on o.relation='source_execution' and o.row_id=m.execution_id
+      on conflict do nothing;
+    insert into orbita_demo_preview.owned(relation,row_id)
+      select 'instrument_state',s.instrument_id from public.instrument_state s join orbita_demo_preview.instrument i using(instrument_id)
+       where not exists(select 1 from orbita_demo_preview.baseline b where b.relation='instrument_state' and b.row_id=s.instrument_id)
       on conflict do nothing;
 
     foreach item slice 1 in array array[

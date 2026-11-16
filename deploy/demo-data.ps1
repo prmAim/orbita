@@ -6,7 +6,8 @@ param(
     [switch]$ValidateOnly,
     [string]$OwnerPasswordFile,
     [string]$MavenRepository,
-    [string]$JavaHome
+    [string]$JavaHome,
+    [ValidateSet('Standard','Large')][string]$Scenario='Standard'
 )
 $ErrorActionPreference='Stop'
 
@@ -98,6 +99,7 @@ services:
             ORBITA_DEMO_JDBC_USERNAME='orbita'
             ORBITA_DEMO_JDBC_PASSWORD=$applicationEnvironment['SPRING_DATASOURCE_PASSWORD']
             ORBITA_DEMO_RETAIN='true'
+            ORBITA_DEMO_SCENARIO=$Scenario
             ORBITA_DEMO_OWNER_PASSWORD_FILE=$passwordPath
         }
         if($JavaHome){$environment['JAVA_HOME']=(Resolve-Path -LiteralPath $JavaHome).Path}
@@ -127,7 +129,15 @@ services:
     }
     if($restorationFailure){throw 'Preview restoration failed: keep the app stopped and restore the original Compose profile locally before retrying'}
     if($scenarioFailure){throw 'Integration scenario failed; temporary database port was removed and the original offline app restarted. Review the local Maven reports.'}
-    Write-Output "Full integration scenario completed in project $Project; generated application facts retained. Reports: $runDirectory"
+    Write-Output "Full $Scenario integration scenario completed in project $Project; generated application facts retained. Reports: $runDirectory"
+}
+function Assert-GenerateBaseline {
+    $query="select json_build_object('schema',(select version from public.flyway_schema_history where success order by installed_rank desc limit 1),'manifest',to_regnamespace('orbita_demo_preview') is not null)::text"
+    $result=@(& docker exec $database.Id psql --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 -U orbita -d orbita -c $query 2>&1)
+    if($LASTEXITCODE -ne 0){throw 'Cannot qualify the selected schema before Generate; no harness was started'}
+    try {$baseline=($result -join "`n") | ConvertFrom-Json} catch {throw 'Invalid schema qualification result; no harness was started'}
+    if($baseline.manifest){throw 'Remove the existing preview before regeneration. A version 1 preview must be removed on schema 15 before upgrading.'}
+    if($baseline.schema -cne '16'){throw 'Generate requires the updated application and qualified schema 16. Remove an old version 1 preview on schema 15 before upgrading.'}
 }
 
 if(-not(Test-Path -LiteralPath $ComposeOverride -PathType Leaf)){throw 'Compose override does not exist'}
@@ -171,7 +181,7 @@ foreach($mount in $app.Mounts) {
 $dataMount=@($database.Mounts | Where-Object Destination -eq '/var/lib/postgresql/data')
 if($dataMount.Count -ne 1 -or $dataMount[0].Name -cne ($Project+'_database')){throw 'Running database volume identity does not match'}
 if($ValidateOnly){Write-Output "Preview configuration verified for project $Project; no database changes.";return}
-if($Action -eq 'Generate'){Invoke-IntegrationScenario;return}
+if($Action -eq 'Generate'){Assert-GenerateBaseline;Invoke-IntegrationScenario;return}
 
 $sqlName='cleanup.sql'
 $sqlPath=Join-Path (Join-Path $PSScriptRoot 'demo') $sqlName

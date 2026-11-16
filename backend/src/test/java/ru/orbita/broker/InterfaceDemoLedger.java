@@ -26,6 +26,9 @@ public final class InterfaceDemoLedger {
     KEYS.put("journal_entry", "id");
     KEYS.put("notification", "id");
     KEYS.put("notification_attempt", "id");
+    KEYS.put("account_read_document", "account_id,kind,id");
+    KEYS.put("account_read_freshness", "account_id,section");
+    KEYS.put("account_read_revision", "account_id");
   }
 
   private final JdbcTemplate database;
@@ -57,9 +60,22 @@ public final class InterfaceDemoLedger {
             try (ResultSet row =
                 sql.executeQuery(
                     "select version from public.flyway_schema_history where success order by installed_rank desc limit 1")) {
-              if (!row.next() || !"15".equals(row.getString(1)))
-                throw new IllegalStateException("Demo requires the qualified schema version 15");
+              if (!row.next() || !"16".equals(row.getString(1)))
+                throw new IllegalStateException("Demo requires the qualified schema version 16");
             }
+            for (var key : KEYS.entrySet())
+              if (readRelation(key.getKey())) {
+                try (PreparedStatement check =
+                    connection.prepareStatement(
+                        "select string_agg(a.attname,',' order by k.ordinality) from pg_index i cross join lateral unnest(i.indkey) with ordinality k(attnum,ordinality) join pg_attribute a on a.attrelid=i.indrelid and a.attnum=k.attnum where i.indrelid=?::regclass and i.indisprimary")) {
+                  check.setString(1, "public." + key.getKey());
+                  try (ResultSet row = check.executeQuery()) {
+                    if (!row.next() || !key.getValue().equals(row.getString(1)))
+                      throw new IllegalStateException(
+                          "Unexpected read-model primary key: " + key.getKey());
+                  }
+                }
+              }
             try (ResultSet row =
                 sql.executeQuery(
                     "select mode='NOT_STARTED' and not live_accepted and not shadow_buy_checked and not shadow_sell_checked and shadow_version is null and automatic_boundary is null and permit_limit is null and permit_issued_at is null and permit_id is null and attempt_id is null and active_capital_candidate_id is null from public.control_state where id=1 for update")) {
@@ -70,7 +86,8 @@ public final class InterfaceDemoLedger {
             for (String relation : KEYS.keySet()) {
               if (relation.equals("journal_entry")
                   || relation.equals("notification")
-                  || relation.equals("notification_attempt")) continue;
+                  || relation.equals("notification_attempt")
+                  || readRelation(relation)) continue;
               try (ResultSet row =
                   sql.executeQuery("select exists(select 1 from public." + relation + ")")) {
                 row.next();
@@ -89,17 +106,17 @@ public final class InterfaceDemoLedger {
             }
             sql.execute("create schema orbita_demo_preview");
             sql.execute(
-                "create table orbita_demo_preview.batch(singleton boolean primary key check(singleton),version integer not null check(version=1),created_at timestamptz not null default clock_timestamp(),retained boolean not null,captured boolean not null default false,restored_at timestamptz,control_before jsonb not null,connectivity_before jsonb not null)");
+                "create table orbita_demo_preview.batch(singleton boolean primary key check(singleton),version integer not null check(version=2),created_at timestamptz not null default clock_timestamp(),retained boolean not null,captured boolean not null default false,restored_at timestamptz,control_before jsonb not null,connectivity_before jsonb not null)");
             sql.execute(
-                "create table orbita_demo_preview.baseline(relation text not null,row_id text not null,primary key(relation,row_id))");
+                "create table orbita_demo_preview.baseline(relation text not null,row_id text not null,row_snapshot jsonb,primary key(relation,row_id))");
             sql.execute(
-                "create table orbita_demo_preview.owned(relation text not null,row_id text not null,primary key(relation,row_id))");
+                "create table orbita_demo_preview.owned(relation text not null,row_id text not null,row_snapshot jsonb,primary key(relation,row_id))");
             sql.execute(
                 "create table orbita_demo_preview.instrument(instrument_id text primary key)");
           }
           try (PreparedStatement insert =
               connection.prepareStatement(
-                  "insert into orbita_demo_preview.batch(singleton,version,retained,control_before,connectivity_before) select true,1,?,to_jsonb(c),to_jsonb(b) from public.control_state c cross join public.broker_connectivity b where c.id=1 and b.singleton")) {
+                  "insert into orbita_demo_preview.batch(singleton,version,retained,control_before,connectivity_before) select true,2,?,to_jsonb(c),to_jsonb(b) from public.control_state c cross join public.broker_connectivity b where c.id=1 and b.singleton")) {
             insert.setBoolean(1, retained);
             if (insert.executeUpdate() != 1)
               throw new IllegalStateException("Demo baseline singleton is missing");
@@ -107,12 +124,15 @@ public final class InterfaceDemoLedger {
           try (Statement sql = connection.createStatement()) {
             for (var key : KEYS.entrySet())
               sql.executeUpdate(
-                  "insert into orbita_demo_preview.baseline(relation,row_id) select '"
+                  "insert into orbita_demo_preview.baseline(relation,row_id,row_snapshot) select '"
                       + key.getKey()
                       + "',"
-                      + key.getValue()
-                      + "::text from public."
-                      + key.getKey());
+                      + rowKey(key.getKey(), "t")
+                      + ","
+                      + (readRelation(key.getKey()) ? "to_jsonb(t)" : "null::jsonb")
+                      + " from public."
+                      + key.getKey()
+                      + " t");
           }
         });
     return ledger;
@@ -131,22 +151,40 @@ public final class InterfaceDemoLedger {
             }
             for (var key : KEYS.entrySet())
               sql.executeUpdate(
-                  "insert into orbita_demo_preview.owned(relation,row_id) select '"
+                  "insert into orbita_demo_preview.owned(relation,row_id,row_snapshot) select '"
                       + key.getKey()
-                      + "',t."
-                      + key.getValue()
-                      + "::text from public."
+                      + "',"
+                      + rowKey(key.getKey(), "t")
+                      + ","
+                      + (readRelation(key.getKey()) ? "to_jsonb(t)" : "null::jsonb")
+                      + " from public."
                       + key.getKey()
                       + " t where not exists(select 1 from orbita_demo_preview.baseline b where b.relation='"
                       + key.getKey()
-                      + "' and b.row_id=t."
-                      + key.getValue()
-                      + "::text) on conflict do nothing");
+                      + "' and b.row_id="
+                      + rowKey(key.getKey(), "t")
+                      + ") on conflict do nothing");
             sql.executeUpdate(
                 "insert into orbita_demo_preview.instrument select distinct e.instrument_id from public.source_execution e join orbita_demo_preview.owned o on o.relation='source_execution' and o.row_id=e.id union select p.instrument_id from public.mirror_position p join orbita_demo_preview.owned o on o.relation='mirror_position' and o.row_id=p.instrument_id union select i.instrument_id from public.instrument_state i join orbita_demo_preview.owned o on o.relation='instrument_state' and o.row_id=i.instrument_id on conflict do nothing");
+            sql.executeUpdate(
+                "insert into orbita_demo_preview.instrument select distinct d.instrument_id from public.account_read_document d join orbita_demo_preview.owned o on o.relation='account_read_document' and o.row_id="
+                    + rowKey("account_read_document", "d")
+                    + " where d.instrument_id is not null on conflict do nothing");
             sql.executeUpdate("update orbita_demo_preview.batch set captured=true where singleton");
           }
         });
+  }
+
+  private static boolean readRelation(String relation) {
+    return relation.startsWith("account_read_");
+  }
+
+  private static String rowKey(String relation, String alias) {
+    String columns =
+        java.util.Arrays.stream(KEYS.get(relation).split(","))
+            .map(column -> alias + "." + column)
+            .collect(java.util.stream.Collectors.joining(","));
+    return readRelation(relation) ? "jsonb_build_array(" + columns + ")::text" : columns + "::text";
   }
 
   /** Teardown only; never changes owner credentials and never replays the snapshot after UI use. */
@@ -183,6 +221,11 @@ public final class InterfaceDemoLedger {
     } catch (Exception failure) {
       throw new IllegalStateException("Demo cleanup failed", failure);
     }
+  }
+
+  /** Executes the shipped Remove artifact without creating or upgrading a manifest. */
+  public static void cleanup(JdbcTemplate database) {
+    new InterfaceDemoLedger(database).cleanup();
   }
 
   private static void restore(
