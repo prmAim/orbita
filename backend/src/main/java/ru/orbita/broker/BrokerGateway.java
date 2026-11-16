@@ -293,6 +293,38 @@ public interface BrokerGateway extends AutoCloseable {
     }
   }
 
+  /** Display-only all-account reads; unknown snapshots must never replace saved facts with zero. */
+  default AccountRead.Snapshot<AccountRead.Order> readOrders(
+      java.util.Collection<String> retainedBrokerOrderIds) {
+    return new AccountRead.Snapshot<>(
+        List.of(), null, null, false, List.of("Account order reader unavailable"));
+  }
+
+  default AccountRead.Holdings readHoldings() {
+    return new AccountRead.Holdings(
+        new AccountRead.Snapshot<>(
+            List.of(), null, null, false, List.of("Holdings reader unavailable")),
+        new AccountRead.Snapshot<>(
+            List.of(), null, null, false, List.of("Cash reader unavailable")));
+  }
+
+  default AccountRead.Snapshot<AccountRead.Order> readOrderHistory(
+      Instant from, Instant through, java.util.Collection<String> retainedBrokerOrderIds) {
+    return new AccountRead.Snapshot<>(
+        List.of(), null, null, false, List.of("Order history unavailable"));
+  }
+
+  default AccountRead.Snapshot<AccountRead.Execution> readExecutions(
+      Instant from, Instant through) {
+    return new AccountRead.Snapshot<>(
+        List.of(), null, null, false, List.of("Execution reader unavailable"));
+  }
+
+  default AutoCloseable observeCash(
+      java.util.function.Consumer<AccountRead.Snapshot<AccountRead.Cash>> sink) {
+    throw new UnsupportedOperationException("Cash stream unavailable");
+  }
+
   Instrument instrument(String instrumentId);
 
   CapitalEvidence capital(String accountId);

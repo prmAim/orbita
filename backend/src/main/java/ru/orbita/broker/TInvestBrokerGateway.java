@@ -44,6 +44,55 @@ public final class TInvestBrokerGateway implements BrokerGateway {
   }
 
   @Override
+  public AutoCloseable observeCash(
+      java.util.function.Consumer<AccountRead.Snapshot<AccountRead.Cash>> sink) {
+    return new AccountCashFeed(factory, mirrorAccount, clock, sink);
+  }
+
+  @Override
+  public AccountRead.Snapshot<AccountRead.Order> readOrderHistory(
+      Instant from, Instant through, java.util.Collection<String> retainedBrokerOrderIds) {
+    return new TInvestAccountReader(factory, mirrorAccount, clock)
+        .history(from, through, retainedBrokerOrderIds);
+  }
+
+  @Override
+  public AccountRead.Snapshot<AccountRead.Execution> readExecutions(Instant from, Instant through) {
+    var started = clock.instant();
+    var history = mirrorHistory(from, through);
+    var executions =
+        history.executions().stream()
+            .map(
+                e ->
+                    new AccountRead.Execution(
+                        e.tradeId(),
+                        null,
+                        e.instrumentId(),
+                        e.side(),
+                        e.lots(),
+                        "lots",
+                        new AccountRead.Price(
+                            e.price(), e.currency(), "currency per instrument unit"),
+                        e.executedAt(),
+                        null,
+                        "GetOperationsByCursor.tradesInfo; order link and individual commission unavailable"))
+            .toList();
+    return new AccountRead.Snapshot<>(
+        executions, started, clock.instant(), history.complete(), history.gaps());
+  }
+
+  @Override
+  public AccountRead.Snapshot<AccountRead.Order> readOrders(
+      java.util.Collection<String> retainedBrokerOrderIds) {
+    return new TInvestAccountReader(factory, mirrorAccount, clock).orders(retainedBrokerOrderIds);
+  }
+
+  @Override
+  public AccountRead.Holdings readHoldings() {
+    return new TInvestAccountReader(factory, mirrorAccount, clock).holdings();
+  }
+
+  @Override
   public OrderEvidence post(OrderRequest request) {
     validateMutation(request);
     var payload =
