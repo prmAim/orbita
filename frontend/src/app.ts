@@ -1,4 +1,7 @@
 import { OwnerNavigation, pages } from "./navigation.js";
+import { AssetsView } from "./assets.js";
+import { OrdersView } from "./orders.js";
+import { OperationsView } from "./operations.js";
 type Status = {
   mode: string;
   coefficient: string | null;
@@ -51,6 +54,7 @@ const byId = <T extends HTMLElement>(id: string) => {
 };
 let csrf: { token: string; headerName: string };
 let authenticated = false;
+let accessGeneration = 0;
 let refreshing = false;
 let refreshRequested = false;
 let routeGeneration = 0;
@@ -182,6 +186,10 @@ function message(text: string) {
   byId("message").textContent = text;
 }
 function lock(text = "Введите пароль для доступа к журналу и управлению.") {
+  accessGeneration++;
+  assetsView.clear();
+  ordersView.clear();
+  operationsView.clear();
   if (accessEvents) {
     accessEvents.onerror = null;
     accessEvents.close();
@@ -245,6 +253,7 @@ async function api<T>(
   method = "GET",
   body?: unknown,
 ): Promise<T> {
+  const generation = accessGeneration;
   const headers: Record<string, string> = {};
   if (method !== "GET") {
     headers[csrf.headerName] = csrf.token;
@@ -258,6 +267,7 @@ async function api<T>(
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     signal: AbortSignal.timeout(15000),
   });
+  if (generation !== accessGeneration) throw Error("Доступ изменён. Ответ прежней сессии отклонён.");
   if (response.status === 401) {
     lock("Доступ закрыт. Войдите с действующим паролем.");
     throw Error("Требуется вход");
@@ -273,8 +283,16 @@ async function api<T>(
   if (response.status === 204 || response.headers.get("content-length") === "0")
     return undefined as T;
   const text = await response.text();
+  if (generation !== accessGeneration) throw Error("Доступ изменён. Ответ прежней сессии отклонён.");
   return (text ? JSON.parse(text) : undefined) as T;
 }
+const assetsView = new AssetsView(byId("assets-view"), api, async (id, paused) => {
+  await api("/instruments/" + encodeURIComponent(id) + (paused ? "/resume" : "/pause"), "POST",
+    paused ? undefined : {text: "Ручная пауза владельца"});
+  await refresh();
+});
+const ordersView = new OrdersView(byId("orders-view"), api);
+const operationsView = new OperationsView(byId("operations-view"), api);
 function element<K extends keyof HTMLElementTagNameMap>(tag: K, text?: string) {
   const node = document.createElement(tag);
   if (text !== undefined) node.textContent = text;
@@ -557,6 +575,9 @@ async function refresh() {
     renderStatus(await api<Status>("/status"));
     if (generation !== routeGeneration || !authenticated) return;
     if (page === "control") await refreshInstruments();
+    else if (page === "assets") await assetsView.refresh();
+    else if (page === "orders") await ordersView.refresh();
+    else if (page === "operations") await operationsView.refresh();
     else if (page === "journal") await refreshJournal();
     else if (page === "notifications") await refreshNotifications();
     else if (page === "backup") await refreshBackups();
@@ -698,6 +719,7 @@ byId<HTMLFormElement>("login-form").onsubmit = (event) => {
       }
       csrf = await api("/csrf");
       await watchAccess();
+      accessGeneration++;
       authenticated = true;
       byId("login").hidden = true;
       byId("workspace").hidden = false;
@@ -717,6 +739,7 @@ void (async () => {
     csrf = await api("/csrf");
     const status = await api<Status>("/status");
     await watchAccess();
+    accessGeneration++;
     authenticated = true;
     byId("login").hidden = true;
     byId("workspace").hidden = false;

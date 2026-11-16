@@ -52,7 +52,17 @@ class OwnerAccessIT {
   void anonymousLoginLoadsKnownFrontendModulesWhileAccountDataAndUnknownAssetsStayProtected()
       throws Exception {
     for (String path :
-        new String[] {"/", "/app.js", "/navigation.js", "/collection.js", "/app.css"}) {
+        new String[] {
+          "/",
+          "/app.js",
+          "/navigation.js",
+          "/collection.js",
+          "/account-ui.js",
+          "/assets.js",
+          "/orders.js",
+          "/operations.js",
+          "/app.css"
+        }) {
       mvc.perform(get(path))
           .andExpect(status().isOk())
           .andExpect(header().string("Cache-Control", "no-store"));

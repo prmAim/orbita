@@ -35,7 +35,8 @@ export type Column<T> = {
 type Filter = {
   key: string;
   label: string;
-  options: Array<[string, string]>;
+  options?: Array<[string, string]>;
+  type?: "text" | "datetime-local";
 };
 type Options<T> = {
   id: string;
@@ -84,7 +85,7 @@ export class CollectionView<T> {
   private readonly next = node("button", "Следующая");
   private readonly search = node("input");
   private readonly size = node("select");
-  private readonly selectors = new Map<string, HTMLSelectElement>();
+  private readonly selectors = new Map<string, HTMLSelectElement | HTMLInputElement>();
   private generation = 0;
   private snapshot = "";
   private result: ListPage<T> | null = null;
@@ -126,9 +127,13 @@ export class CollectionView<T> {
       this.change(true);
     };
     for (const filter of options.filters ?? []) {
-      const select = node("select");
+      const select = filter.options ? node("select") : node("input");
+      if (select instanceof HTMLInputElement) {
+        select.type = filter.type ?? "text";
+        if (select.type === "datetime-local") select.step = "1";
+      }
       select.id = options.id + "-filter-" + filter.key;
-      for (const [value, text] of filter.options) {
+      for (const [value, text] of filter.options ?? []) {
         const option = node("option", text);
         option.value = value;
         select.append(option);

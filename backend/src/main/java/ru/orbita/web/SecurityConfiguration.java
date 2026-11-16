@@ -41,6 +41,10 @@ class SecurityConfiguration {
                         "/app.js",
                         "/navigation.js",
                         "/collection.js",
+                        "/account-ui.js",
+                        "/assets.js",
+                        "/orders.js",
+                        "/operations.js",
                         "/app.css",
                         "/api/csrf",
                         "/error")

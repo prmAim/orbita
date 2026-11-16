@@ -253,6 +253,13 @@ td:last-child {
 .collection-table td > * { max-width: 100%; }
 .collection-table tr[data-selected="true"] { background: #e6f0f7; outline: 2px solid var(--blue); outline-offset: -2px; }
 .list-empty { padding: 20px 9px; }
+.row-actions { display: flex; flex-direction: column; gap: 10px; align-items: flex-start; }
+.row-actions button { max-width: 100%; }
+.cash-table { margin-top: 14px; }
+.execution-detail { border-top: 1px solid var(--line); margin-top: 14px; padding-top: 8px; }
+.execution-detail dl { margin: 8px 0; }
+.execution-detail dt { font-weight: 600; color: #456077; margin-top: 9px; }
+.execution-detail dd { margin: 4px 0 8px; overflow-wrap: anywhere; }
 #message:not(:empty) {
   padding: 13px 18px;
   border: 1px solid #b89044;
