@@ -75,13 +75,13 @@ begin
             execute format('select exists(select 1 from orbita_demo_preview.baseline b where b.relation=%L and b.row_snapshot is not null and not exists(select 1 from public.%I t where %s=b.row_id and to_jsonb(t)=b.row_snapshot))',item[1],item[1],key_expression) into ambiguous;
             if ambiguous then raise exception 'Demo cleanup refuses changed baseline read data: %',item[1]; end if;
             if item[1]<>'account_read_revision' then
-                execute format('select exists(select 1 from orbita_demo_preview.owned o where o.relation=%L and o.row_snapshot is not null %s and not exists(select 1 from public.%I t where %s=o.row_id and to_jsonb(t)=o.row_snapshot))',item[1],case when item[1]='account_read_document' then 'and o.row_snapshot->>''kind'' in (''SECURITY'',''CASH'',''BANK_ORDER'',''BANK_FILL'')' else '' end,item[1],key_expression) into ambiguous;
+                execute format('select exists(select 1 from orbita_demo_preview.owned o where o.relation=%L and o.row_snapshot is not null %s and not exists(select 1 from public.%I t where %s=o.row_id and to_jsonb(t)=o.row_snapshot))',item[1],case when item[1]='account_read_document' then 'and o.row_snapshot->>''kind'' in (''SECURITY'',''CASH'',''CASH_PARTIAL'',''BANK_ORDER'',''BANK_FILL'')' else '' end,item[1],key_expression) into ambiguous;
                 if ambiguous then raise exception 'Demo cleanup refuses changed captured broker observations: %',item[1]; end if;
             end if;
         end loop;
         if exists(
             select 1 from public.account_read_document d
-             where d.kind in ('SECURITY','CASH','BANK_ORDER','BANK_FILL')
+             where d.kind in ('SECURITY','CASH','CASH_PARTIAL','BANK_ORDER','BANK_FILL')
                and d.account_id in (select o.row_id::jsonb->>0 from orbita_demo_preview.owned o where o.relation in ('account_read_document','account_read_freshness','account_read_revision'))
                and not exists(select 1 from orbita_demo_preview.owned o where o.relation='account_read_document' and o.row_id=jsonb_build_array(d.account_id,d.kind,d.id)::text)
                and not exists(select 1 from orbita_demo_preview.baseline b where b.relation='account_read_document' and b.row_id=jsonb_build_array(d.account_id,d.kind,d.id)::text)

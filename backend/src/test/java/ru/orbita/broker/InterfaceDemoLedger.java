@@ -138,7 +138,7 @@ public final class InterfaceDemoLedger {
     return ledger;
   }
 
-  /** Capture once, only after all harness workers, ports and application contexts have closed. */
+  /** Capture every read-document kind, including CASH_PARTIAL, only after full harness drain. */
   public void captureOwnedFacts() {
     transaction(
         connection -> {

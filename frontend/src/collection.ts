@@ -98,6 +98,7 @@ export class CollectionView<T> {
   private readonly controls: HTMLFormElement;
   private readonly pagination: HTMLDivElement;
   private exactInitialized = false;
+  private exact = false;
   constructor(private host: HTMLElement, private options: Options<T>) {
     this.storageKey = "orbita-list-v1-" + options.id;
     this.baseStorageKey = this.storageKey;
@@ -221,6 +222,10 @@ export class CollectionView<T> {
     this.clear();
   }
   exactMode(active: boolean) {
+    if (this.exact !== active) {
+      this.exact = active;
+      ++this.generation;
+    }
     this.controls.hidden = active;
     this.pagination.hidden = active;
   }
@@ -239,6 +244,7 @@ export class CollectionView<T> {
     this.snapshot = snapshot;
   }
   private change(reset = false) {
+    if (this.exact) return;
     if (reset)
       this.query.page = 0;
     this.save();
@@ -268,6 +274,7 @@ export class CollectionView<T> {
     this.change(true);
   }
   async refresh() {
+    if (this.exact) return;
     const generation = ++this.generation;
     this.host.setAttribute("aria-busy", "true");
     if (!this.result) {
@@ -346,13 +353,14 @@ export class CollectionView<T> {
     for (const column of this.options.columns) {
       const th = node("th");
       th.scope = "col";
-      if (column.sort) {
+      if (column.sort && !this.exact) {
         const selected = this.query.sort === column.sort;
         th.setAttribute("aria-sort", selected ? this.query.direction === "asc" ? "ascending" : "descending" : "none");
         const sort = node("button", column.label + (selected ? this.query.direction === "asc" ? " ↑" : " ↓" : ""));
         sort.id = this.options.id + "-sort-" + column.key;
         sort.setAttribute("aria-label", `Сортировать: ${column.label}, ${selected && this.query.direction === "asc" ? "по убыванию" : "по возрастанию"}`);
         sort.onclick = () => {
+          if (this.exact) return;
           this.query.direction = selected && this.query.direction === "asc" ? "desc" : "asc";
           this.query.sort = column.sort!;
           this.snapshot = "";

@@ -2,7 +2,10 @@ package ru.orbita.broker;
 
 import static org.assertj.core.api.Assertions.*;
 
+import java.math.BigDecimal;
 import java.time.Clock;
+import java.time.Instant;
+import java.util.List;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -239,6 +242,134 @@ class InterfaceDemoLedgerIT {
     return new JdbcTemplate(
         new DriverManagerDataSource(
             POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword()));
+  }
+
+  @Test
+  void unchangedCapturedPartialIsOwnedAndRemoved() {
+    var data = capturedPartial();
+    var db = database();
+    assertThat(
+            db.queryForObject(
+                "select count(*) from orbita_demo_preview.owned where relation='account_read_document' and row_snapshot->>'kind'='CASH_PARTIAL'",
+                Integer.class))
+        .isEqualTo(1);
+    data.ledger().cleanup();
+    assertThat(db.queryForObject("select count(*) from account_read_document", Integer.class))
+        .isZero();
+    assertThat(db.queryForObject("select count(*) from account_read_freshness", Integer.class))
+        .isZero();
+  }
+
+  @Test
+  void changedCapturedPartialRefusesEvenWhenFreshnessAndCoherentCashAreUnchanged() {
+    partialMutationMustRefuse("rub");
+  }
+
+  @Test
+  void newPartialCurrencyRefusesEvenWhenFreshnessAndCoherentCashAreUnchanged() {
+    partialMutationMustRefuse("usd");
+  }
+
+  private record PartialFixture(InterfaceDemoLedger ledger, Instant at) {}
+
+  private PartialFixture capturedPartial() {
+    var ledger = InterfaceDemoLedger.begin(database(), false);
+    Instant at = Instant.now().minusSeconds(10);
+    try (var preview = application("preview", false)) {
+      var reads = preview.getBean(AccountReadService.class);
+      reads.acceptCash(
+          new AccountRead.Snapshot<>(
+              List.of(
+                  new AccountRead.Cash(
+                      "rub",
+                      new BigDecimal("1000"),
+                      new BigDecimal("800"),
+                      new BigDecimal("200"),
+                      null,
+                      at.minusSeconds(5),
+                      "[ТЕСТ] cash stream",
+                      null),
+                  new AccountRead.Cash(
+                      "usd",
+                      new BigDecimal("10"),
+                      new BigDecimal("10"),
+                      BigDecimal.ZERO,
+                      null,
+                      at.minusSeconds(5),
+                      "[ТЕСТ] cash stream",
+                      null)),
+              at,
+              at,
+              false,
+              List.of("[ТЕСТ] partial currency inventory")));
+      reads.acceptCash(partialSnapshot("rub", at, at.minusSeconds(4), "900"));
+    }
+    ledger.captureOwnedFacts();
+    ledger.restoreControl();
+    return new PartialFixture(ledger, at);
+  }
+
+  private AccountRead.Snapshot<AccountRead.Cash> partialSnapshot(
+      String currency, Instant received, Instant bank, String available) {
+    return new AccountRead.Snapshot<>(
+        List.of(
+            new AccountRead.Cash(
+                currency,
+                null,
+                new BigDecimal(available),
+                null,
+                null,
+                bank,
+                "[ТЕСТ] cash stream",
+                null)),
+        received,
+        received,
+        false,
+        List.of("[ТЕСТ] partial currency inventory"));
+  }
+
+  private void partialMutationMustRefuse(String currency) {
+    var fixture = capturedPartial();
+    var db = database();
+    var freshness =
+        db.queryForList(
+            "select to_jsonb(f)::text from account_read_freshness f order by account_id,section",
+            String.class);
+    var coherent =
+        db.queryForList(
+            "select to_jsonb(d)::text from account_read_document d where kind='CASH' order by account_id,kind,id",
+            String.class);
+    try (var writer = application("preview", false)) {
+      // Public read-service seam: two bank observations can share one receive timestamp.
+      // No SQL seeds or freshness edits; isolate the raw partial-kind guard itself.
+      writer
+          .getBean(AccountReadService.class)
+          .acceptCash(partialSnapshot(currency, fixture.at(), fixture.at().minusSeconds(3), "901"));
+    }
+    assertThat(
+            db.queryForList(
+                "select to_jsonb(f)::text from account_read_freshness f order by account_id,section",
+                String.class))
+        .isEqualTo(freshness);
+    assertThat(
+            db.queryForList(
+                "select to_jsonb(d)::text from account_read_document d where kind='CASH' order by account_id,kind,id",
+                String.class))
+        .isEqualTo(coherent);
+    var all =
+        db.queryForList(
+            "select to_jsonb(d)::text from account_read_document d order by account_id,kind,id",
+            String.class);
+    assertThatThrownBy(fixture.ledger()::cleanup).rootCause().hasMessageContaining("Demo cleanup");
+    assertThat(
+            db.queryForList(
+                "select to_jsonb(d)::text from account_read_document d order by account_id,kind,id",
+                String.class))
+        .isEqualTo(all);
+    assertThat(
+            db.queryForObject(
+                "select to_regnamespace('orbita_demo_preview') is not null", Boolean.class))
+        .isTrue();
   }
 
   private ConfigurableApplicationContext application(String account, boolean bank) {
