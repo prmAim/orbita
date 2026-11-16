@@ -15,6 +15,13 @@ PostgreSQL 17.11 и Hibernate. Интерфейс написан на TypeScript
 [описании модулей](docs/architecture/application.md), доказательства сценариев —
 в [матрице приёмки v0.147](docs/acceptance/scenarios-v0.147.md).
 Решение о сессии веб-интерфейса: [ADR-0001](docs/adr/0001-local-web-session.md).
+Разделы «Активы», «Инструменты» и «Операции» описаны в
+[архитектуре панели](docs/architecture/panel-foundation.md); источники данных —
+в [контракте SDK](docs/architecture/account-read.md) и
+[модели чтения/HTTP](docs/architecture/account-read-model.md).
+Результаты проверки интерфейса v0.149 — в
+[отдельном отчёте](docs/acceptance/interface-v0.149.md), воспроизводимый
+временный набор — в [сквозном сценарии](docs/acceptance/interface-preview.md).
 
 Существующие Python CLI для проверки AI-окружения и чтения исполнений
 сохранены и устанавливаются отдельно через `uv`.
