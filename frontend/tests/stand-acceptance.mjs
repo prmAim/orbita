@@ -22,8 +22,10 @@ async function command(...args) {
   let output;
   try {
     output = await execute(cli, ["--session", options.session, "--json", ...args], { timeout: 120000, maxBuffer: 1024 * 1024, windowsHide: true });
-  } catch {
-    throw Error(`agent-browser ${args[0]} failed; verify the named session and native CLI path (--cli). No credentials are read by this runner.`);
+  } catch (error) {
+    // CLI assertion failures still carry the documented JSON response on stdout.
+    if (typeof error.stdout === "string" && error.stdout.trim()) output = { stdout: error.stdout };
+    else throw Error(`agent-browser ${args[0]} failed (${error.code ?? "process error"}); verify the named session and native CLI path (--cli).`);
   }
   let result;
   try { result = JSON.parse(output.stdout.trim()); } catch { throw Error("agent-browser did not return its documented JSON envelope"); }
@@ -31,8 +33,10 @@ async function command(...args) {
   return result.data;
 }
 async function evaluate(fn, argument) {
-  const source = `(${fn.toString()})(${JSON.stringify(argument)})`;
-  return (await command("eval", "-b", Buffer.from(source, "utf8").toString("base64"))).result;
+  const source = `(async()=>{try{return {ok:true,value:await (${fn.toString()})(${JSON.stringify(argument)})}}catch(error){return {ok:false,error:{name:error.name,message:error.message}}}})()`;
+  const result = (await command("eval", "-b", Buffer.from(source, "utf8").toString("base64"))).result;
+  if (!result?.ok) throw Error(`${fn.name || "browser assertion"}: ${result?.error?.name ?? "Error"}: ${result?.error?.message ?? "Missing structured eval result"}`);
+  return result.value;
 }
 
 // All browser actions below are ordinary navigation, search, filters and pagination.
@@ -63,6 +67,8 @@ async function mainChecks({ expectedTotal, origin }) {
     await wait(() => !document.querySelector(`#${page}`).hidden && document.querySelector(`#nav-${page}`).getAttribute("aria-current") === "page", `Section ${page} did not open`);
     if (["assets", "orders", "operations"].includes(page))
       await wait(() => settled(page) && !document.querySelector(`#${page}-search`).closest("form").hidden, `Ordinary ${page} list did not finish reading`);
+    // Data completion precedes OwnerNavigation's rendering-frame restoration.
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
   };
   const set = async (id, value, page) => {
     const input = document.getElementById(id); require(input, `Missing labelled control ${id}`);
@@ -180,7 +186,11 @@ async function mainChecks({ expectedTotal, origin }) {
   require(!document.querySelector("#operations-view .collection-content thead button"), "Exact headings still invoke generic sorting");
   await wait(() => document.activeElement.id === selected.id && selected.getBoundingClientRect().top < innerHeight && selected.getBoundingClientRect().bottom > 0, "Exact fill not focused and visible");
   history.back();
-  await wait(() => !document.querySelector("#assets").hidden && document.activeElement.id === sourceView.focus && Math.abs(scrollY - sourceView.scroll) <= 2, "Native Back lost asset focus/position");
+  try {
+    await wait(() => !document.querySelector("#assets").hidden && document.activeElement.id === sourceView.focus && Math.abs(scrollY - sourceView.scroll) <= 2, "Native Back lost asset focus/position");
+  } catch (error) {
+    throw Error(`${error.message}; ${JSON.stringify({expected:sourceView,actual:{scroll:scrollY,focus:document.activeElement.id,route:location.hash,assetsHidden:document.querySelector("#assets").hidden}})}`);
+  }
   await navigate("operations");
   require(document.querySelector("#operations-filter-from").value === "2099-01-01T00:00" && metadata("operations").total === 0, "Deep link overwrote previous list period");
   await navigate("assets");
