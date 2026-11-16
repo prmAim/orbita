@@ -66,6 +66,14 @@ class AccountReadStore {
         kind);
   }
 
+  void hide(String account, String kind, String id) {
+    db.update(
+        "update account_read_document set current=false where account_id=? and kind=? and id=? and current",
+        account,
+        kind,
+        id);
+  }
+
   void save(
       String account, String kind, String id, Object value, Instant observed, boolean current) {
     var data = map(value);

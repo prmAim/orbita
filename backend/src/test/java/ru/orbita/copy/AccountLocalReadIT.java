@@ -194,6 +194,115 @@ class AccountLocalReadIT {
         .isEqualTo("10");
   }
 
+  @Test
+  void activeLocalIntentCanBeFilteredBeforeAnyBankReadImport() {
+    control.markReconciled();
+    control.start();
+    control.markFeedReady(true);
+    control.shadowChecked(algorithms.current(), "BUY", true);
+    control.shadowChecked(algorithms.current(), "SELL", true);
+    clock.now = clock.now.plusSeconds(1);
+    control.issuePermit(new BigDecimal("1000"));
+    clock.now = clock.now.plusSeconds(1);
+    broker.partialNext = 0;
+    copies.accept(
+        new BrokerGateway.SourceExecution(
+            "source",
+            "active-before-import",
+            "active-source-order",
+            "instrument",
+            BrokerGateway.Side.BUY,
+            BigDecimal.ONE,
+            new BigDecimal("100"),
+            "RUB",
+            clock.instant(),
+            clock.instant()));
+    trading.tick();
+    assertThat(reads.page("orders", AccountQuery.defaults()).items().getFirst().get("status"))
+        .isEqualTo("ACTIVE");
+    var query = AccountQuery.parse(Map.of("status", "ACTIVE"));
+    assertThat(reads.page("orders", query).total()).isEqualTo(1);
+    assertThat(reads.page("operations", query).total()).isEqualTo(1);
+  }
+
+  @Test
+  void skippedSourceWithoutIntentRetainsExactReasonAndJournalAssociation() {
+    var source =
+        copies.accept(
+            new BrokerGateway.SourceExecution(
+                "source",
+                "[ТЕСТ] skipped/source",
+                "source-order",
+                "instrument",
+                BrokerGateway.Side.BUY,
+                BigDecimal.ONE,
+                new BigDecimal("100"),
+                "RUB",
+                clock.instant(),
+                clock.instant()));
+    assertThat(copies.intents()).isEmpty();
+    var group = reads.page("operations", AccountQuery.defaults()).items().getFirst();
+    assertThat(group.get("result")).isEqualTo("SKIPPED");
+    assertThat(group.get("reason")).isEqualTo("Исполнение до границы наблюдения или возобновления");
+    var journal = reads.journal(Long.parseLong(group.get("journalId").toString()));
+    assertThat(journal.get("category")).isEqualTo("SOURCE_SKIPPED");
+    assertThat(journal.get("detail"))
+        .isEqualTo(source.executionId() + " Исполнение до границы наблюдения или возобновления");
+  }
+
+  @Test
+  void sourceIdsWithSpacesNeverBorrowAnotherSkippedSourcesJournalReason() {
+    control.markReconciled();
+    control.start();
+    clock.now = clock.now.plusSeconds(1);
+    clock.evidenceAvailable = false;
+    var shortEvent =
+        new BrokerGateway.SourceExecution(
+            "source",
+            "[ТЕСТ] prefix",
+            "order-short",
+            "instrument",
+            BrokerGateway.Side.BUY,
+            BigDecimal.ONE,
+            new BigDecimal("100"),
+            "RUB",
+            clock.instant(),
+            clock.instant());
+    var longEvent =
+        new BrokerGateway.SourceExecution(
+            "source",
+            "[ТЕСТ] prefix suffix",
+            "order-long",
+            "instrument",
+            BrokerGateway.Side.BUY,
+            BigDecimal.ONE,
+            new BigDecimal("100"),
+            "RUB",
+            clock.instant(),
+            clock.instant());
+    var shortSource = copies.accept(shortEvent);
+    var longSource = copies.accept(longEvent);
+    copies.skipSource(shortEvent, "SHORT persisted reason");
+    copies.skipSource(longEvent, "LONG persisted reason");
+    var groups = reads.page("operations", AccountQuery.defaults()).items();
+    var shortGroup =
+        groups.stream()
+            .filter(g -> g.get("sourceExecutionId").equals(shortSource.executionId()))
+            .findFirst()
+            .orElseThrow();
+    var longGroup =
+        groups.stream()
+            .filter(g -> g.get("sourceExecutionId").equals(longSource.executionId()))
+            .findFirst()
+            .orElseThrow();
+    assertThat(shortGroup.get("reason")).isEqualTo("SHORT persisted reason");
+    assertThat(reads.journal(Long.parseLong(shortGroup.get("journalId").toString())).get("detail"))
+        .isEqualTo(shortSource.executionId() + " SHORT persisted reason");
+    assertThat(longGroup.get("reason").toString()).contains("не подтверждена");
+    assertThat(longGroup.get("journalId")).isNull();
+    assertThat(longGroup.get("complete")).isEqualTo(false);
+  }
+
   @TestConfiguration(proxyBeanMethods = false)
   static class ReadFixture {
     @Bean

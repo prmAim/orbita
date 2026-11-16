@@ -12,7 +12,7 @@ broker_fill, ручные корректировки или торговые к�
 - `account_read_document`: ключ `(account_id,kind,id)`, точный JSONB исходного
   контракта или HTTP-проекции, индексируемые поля поиска/фильтров/сортировки,
   время фактического наблюдения и признак текущей строки. Исходные виды:
-  SECURITY, CASH, BANK_ORDER, BANK_FILL. Проекции: ASSET, ORDER, OPERATION, FILL.
+  SECURITY, CASH, CASH_PARTIAL, BANK_ORDER, BANK_FILL. Проекции: ASSET, ORDER, OPERATION, FILL.
 - `account_read_freshness`: ключ `(account_id,section)`, последняя попытка,
   последнее успешное чтение, период и полнота отдельного источника.
 - `account_read_revision`: ключ `account_id`, отпечаток долговечных локальных
@@ -94,7 +94,14 @@ MANUAL требует точного совпадения всех исполн�
 публикуются явно, без обещания полной старой истории реального счёта.
 
 Денежные изменения применяются по валюте/банковскому времени, без удаления
-пропущенных валют. Старые/повторные события не освежают сумму. Неоднозначный
+пропущенных валют. Старые/повторные события не освежают сумму.
+Новый stream с отсутствующим available/blocked не заменяет прежнюю согласованную
+подтверждённую тройку: она и её времена остаются в CASH, а отдельное наблюдение
+сохраняется в CASH_PARTIAL той же таблицы document. Ограничение описывает его
+момент и поля; freshness строки становится UNCONFIRMED. Суммы разных моментов
+не складываются. Более новое полное согласованное событие обновляет всю тройку
+и снимает соответствующее ограничение. Без подтверждённой полной тройки строка
+не получает FRESH; повторное offline-чтение сохраняет это различие. Неоднозначный
 GetPositions.money сохраняется как reportedMoney и не заменяет подтверждённые
 stream total/available. Такой опрос не меняет время подтверждения этих сумм и
 не обновляет их lastSuccessAt. Свежесть учитывает и банковское время, и время
@@ -118,6 +125,11 @@ stream total/available. Такой опрос не меняет время по�
 Контракт ниже реализован в AccountReadController; точные query-ID получают
 запись вне текущей страницы/фильтров, неизвестный ID даёт 404. Journal link
 паузы использует существующее полное событие с точным совпадением причины.
+Для пропуска исходного исполнения без намерения причина восстанавливается из
+SOURCE_SKIPPED; nullable operation.journalId связывает именно этот журнал.
+Разбор старого текстового формата проверяет все сохранённые source IDs того
+же инструмента. Если ID с пробелами допускает несколько разборов, чужая причина
+не присваивается: причина/ссылка не подтверждены. Торговый журнал не меняется.
 
 AccountReadIT проверяет SDK/TLS → приложение → настоящий PostgreSQL → обычный
 HTTP владельца: 123 строки, поиск/фильтры/стабильные страницы, точные IDs,
@@ -149,7 +161,7 @@ Asset item: `{id,instrumentId,ticker,name,state,reason,journalId,copiedLots,manu
 
 Order item: `{id,brokerOrderId,requestId,instrumentId,ticker,name,side,lots,executedLots,remainingLots,type,createdAt,timeSemantics,limitPrice,status,origin,cancellationPending,sourceExecutionIds,fills,executionPrice,updatedAt,complete,reason}`. Unsent WAITING/SHADOW intentions are not active rows; their planned result remains in Operations. Unknown app intents have stable `intent:<UUID>` IDs even without bank ID. External IDs begin `order:`. Limits remain separate from execution price.
 
-Operation item: `{id,sourceExecutionId,instrumentId,ticker,name,side,time,timeSemantics,sourceLots,coefficient,targetLots,executedLots,skippedLots,result,reason,origin,orderIds,fills,lastExecutionAt,executionPrice,complete}`. No invented source/coefficient for external rows. ORBITA grouping uses durable source execution; fills unique across linked orders. Source price is not another primary column.
+Operation item: `{id,sourceExecutionId,instrumentId,ticker,name,side,time,timeSemantics,sourceLots,coefficient,targetLots,executedLots,skippedLots,result,reason,journalId,origin,orderIds,fills,lastExecutionAt,executionPrice,complete}`. No invented source/coefficient for external rows. ORBITA grouping uses durable source execution; fills unique across linked orders. Source price is not another primary column.
 
 Fill item: `{id,orderId,tradeId,instrumentId,side,lots,price,executedAt,commission,provenance,complete}`. Execution IDs are opaque composite encodings to avoid delimiter collisions. Unlinked operation-service fills stay explicitly unlinked and are not combined with order-service fills without evidence.
 

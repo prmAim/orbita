@@ -32,6 +32,7 @@ public record AccountQuery(
     if (status != null
         && !Set.of(
                 "NEW",
+                "ACTIVE",
                 "PARTIALLY_FILLED",
                 "FILLED",
                 "CANCELLED",

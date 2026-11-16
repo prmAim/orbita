@@ -229,37 +229,63 @@ public class AccountReadService {
         });
   }
 
+  private static boolean coherentCash(AccountRead.Cash cash) {
+    return cash.bankAt() != null
+        && cash.total() != null
+        && cash.available() != null
+        && cash.blocked() != null
+        && cash.total().compareTo(cash.available().add(cash.blocked())) == 0;
+  }
+
   private boolean saveCash(AccountRead.Cash incoming, Instant at) {
     var previous =
         store.documents(account, "CASH").stream()
             .filter(d -> d.id().equals(incoming.currency()))
             .findFirst()
             .orElse(null);
-    var value = incoming;
-    if (previous != null) {
-      var old = store.convert(previous.data(), AccountRead.Cash.class);
-      if (old.bankAt() != null
-          && incoming.bankAt() != null
-          && !incoming.bankAt().isAfter(old.bankAt())) return false;
-      if (incoming.bankAt() == null && old.bankAt() != null) {
-        value =
-            new AccountRead.Cash(
-                old.currency(),
-                old.total(),
-                old.available(),
-                old.blocked(),
-                incoming.reportedMoney(),
-                old.bankAt(),
-                old.source(),
-                old.limitation());
-        at = previous.observedAt();
+    var old = previous == null ? null : store.convert(previous.data(), AccountRead.Cash.class);
+    boolean coherent = coherentCash(incoming);
+    if (old != null
+        && old.bankAt() != null
+        && incoming.bankAt() != null
+        && (incoming.bankAt().isBefore(old.bankAt())
+            || incoming.bankAt().equals(old.bankAt()) && coherentCash(old))) return false;
+    var pending =
+        store.documents(account, "CASH_PARTIAL").stream()
+            .filter(d -> d.id().equals(incoming.currency()) && d.current())
+            .findFirst()
+            .orElse(null);
+    if (incoming.bankAt() != null && !coherent) {
+      if (pending != null) {
+        var seen = store.convert(pending.data(), AccountRead.Cash.class);
+        if (seen.bankAt() != null && !incoming.bankAt().isAfter(seen.bankAt())) return false;
       }
+      store.save(account, "CASH_PARTIAL", incoming.currency(), incoming, at, true);
+      if (old == null || !coherentCash(old))
+        store.save(account, "CASH", incoming.currency(), incoming, at, true);
+      return false;
+    }
+    var value = incoming;
+    if (old != null && incoming.bankAt() == null && old.bankAt() != null) {
+      value =
+          new AccountRead.Cash(
+              old.currency(),
+              old.total(),
+              old.available(),
+              old.blocked(),
+              incoming.reportedMoney(),
+              old.bankAt(),
+              old.source(),
+              old.limitation());
+      at = previous.observedAt();
     }
     store.save(account, "CASH", incoming.currency(), value, at, true);
-    return incoming.bankAt() != null
-        && incoming.total() != null
-        && incoming.available() != null
-        && incoming.blocked() != null;
+    if (coherent && pending != null) {
+      var seen = store.convert(pending.data(), AccountRead.Cash.class);
+      if (seen.bankAt() == null || !seen.bankAt().isAfter(incoming.bankAt()))
+        store.hide(account, "CASH_PARTIAL", incoming.currency());
+    }
+    return coherent;
   }
 
   private void cashFreshness(AccountRead.Snapshot<?> snapshot, boolean confirmedUpdate) {
@@ -276,7 +302,7 @@ public class AccountReadService {
         String.join("; ", snapshot.limitations())
             + (confirmedUpdate
                 ? "; confirmed currency update, inventory partial"
-                : "; raw poll does not refresh confirmed available/total amounts"));
+                : "; no new coherent currency tuple confirmed; retained values require qualification"));
   }
 
   public Page page(String section, AccountQuery query) {
@@ -338,6 +364,9 @@ public class AccountReadService {
   }
 
   private List<Map<String, Object>> cashViews() {
+    var partials = new HashMap<String, AccountReadStore.Document>();
+    for (var partial : store.documents(account, "CASH_PARTIAL"))
+      if (partial.current()) partials.put(partial.id(), partial);
     return store.documents(account, "CASH").stream()
         .filter(AccountReadStore.Document::current)
         .map(
@@ -347,9 +376,25 @@ public class AccountReadService {
                 row.put(key, str(row.get(key)));
               row.put("updatedAt", d.observedAt());
               var bankAt = row.get("bankAt");
+              var partial = partials.get(d.id());
+              if (partial != null) {
+                var p = partial.data();
+                row.put(
+                    "limitation",
+                    Objects.toString(row.get("limitation"), "")
+                        + "; Partial currency observation at "
+                        + p.get("bankAt")
+                        + ": available="
+                        + str(p.get("available"))
+                        + ", blocked="
+                        + str(p.get("blocked"))
+                        + "; total unconfirmed; last coherent tuple and its times retained");
+              }
               row.put(
                   "freshness",
-                  bankAt == null
+                  partial != null
+                          || !coherentCash(store.convert(d.data(), AccountRead.Cash.class))
+                          || bankAt == null
                       ? "UNCONFIRMED"
                       : Instant.parse(bankAt.toString()).plusSeconds(30).isBefore(clock.instant())
                               || d.observedAt().plusSeconds(30).isBefore(clock.instant())

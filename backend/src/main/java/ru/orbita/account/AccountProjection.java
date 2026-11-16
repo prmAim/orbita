@@ -23,6 +23,11 @@ final class AccountProjection {
       fills = new LinkedHashMap<>();
   private final Map<String, Map<String, Object>> intents = new LinkedHashMap<>();
   private final List<Map<String, Object>> receipts;
+
+  private record SkipEvidence(String reason, String journalId) {}
+
+  private final Map<String, SkipEvidence> skipEvidence = new HashMap<>();
+  private final Set<String> ambiguousSkips = new HashSet<>();
   private final Map<String, AccountReadStore.Document> rawSecurities = new HashMap<>();
   private final Map<String, List<Map<String, Object>>> durableFills = new HashMap<>();
 
@@ -49,6 +54,7 @@ final class AccountProjection {
       sources.put(text(row, "id"), row);
     for (var row : db.queryForList("select * from copy_intent order by created_at,id"))
       intents.put(text(row, "id"), row);
+    loadSkipEvidence();
     var bankOrders = store.documents(account, "BANK_ORDER");
     var consumed = new HashSet<String>();
     for (var intent : intents.values()) {
@@ -284,6 +290,36 @@ final class AccountProjection {
         f.quantity() != null && f.price() != null && f.executedAt() != null);
   }
 
+  private void loadSkipEvidence() {
+    for (var event :
+        db.queryForList(
+            "select id,instrument,detail from journal_entry where category='SOURCE_SKIPPED' order by id")) {
+      String detail = text(event, "detail");
+      var candidates =
+          sources.values().stream()
+              .filter(
+                  s ->
+                      text(s, "instrument_id").equals(text(event, "instrument"))
+                          && detail.startsWith(text(s, "id") + " "))
+              .map(s -> text(s, "id"))
+              .toList();
+      if (candidates.size() == 1) {
+        String id = candidates.getFirst();
+        skipEvidence.put(
+            id, new SkipEvidence(detail.substring(id.length() + 1), text(event, "id")));
+      } else if (candidates.size() > 1) ambiguousSkips.addAll(candidates);
+    }
+  }
+
+  private String sourceSkipReason(String sourceId) {
+    var exact = skipEvidence.get(sourceId);
+    return exact != null
+        ? exact.reason()
+        : ambiguousSkips.contains(sourceId)
+            ? "Причина пропуска не подтверждена: неоднозначная связь с журналом"
+            : null;
+  }
+
   private void operations() {
     for (var source : sources.values()) {
       String sourceId = text(source, "id");
@@ -352,7 +388,9 @@ final class AccountProjection {
                   .map(o -> nullable(o, "reason"))
                   .filter(Objects::nonNull)
                   .findFirst()
-                  .orElse(null),
+                  .orElse(sourceSkipReason(sourceId)),
+              "journalId",
+              skipEvidence.containsKey(sourceId) ? skipEvidence.get(sourceId).journalId() : null,
               "origin",
               "ORBITA",
               "orderIds",
@@ -364,7 +402,8 @@ final class AccountProjection {
               "executionPrice",
               average(groupFills, executed, complete),
               "complete",
-              complete);
+              complete
+                  && (!ambiguousSkips.contains(sourceId) || skipEvidence.containsKey(sourceId)));
       store.save(account, "OPERATION", text(row, "id"), row, clock.instant(), true);
     }
     for (var order : orders.values())
@@ -399,6 +438,8 @@ final class AccountProjection {
                 null,
                 "result",
                 order.get("status"),
+                "journalId",
+                null,
                 "reason",
                 "Нет исходного исполнения автоследования",
                 "origin",
@@ -454,6 +495,8 @@ final class AccountProjection {
               null,
               "result",
               "UNLINKED_EVIDENCE",
+              "journalId",
+              null,
               "reason",
               "Execution observed; order linkage and cross-service deduplication unconfirmed; excluded from grouped totals",
               "origin",

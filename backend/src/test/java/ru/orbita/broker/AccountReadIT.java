@@ -182,6 +182,7 @@ class AccountReadIT {
     assertThat(get(client, "/api/account/orders?size=7").statusCode()).isEqualTo(400);
     assertThat(get(client, "/api/account/orders?sort=unsafe").statusCode()).isEqualTo(400);
     assertThat(get(client, "/api/account/order?id=missing").statusCode()).isEqualTo(404);
+    captureHttpExamples(client, id);
     credentials.replace("synthetic-revoked-account-password".toCharArray());
     assertThat(get(client, "/api/account/orders").statusCode()).isEqualTo(401);
     assertThat(bank.mutations).isZero();
@@ -326,6 +327,198 @@ class AccountReadIT {
     }
   }
 
+  @org.junit.jupiter.params.ParameterizedTest
+  @org.junit.jupiter.params.provider.ValueSource(ints = {1, 2})
+  void partialCashStreamRetainsCoherentTupleAcrossOfflineReadAndFullUpdateRestoresIt(int mode)
+      throws Exception {
+    reads.refresh();
+    bank.cashOnlyRub = true;
+    credentials.replace("synthetic-partial-cash-password".toCharArray());
+    var client =
+        HttpClient.newBuilder()
+            .cookieHandler(new CookieManager(null, CookiePolicy.ACCEPT_ALL))
+            .build();
+    login(client, "synthetic-partial-cash-password");
+    String attempt =
+        JsonMapper.builder()
+            .build()
+            .readTree(get(client, "/api/account/assets").body())
+            .get("freshness")
+            .get("cash")
+            .get("lastAttemptAt")
+            .asText();
+    try (var feed = gateway.observeCash(reads::acceptCash)) {
+      awaitCashAttempt(client, attempt);
+    }
+    var before = JsonMapper.builder().build().readTree(get(client, "/api/account/assets").body());
+    var coherent = before.get("cash").get(0);
+    assertThat(coherent.get("total").asText()).isEqualTo("1000");
+    bank.cashMode = mode;
+    bank.cashAt++;
+    bank.cashAvailable = 900;
+    bank.cashBlocked = 300;
+    attempt = before.get("freshness").get("cash").get("lastAttemptAt").asText();
+    try (var feed = gateway.observeCash(reads::acceptCash)) {
+      awaitCashAttempt(client, attempt);
+    }
+    var partial =
+        JsonMapper.builder()
+            .build()
+            .readTree(get(client, "/api/account/assets").body())
+            .get("cash")
+            .get(0);
+    assertThat(partial.get("total").asText()).isEqualTo("1000");
+    assertThat(partial.get("available").asText()).isEqualTo("800");
+    assertThat(partial.get("blocked").asText()).isEqualTo("200");
+    assertThat(partial.get("bankAt")).isEqualTo(coherent.get("bankAt"));
+    assertThat(partial.get("updatedAt")).isEqualTo(coherent.get("updatedAt"));
+    assertThat(partial.get("freshness").asText()).isEqualTo("UNCONFIRMED");
+    assertThat(partial.get("limitation").asText()).contains("Partial currency observation");
+    captureExample(
+        "assets-partial-cash-" + mode + ".json", get(client, "/api/account/assets").body());
+    try (var offline =
+        new org.springframework.boot.builder.SpringApplicationBuilder(
+                ru.orbita.OrbitaApplication.class)
+            .run(
+                "--server.port=0",
+                "--spring.datasource.url=" + postgres.getJdbcUrl(),
+                "--spring.datasource.username=" + postgres.getUsername(),
+                "--spring.datasource.password=" + postgres.getPassword(),
+                "--orbita.worker.enabled=false",
+                "--orbita.broker.enabled=false",
+                "--orbita.account-read.enabled=false",
+                "--orbita.source-account=",
+                "--orbita.mirror-account=")) {
+      int offlinePort =
+          ((org.springframework.boot.web.server.context.WebServerApplicationContext) offline)
+              .getWebServer()
+              .getPort();
+      var offlineClient =
+          HttpClient.newBuilder()
+              .cookieHandler(new CookieManager(null, CookiePolicy.ACCEPT_ALL))
+              .build();
+      login(offlineClient, "synthetic-partial-cash-password", offlinePort);
+      var saved =
+          JsonMapper.builder()
+              .build()
+              .readTree(get(offlineClient, offlinePort, "/api/account/assets").body())
+              .get("cash")
+              .get(0);
+      assertThat(saved.get("total")).isEqualTo(partial.get("total"));
+      assertThat(saved.get("bankAt")).isEqualTo(partial.get("bankAt"));
+      assertThat(saved.get("updatedAt")).isEqualTo(partial.get("updatedAt"));
+      assertThat(saved.get("freshness").asText()).isEqualTo("UNCONFIRMED");
+    }
+    attempt =
+        JsonMapper.builder()
+            .build()
+            .readTree(get(client, "/api/account/assets").body())
+            .get("freshness")
+            .get("cash")
+            .get("lastAttemptAt")
+            .asText();
+    bank.cashMode = 0;
+    bank.cashAt++;
+    try (var feed = gateway.observeCash(reads::acceptCash)) {
+      awaitCashAttempt(client, attempt);
+    }
+    var restored =
+        JsonMapper.builder()
+            .build()
+            .readTree(get(client, "/api/account/assets").body())
+            .get("cash")
+            .get(0);
+    assertThat(restored.get("total").asText()).isEqualTo("1200");
+    assertThat(restored.get("available").asText()).isEqualTo("900");
+    assertThat(restored.get("blocked").asText()).isEqualTo("300");
+    assertThat(restored.get("freshness").asText()).isEqualTo("FRESH");
+    assertThat(restored.get("limitation").asText()).doesNotContain("Partial currency observation");
+    captureExample(
+        "assets-restored-cash-" + mode + ".json", get(client, "/api/account/assets").body());
+  }
+
+  private void awaitCashAttempt(HttpClient client, String before) throws Exception {
+    long until = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+    while (System.nanoTime() < until) {
+      var page = JsonMapper.builder().build().readTree(get(client, "/api/account/assets").body());
+      if (!page.get("freshness").get("cash").get("lastAttemptAt").asText().equals(before)) return;
+      Thread.sleep(20);
+    }
+    throw new AssertionError("Cash observation was not persisted");
+  }
+
+  private void captureExample(String name, String body) throws Exception {
+    String target = System.getProperty("orbita.http.examples.dir");
+    if (target == null) return;
+    var directory = java.nio.file.Path.of(target);
+    Files.createDirectories(directory);
+    Files.writeString(directory.resolve(name), body + "\n");
+  }
+
+  private void captureHttpExamples(HttpClient client, String orderId) throws Exception {
+    String target = System.getProperty("orbita.http.examples.dir");
+    if (target == null) return;
+    var directory = java.nio.file.Path.of(target);
+    Files.createDirectories(directory);
+    var mapper = JsonMapper.builder().build();
+    try (var feed = gateway.observeCash(reads::acceptCash)) {
+      long until = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+      while (mapper.readTree(get(client, "/api/account/assets").body()).get("cash").size() < 2
+          && System.nanoTime() < until) Thread.sleep(20);
+    }
+    control.pauseInstrument("security", "[ТЕСТ] Пример полной причины паузы");
+    for (String route : List.of("assets", "orders", "operations")) {
+      var reply = get(client, "/api/account/" + route);
+      assertThat(reply.statusCode()).isEqualTo(200);
+      Files.writeString(directory.resolve(route + ".json"), reply.body() + "\n");
+    }
+    var detail =
+        get(
+            client,
+            "/api/account/order?id="
+                + URLEncoder.encode(orderId, java.nio.charset.StandardCharsets.UTF_8));
+    Files.writeString(directory.resolve("order.json"), detail.body() + "\n");
+    String fill = mapper.readTree(detail.body()).get("fills").get(0).get("id").asText();
+    var reply =
+        get(
+            client,
+            "/api/account/fill?id="
+                + URLEncoder.encode(fill, java.nio.charset.StandardCharsets.UTF_8));
+    Files.writeString(directory.resolve("fill.json"), reply.body() + "\n");
+    var assets = mapper.readTree(Files.readString(directory.resolve("assets.json")));
+    Files.writeString(
+        directory.resolve("cash.json"), mapper.writeValueAsString(assets.get("cash")) + "\n");
+    String journal = assets.get("items").get(0).get("journalId").asText();
+    Files.writeString(
+        directory.resolve("journal.json"),
+        get(client, "/api/account/journal?id=" + journal).body() + "\n");
+    Files.writeString(
+        directory.resolve("README.txt"),
+        "SYNTHETIC ONLY. Actual owner HTTP response bodies from AccountReadIT, backed by local official SDK/TLS simulator and disposable PostgreSQL. Captured "
+            + Instant.now()
+            + ". cash.json is the cash array extracted from assets.json. No live broker/Telegram.\n");
+  }
+
+  private HttpResponse<String> get(HttpClient client, int targetPort, String path)
+      throws Exception {
+    return client.send(
+        HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + targetPort + path)).GET().build(),
+        HttpResponse.BodyHandlers.ofString());
+  }
+
+  private void login(HttpClient client, String password, int targetPort) throws Exception {
+    var csrf = JsonMapper.builder().build().readTree(get(client, targetPort, "/api/csrf").body());
+    var reply =
+        client.send(
+            HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + targetPort + "/api/login"))
+                .header(csrf.get("headerName").asText(), csrf.get("token").asText())
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .POST(HttpRequest.BodyPublishers.ofString("username=owner&password=" + password))
+                .build(),
+            HttpResponse.BodyHandlers.ofString());
+    assertThat(reply.statusCode()).isEqualTo(204);
+  }
+
   private HttpResponse<String> get(HttpClient client, String path) throws Exception {
     return client.send(
         HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + path)).GET().build(),
@@ -389,6 +582,9 @@ class AccountReadIT {
     final java.util.concurrent.atomic.AtomicInteger cashCancelled =
         new java.util.concurrent.atomic.AtomicInteger();
     long at;
+    int cashMode;
+    long cashAt, cashAvailable, cashBlocked;
+    boolean cashOnlyRub;
 
     void reset() {
       orders.clear();
@@ -398,6 +594,11 @@ class AccountReadIT {
       unlinked = null;
       mutations = 0;
       cashConnections = 0;
+      cashMode = 0;
+      cashAt = Instant.now().getEpochSecond() - 5;
+      cashAvailable = 800;
+      cashBlocked = 200;
+      cashOnlyRub = false;
       cashCancelled.set(0);
       orders.put("[ТЕСТ]/один", order("[ТЕСТ]/один"));
       orders.put("two", order("two"));
@@ -493,27 +694,24 @@ class AccountReadIT {
           cashConnections++;
           ((io.grpc.stub.ServerCallStreamObserver<PositionsStreamResponse>) out)
               .setOnCancelHandler(cashCancelled::incrementAndGet);
-          out.onNext(
-              PositionsStreamResponse.newBuilder()
-                  .setPosition(
-                      PositionData.newBuilder()
-                          .setAccountId("mirror")
-                          .setDate(timestamp(Instant.now().getEpochSecond()))
-                          .addMoney(
-                              PositionsMoney.newBuilder()
-                                  .setAvailableValue(
-                                      MoneyValue.newBuilder().setCurrency("rub").setUnits(800))
-                                  .setBlockedValue(
-                                      MoneyValue.newBuilder().setCurrency("rub").setUnits(200)))
-                          .addMoney(
-                              PositionsMoney.newBuilder()
-                                  .setAvailableValue(
-                                      MoneyValue.newBuilder()
-                                          .setCurrency("usd")
-                                          .setUnits(1)
-                                          .setNano(234567891))
-                                  .setBlockedValue(MoneyValue.newBuilder().setCurrency("usd"))))
-                  .build());
+          var money = PositionsMoney.newBuilder();
+          if (cashMode != 2)
+            money.setAvailableValue(
+                MoneyValue.newBuilder().setCurrency("rub").setUnits(cashAvailable));
+          if (cashMode != 1)
+            money.setBlockedValue(MoneyValue.newBuilder().setCurrency("rub").setUnits(cashBlocked));
+          var data =
+              PositionData.newBuilder()
+                  .setAccountId("mirror")
+                  .setDate(timestamp(cashAt))
+                  .addMoney(money);
+          if (!cashOnlyRub)
+            data.addMoney(
+                PositionsMoney.newBuilder()
+                    .setAvailableValue(
+                        MoneyValue.newBuilder().setCurrency("usd").setUnits(1).setNano(234567891))
+                    .setBlockedValue(MoneyValue.newBuilder().setCurrency("usd")));
+          out.onNext(PositionsStreamResponse.newBuilder().setPosition(data).build());
         }
       };
     }
@@ -546,6 +744,8 @@ class AccountReadIT {
         .setInstrumentUid("security")
         .setTicker("SYN")
         .setDirection(OrderDirection.ORDER_DIRECTION_SELL)
+        .setOrderType(OrderType.ORDER_TYPE_LIMIT)
+        .setInitialSecurityPrice(MoneyValue.newBuilder().setCurrency("rub").setUnits(120))
         .setLotsRequested(10)
         .setLotsExecuted(5)
         .setOrderDate(timestamp(at - 10))
