@@ -1,6 +1,7 @@
 import { CollectionView } from "./collection.js";
 import { type AccountPage, type Operation as OperationData, type Order, type Fill, type Read, el, time, label, price, decimal, link, reasonLink, instrument, orderTime, note } from "./account-ui.js";
 import { originOptions, sideOptions, statusOptions, orderStatus, limitPrice } from "./orders.js";
+import { routeHref, type OwnerRoute } from "./navigation.js";
 type Operation = OperationData & {
   journalId?: string | number | null;
 };
@@ -16,10 +17,11 @@ const field = (dl: HTMLDListElement, title: string, value: string | Node) => {
   dd.append(value);
   dl.append(el("dt", title), dd);
 };
-function fillDetails(fill: Fill): HTMLElement {
+function fillDetails(fill: Fill, context: string): HTMLElement {
   const article = el("article");
   article.className = "execution-detail";
-  article.id = "fill-" + encodeURIComponent(fill.id);
+  article.id = "fill-" + encodeURIComponent(context) + "-" + encodeURIComponent(fill.id);
+  article.dataset.exactFill = fill.id;
   article.append(el("h4", "Фактическое исполнение"));
   const dl = el("dl");
   field(dl, "Дата исполнения, МСК", link(time(fill.executedAt), {
@@ -62,9 +64,18 @@ export class OperationsView {
   readonly list: CollectionView<Operation>;
   private coverage = note("Период полноты истории не подтверждён.");
   private generation = 0;
+  private instrumentContext = el("div");
+  private route: OwnerRoute = {page: "operations"};
+  private exactContext = el("div");
+  private exactSnapshot = "";
+  private target: HTMLElement | null = null;
   constructor(host: HTMLElement, private read: Read) {
     const listHost = el("div");
-    host.replaceChildren(note("Период, МСК: время исходного исполнения для групп Орбиты; время создания заявки для самостоятельных заявок. Для непривязанного исполнения используется его фактическое время, явно подписанное в строке. Закрытые позиции остаются в истории."), this.coverage, listHost);
+    this.instrumentContext.id = "operation-instrument-context";
+    this.instrumentContext.hidden = true;
+    this.exactContext.id = "operation-exact-context";
+    this.exactContext.hidden = true;
+    host.replaceChildren(note("Период, МСК: время исходного исполнения для групп Орбиты; время создания заявки для самостоятельных заявок. Для непривязанного исполнения используется его фактическое время, явно подписанное в строке. Закрытые позиции остаются в истории."), this.instrumentContext, this.exactContext, this.coverage, listHost);
     this.list = new CollectionView(listHost, {
       id: "operations", label: "История заявок и исполнений", key: row => row.id, freshnessKeys: ["history", "executions"],
       filters: [
@@ -148,12 +159,102 @@ export class OperationsView {
           query.set("to", new Date(to + "+03:00").toISOString());
         if (from && to && from > to)
           throw Error("Начало периода позже конца. Исправьте границы в МСК.");
-        const page = await read<AccountPage<Operation>>("/account/operations?" + query);
+        return read<AccountPage<Operation>>("/account/operations?" + query);
+      },
+      applied: result => {
+        const page = result as AccountPage<Operation>;
+        if (this.route.instrument && !this.route.instrumentName && page.items[0])
+          this.showInstrument([page.items[0].ticker, page.items[0].name].filter(Boolean).join(" · "));
         const history = page.freshness.history, executions = page.freshness.executions;
         this.coverage.textContent = `Прочитанный период заявок: ${time(history?.from ?? null)} — ${time(history?.through ?? null)}. ${history?.complete ? "Полнота подтверждена для указанного периода." : "История заявок неполная."} Период исполнений: ${time(executions?.from ?? null)} — ${time(executions?.through ?? null)}. ${executions?.complete ? "Полнота подтверждена для указанного периода." : "История исполнений неполная."} ${history?.detail ?? ""} ${executions?.detail ?? ""}`;
-        return page;
       },
     });
+  }
+  setRoute(route: OwnerRoute) {
+    if (routeHref(route) !== routeHref(this.route)) this.generation++;
+    this.route = route;
+    const exact = Boolean(route.fill || route.order || route.operation);
+    this.list.setContext(exact ? routeHref(route) : route.instrument ? "instrument=" + route.instrument : "",
+      route.instrument ? {instrumentId: route.instrument} : {});
+    this.list.exactMode(exact);
+    this.exactContext.hidden = !exact;
+    this.coverage.hidden = exact;
+    this.target = null;
+    this.exactSnapshot = "";
+    this.exactContext.replaceChildren();
+    this.instrumentContext.hidden = !route.instrument;
+    if (route.instrument) this.showInstrument(route.instrumentName ?? "Выбранная бумага");
+  }
+  private async refreshExact() {
+    const generation = this.generation;
+    const route = this.route;
+    try {
+      let fill: (Fill & {operationIds: string[]}) | null = null;
+      let order: Order | null = null;
+      let operationIds: string[];
+      if (route.fill) {
+        fill = await this.read<Fill & {operationIds: string[]}>("/account/fill?" + new URLSearchParams({id: route.fill}));
+        if (route.order && route.order !== fill.orderId) throw Error("Связь исполнения с указанной заявкой не подтверждена");
+        if (route.instrument && route.instrument !== fill.instrumentId) throw Error("Исполнение относится к другой бумаге");
+        order = fill.orderId ? await this.read<Order>("/account/order?" + new URLSearchParams({id: fill.orderId})) : null;
+        operationIds = fill.operationIds;
+      } else if (route.operation) {
+        operationIds = [route.operation];
+      } else {
+        const exactOrder = await this.read<Order & {operationIds: string[]}>("/account/order?" + new URLSearchParams({id: route.order!}));
+        order = exactOrder;
+        operationIds = exactOrder.operationIds;
+      }
+      if (generation !== this.generation) return;
+      const groups = await Promise.all(operationIds.map(id => this.read<Operation>("/account/operation?" + new URLSearchParams({id}))));
+      if (generation !== this.generation) return;
+      if (route.operation && groups[0]?.id !== route.operation) throw Error("Запрошенная группа не подтверждена");
+      if (fill && groups.some(group => !group.fills.some(item => item.id === fill!.id))) throw Error("Связь исполнения с группой не подтверждена");
+      if (!fill && order && groups.some(group => !group.orderIds.includes(order!.id))) throw Error("Связь заявки с группой не подтверждена");
+      const snapshot = JSON.stringify({fill, order, operation: route.operation});
+      if (snapshot !== this.exactSnapshot) {
+        this.exactContext.replaceChildren(el("h3", fill ? "История выбранного исполнения" : order ? "История выбранной заявки" : "История выбранной группы"));
+        if (order) {
+          const article = linkedOrder(order, "exact:" + (fill?.id ?? order.id));
+          article.id = "exact-order-" + encodeURIComponent(order.id);
+          article.dataset.exactOrder = order.id;
+          if (!fill) { article.dataset.selected = "true"; article.tabIndex = -1; }
+          this.exactContext.append(article);
+        }
+        if (fill) this.exactContext.append(fillDetails(fill, "exact"));
+        this.exactSnapshot = snapshot;
+      }
+      this.list.showExact(groups, groups.map(group => group.id));
+      if (fill) {
+        const targets = [...document.querySelectorAll<HTMLElement>("#operations-view [data-exact-fill]")].filter(node => node.dataset.exactFill === fill!.id);
+        for (const node of targets) { node.dataset.selected = "true"; node.tabIndex = -1; }
+        this.target = targets[0] ?? null;
+      } else if (order) this.target = this.exactContext.querySelector<HTMLElement>("[data-exact-order]");
+      else {
+        const row = [...document.querySelectorAll<HTMLElement>("#operations-view tr[data-row-key]")].find(node => node.dataset.rowKey === route.operation);
+        if (row) { row.dataset.selected = "true"; row.tabIndex = -1; row.id = "exact-operation-" + encodeURIComponent(route.operation!); }
+        this.target = row ?? null;
+      }
+    } catch (error) {
+      if (generation !== this.generation) return;
+      this.list.clear();
+      this.list.exactMode(true);
+      const status = el("p", "Точная запись недоступна или чтение завершилось ошибкой. " + (error instanceof Error ? error.message : "Повторите чтение."));
+      status.id = "operation-exact-unavailable"; status.tabIndex = -1; status.setAttribute("role", "alert");
+      this.exactContext.replaceChildren(status);
+      this.exactSnapshot = "";
+      this.target = status;
+    }
+  }
+  reveal() {
+    if (!this.target?.isConnected) return;
+    this.target.scrollIntoView({block: "center"});
+    this.target.focus({preventScroll: true});
+  }
+  private showInstrument(name: string) {
+    const clear = link("Сбросить бумагу", {page: "operations"});
+    clear.id = "clear-operation-instrument";
+    this.instrumentContext.replaceChildren(note("История бумаги: " + name), clear);
   }
   private details(row: Operation): HTMLDetailsElement {
     const detail = el("details");
@@ -172,7 +273,7 @@ export class OperationsView {
     if (!row.fills.length)
       fills.append(note(row.executionPrice.status === "NO_EXECUTIONS" ? "Нет исполнений" : "Данные исполнений не подтверждены"));
     for (const fill of row.fills)
-      fills.append(fillDetails(fill));
+      fills.append(fillDetails(fill, row.id));
     detail.append(fills);
     let loaded = false;
     const load = async () => {
@@ -206,11 +307,12 @@ export class OperationsView {
     return detail;
   }
   refresh() {
-    return this.list.refresh();
+    return this.route.fill || this.route.order || this.route.operation ? this.refreshExact() : this.list.refresh();
   }
   clear() {
     this.generation++;
     this.list.clear();
+    this.exactContext.replaceChildren(); this.exactSnapshot = ""; this.target = null;
     this.coverage.textContent = "Период полноты истории не подтверждён.";
   }
 }

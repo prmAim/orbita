@@ -140,7 +140,8 @@ export function instrument(row: {
 }): HTMLElement {
   const node = el("div");
   node.append(link(row.ticker || row.instrumentId, {
-    page: "operations", instrument: row.instrumentId
+    page: "operations", instrument: row.instrumentId,
+    instrumentName: [row.ticker, row.name].filter(Boolean).join(" · ")
   }), el("div", row.name));
   return node;
 }

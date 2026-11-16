@@ -3,6 +3,7 @@ export type Page = (typeof pages)[number];
 export type OwnerRoute = {
   page: Page;
   instrument?: string;
+  instrumentName?: string;
   operation?: string;
   order?: string;
   fill?: string;
@@ -15,7 +16,7 @@ type Viewport = {
 const storageKey = "orbita-owner-navigation-v1";
 export function routeHref(route: OwnerRoute): string {
   const params = new URLSearchParams();
-  for (const key of ["instrument", "operation", "order", "fill", "journal"] as const)
+  for (const key of ["instrument", "instrumentName", "operation", "order", "fill", "journal"] as const)
     if (route[key] !== undefined)
       params.set(key, route[key]);
   return "#" + route.page + (params.size ? "?" + params : "");
@@ -26,7 +27,7 @@ export function readRoute(hash = location.hash): OwnerRoute {
     page: pages.includes(page as Page) ? page as Page : "assets"
   };
   const params = new URLSearchParams(query);
-  for (const key of ["instrument", "operation", "order", "fill", "journal"] as const) {
+  for (const key of ["instrument", "instrumentName", "operation", "order", "fill", "journal"] as const) {
     const value = params.get(key);
     if (value !== null)
       route[key] = value;
@@ -39,6 +40,7 @@ export class OwnerNavigation {
   private viewports: Record<string, Viewport> = {};
   private pendingRestore = true;
   private destinationGeneration = 0;
+  private revisitingEntry = false;
   constructor(private changed: () => void) {
     try {
       const saved = JSON.parse(sessionStorage.getItem(storageKey) ?? "{}");
@@ -48,10 +50,15 @@ export class OwnerNavigation {
     catch { /* Storage may be unavailable. */
     }
     history.scrollRestoration = "manual";
-    addEventListener("hashchange", () => {
+    this.markHistoryEntry();
+    addEventListener("hashchange", event => {
+      // Several hash changes may queue before the browser delivers their events.
+      // Only the event for the current destination may consume its restore state.
+      if (new URL(event.newURL).hash !== location.hash) return;
       // Native fragment navigation may already have moved focus/scroll. The
       // outgoing view was saved by navigate() or the focus/scroll listeners.
       this.route = readRoute();
+      this.markHistoryEntry();
       this.destinationGeneration++;
       this.pendingRestore = true;
       this.changed();
@@ -62,6 +69,12 @@ export class OwnerNavigation {
       passive: true
     });
     document.addEventListener("focusin", () => this.save());
+  }
+  private markHistoryEntry() {
+    const href = routeHref(this.route);
+    const state = history.state && typeof history.state === "object" ? history.state : {};
+    this.revisitingEntry = state.orbitaOwnerRoute === href;
+    history.replaceState({...state, orbitaOwnerRoute: href}, "");
   }
   navigate(route: OwnerRoute) {
     this.save();
@@ -85,7 +98,12 @@ export class OwnerNavigation {
     catch { /* Navigation still works without persistence. */
     }
   }
-  restore() {
+  suspend() {
+    this.save();
+    this.pendingRestore = true;
+    this.destinationGeneration++;
+  }
+  restore(firstVisit?: () => void) {
     // Call after the destination has rendered, including asynchronous HTTP reads.
     if (!this.pendingRestore)
       return;
@@ -95,11 +113,12 @@ export class OwnerNavigation {
     requestAnimationFrame(() => {
       if (routeHref(this.route) !== href || generation !== this.destinationGeneration)
         return;
-      if (state?.focus)
-        document.getElementById(state.focus)?.focus({
-          preventScroll: true
-        });
-      window.scrollTo(0, state?.scroll ?? 0);
+      if (firstVisit && !this.revisitingEntry) firstVisit();
+      else if (state) {
+        if (state.focus) document.getElementById(state.focus)?.focus({preventScroll: true});
+        window.scrollTo(0, state.scroll);
+      } else if (firstVisit) firstVisit();
+      else window.scrollTo(0, 0);
       this.pendingRestore = false;
     });
   }

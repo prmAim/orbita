@@ -83,11 +83,11 @@ export class AssetsView {
           }
         },
       ],
-      load: async (query) => {
-        const page = await read<AccountPage<Asset>>("/account/assets?" + query);
+      load: query => read<AccountPage<Asset>>("/account/assets?" + query),
+      applied: result => {
+        const page = result as AccountPage<Asset>;
         this.renderCash(page);
         this.readAt.textContent = "Получение остатков от брокера: " + time(page.freshness.assets?.lastSuccessAt ?? null);
-        return page;
       },
     });
   }

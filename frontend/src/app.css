@@ -260,6 +260,8 @@ td:last-child {
 .execution-detail dl { margin: 8px 0; }
 .execution-detail dt { font-weight: 600; color: #456077; margin-top: 9px; }
 .execution-detail dd { margin: 4px 0 8px; overflow-wrap: anywhere; }
+[data-exact-fill][data-selected="true"], [data-exact-order][data-selected="true"] { border: 2px solid var(--blue); background: #e6f0f7; padding: 12px; scroll-margin: 24px; }
+#journal-exact [data-selected="true"] { border-left: 4px solid var(--blue); background: #f2f6fa; padding: 16px; scroll-margin: 24px; }
 #message:not(:empty) {
   padding: 13px 18px;
   border: 1px solid #b89044;

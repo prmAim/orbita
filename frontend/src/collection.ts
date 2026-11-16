@@ -46,6 +46,7 @@ type Options<T> = {
   load: (query: URLSearchParams) => Promise<ListPage<T>>;
   key: (row: T) => string;
   freshnessKeys?: string[];
+  applied?: (page: ListPage<T>) => void;
 };
 const node = <K extends keyof HTMLElementTagNameMap>(tag: K, text?: string) => {
   const result = document.createElement(tag);
@@ -91,27 +92,22 @@ export class CollectionView<T> {
   private result: ListPage<T> | null = null;
   private expanded: string[] = [];
   private storageKey: string;
+  private readonly baseStorageKey: string;
+  private readonly defaults: ListQuery;
+  private context = "";
+  private readonly controls: HTMLFormElement;
+  private readonly pagination: HTMLDivElement;
+  private exactInitialized = false;
   constructor(private host: HTMLElement, private options: Options<T>) {
     this.storageKey = "orbita-list-v1-" + options.id;
+    this.baseStorageKey = this.storageKey;
     this.query = {
       search: "", page: 0, size: 25, sort: options.columns.find(c => c.sort)?.sort ?? "", direction: "asc", filters: {}
     };
-    try {
-      const saved = JSON.parse(sessionStorage.getItem(this.storageKey) ?? "null");
-      if (saved && typeof saved.query?.search === "string"
-        && Number.isSafeInteger(saved.query.page) && saved.query.page >= 0
-        && [25, 50, 100].includes(saved.query.size)
-        && ["asc", "desc"].includes(saved.query.direction)
-        && typeof saved.query.sort === "string"
-        && saved.query.filters && typeof saved.query.filters === "object"
-        && Object.values(saved.query.filters).every(value => typeof value === "string")) {
-        Object.assign(this.query, saved.query);
-        this.expanded = Array.isArray(saved.expanded) ? saved.expanded.filter((v: unknown) => typeof v === "string") : [];
-      }
-    }
-    catch { /* Treat unavailable or older storage as a fresh list. */
-    }
+    this.defaults = structuredClone(this.query);
+    this.restoreSaved();
     const controls = node("form");
+    this.controls = controls;
     controls.className = "list-controls";
     controls.setAttribute("role", "search");
     this.search.id = options.id + "-search";
@@ -153,6 +149,7 @@ export class CollectionView<T> {
     this.total.id = options.id + "-total";
     this.total.setAttribute("aria-live", "polite");
     const pagination = node("div");
+    this.pagination = pagination;
     pagination.className = "pagination";
     pagination.setAttribute("role", "group");
     pagination.setAttribute("aria-label", options.label + ": страницы");
@@ -193,6 +190,53 @@ export class CollectionView<T> {
     label.htmlFor = input.id;
     wrapper.append(label, input);
     parent.append(wrapper);
+  }
+  private restoreSaved() {
+    try {
+      const saved = JSON.parse(sessionStorage.getItem(this.storageKey) ?? "null");
+      if (saved && typeof saved.query?.search === "string"
+        && Number.isSafeInteger(saved.query.page) && saved.query.page >= 0
+        && [25, 50, 100].includes(saved.query.size)
+        && ["asc", "desc"].includes(saved.query.direction)
+        && typeof saved.query.sort === "string"
+        && saved.query.filters && typeof saved.query.filters === "object"
+        && Object.values(saved.query.filters).every(value => typeof value === "string")) {
+        Object.assign(this.query, saved.query);
+        this.expanded = Array.isArray(saved.expanded) ? saved.expanded.filter((v: unknown) => typeof v === "string") : [];
+      }
+    } catch { /* Invalid or unavailable storage starts a fresh context. */ }
+  }
+  setContext(context: string, filters: Record<string, string> = {}) {
+    if (this.context === context) return;
+    this.save();
+    this.context = context;
+    this.storageKey = this.baseStorageKey + (context ? ":context:" + context : "");
+    Object.assign(this.query, structuredClone(this.defaults));
+    this.expanded = [];
+    this.restoreSaved();
+    Object.assign(this.query.filters, filters);
+    this.search.value = this.query.search;
+    this.size.value = String(this.query.size);
+    for (const [key, selector] of this.selectors) selector.value = this.query.filters[key] ?? "";
+    this.clear();
+  }
+  exactMode(active: boolean) {
+    this.controls.hidden = active;
+    this.pagination.hidden = active;
+  }
+  showExact(items: T[], expandedKeys: string[]) {
+    this.exactMode(true);
+    this.host.setAttribute("aria-busy", "false");
+    this.status.dataset.state = "ready";
+    this.status.textContent = "Точная запись: прежние поиск, период и страницы списка здесь не применяются.";
+    const snapshot = "exact:" + JSON.stringify(items);
+    if (snapshot === this.snapshot) return;
+    this.save();
+    if (!this.exactInitialized) this.expanded = [...new Set([...this.expanded, ...expandedKeys])];
+    this.exactInitialized = true;
+    if (items.length) this.render(items);
+    else this.content.replaceChildren(node("p", "Связанная группа не подтверждена или недоступна в сохранённой истории."));
+    this.snapshot = snapshot;
   }
   private change(reset = false) {
     if (reset)
@@ -235,6 +279,7 @@ export class CollectionView<T> {
       if (generation !== this.generation)
         return;
       this.result = result;
+      this.options.applied?.(result);
       const entries = this.freshnessEntries();
       const stale = !entries.length || entries.some(([, value]) => value.status !== "FRESH");
       this.status.textContent = stale
@@ -352,6 +397,7 @@ export class CollectionView<T> {
       detail.open = this.expanded.includes(detail.dataset.expansion!);
   }
   clear() {
+    this.exactInitialized = false;
     ++this.generation;
     this.result = null;
     this.snapshot = "";

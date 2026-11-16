@@ -1,4 +1,4 @@
-import { OwnerNavigation, pages } from "./navigation.js";
+import { OwnerNavigation, pages, routeHref } from "./navigation.js";
 import { AssetsView } from "./assets.js";
 import { OrdersView } from "./orders.js";
 import { OperationsView } from "./operations.js";
@@ -30,6 +30,7 @@ type Journal = {
   instrument: string | null;
   detail: string;
 };
+type ExactJournal = Journal & {operationIds: string[]; orderIds: string[]; fillIds: string[]};
 type Instrument = {
   instrumentId: string;
   paused: boolean;
@@ -66,6 +67,8 @@ let notificationsSnapshot = "";
 let journalEntries: Journal[] = [];
 let journalSnapshot = "";
 let hasOlderJournal = true;
+let journalExactSnapshot = "";
+let journalExactRoute = "";
 const channel = new BroadcastChannel("orbita-owner-access");
 const date = (value: string | null) =>
   value
@@ -186,10 +189,13 @@ function message(text: string) {
   byId("message").textContent = text;
 }
 function lock(text = "Введите пароль для доступа к журналу и управлению.") {
+  navigation.suspend();
   accessGeneration++;
   assetsView.clear();
   ordersView.clear();
   operationsView.clear();
+  journalExact.replaceChildren();
+  journalExactSnapshot = "";
   if (accessEvents) {
     accessEvents.onerror = null;
     accessEvents.close();
@@ -293,6 +299,10 @@ const assetsView = new AssetsView(byId("assets-view"), api, async (id, paused) =
 });
 const ordersView = new OrdersView(byId("orders-view"), api);
 const operationsView = new OperationsView(byId("operations-view"), api);
+const journalExact = element("div");
+journalExact.id = "journal-exact";
+journalExact.hidden = true;
+byId("journal").querySelector("h2")!.after(journalExact);
 function element<K extends keyof HTMLElementTagNameMap>(tag: K, text?: string) {
   const node = document.createElement(tag);
   if (text !== undefined) node.textContent = text;
@@ -370,6 +380,41 @@ async function refreshJournal(append = false) {
     body.append(row);
   }
   byId<HTMLButtonElement>("older-journal").disabled = !hasOlderJournal;
+}
+async function refreshExactJournal() {
+  const generation = routeGeneration, access = accessGeneration;
+  try {
+    const row = await api<ExactJournal>("/account/journal?" + new URLSearchParams({id: navigation.route.journal!}));
+    if (generation !== routeGeneration || access !== accessGeneration) return;
+    const snapshot = JSON.stringify(row);
+    if (snapshot === journalExactSnapshot) return;
+    const article = element("article");
+    article.id = "journal-record-" + row.id;
+    article.dataset.journalId = String(row.id); article.dataset.selected = "true"; article.tabIndex = -1;
+    article.append(element("h3", journalLabel(row.category)), element("p", `Запись ${row.id}. ${date(row.occurredAt)}.`), element("pre", row.detail));
+    if (row.instrument) article.append(element("p", "Инструмент: " + row.instrument));
+    const relations = element("div"); relations.className = "row-actions";
+    for (const [kind, ids, title] of [
+      ["operation", row.operationIds ?? [], "Группа"], ["order", row.orderIds ?? [], "Заявка"], ["fill", row.fillIds ?? [], "Исполнение"],
+    ] as const) for (const id of ids) {
+      const link = element("a", title + ": " + id);
+      link.href = routeHref({page: "operations", [kind]: id});
+      link.id = `journal-${row.id}-${kind}-${encodeURIComponent(id)}`;
+      relations.append(link);
+    }
+    if (!relations.children.length) relations.append(element("p", "Подтверждённые связи с заявками и исполнениями недоступны."));
+    const back = element("a", "К списку журнала"); back.href = "#journal"; back.id = "journal-back-to-list";
+    article.append(relations, back); journalExact.replaceChildren(article); journalExactSnapshot = snapshot;
+  } catch (error) {
+    if (generation !== routeGeneration || access !== accessGeneration) return;
+    const status = element("p", "Точная запись журнала недоступна или чтение завершилось ошибкой. " + (error instanceof Error ? error.message : "Повторите чтение."));
+    status.id = "journal-exact-unavailable"; status.tabIndex = -1; status.setAttribute("role", "alert");
+    journalExact.replaceChildren(status); journalExactSnapshot = "";
+  }
+}
+function revealJournal() {
+  const target = journalExact.querySelector<HTMLElement>("[data-journal-id], [role=alert]");
+  target?.scrollIntoView({block: "center"}); target?.focus({preventScroll: true});
 }
 async function refreshNotifications() {
   const list = byId("notification-list");
@@ -570,20 +615,28 @@ async function refresh() {
   }
   refreshing = true;
   const generation = routeGeneration;
+  const access = accessGeneration;
   const page = activePage;
   try {
     renderStatus(await api<Status>("/status"));
-    if (generation !== routeGeneration || !authenticated) return;
+    if (generation !== routeGeneration || access !== accessGeneration || !authenticated) return;
     if (page === "control") await refreshInstruments();
     else if (page === "assets") await assetsView.refresh();
     else if (page === "orders") await ordersView.refresh();
     else if (page === "operations") await operationsView.refresh();
-    else if (page === "journal") await refreshJournal();
+    else if (page === "journal") {
+      if (navigation.route.journal) await refreshExactJournal();
+      else await refreshJournal();
+    }
     else if (page === "notifications") await refreshNotifications();
     else if (page === "backup") await refreshBackups();
-    if (generation === routeGeneration && authenticated) navigation.restore();
+    if (generation === routeGeneration && access === accessGeneration && authenticated) {
+      const reveal = page === "operations" && (navigation.route.fill || navigation.route.order || navigation.route.operation)
+        ? () => operationsView.reveal() : page === "journal" && navigation.route.journal ? revealJournal : undefined;
+      navigation.restore(reveal);
+    }
   } catch (error) {
-    lock(
+    if (access === accessGeneration) lock(
       "Связь с приложением потеряна. Журнал скрыт; повторите вход после восстановления связи.",
     );
   } finally {
@@ -595,20 +648,33 @@ async function refresh() {
   }
 }
 const navigation = new OwnerNavigation(() => activateRoute());
+addEventListener("beforeunload", () => {
+  navigation.save();
+  if (accessEvents) {
+    accessEvents.onerror = null;
+    accessEvents.close();
+    accessEvents = null;
+  }
+});
 function activateRoute() {
   routeGeneration++;
   activePage = navigation.route.page;
+  if (activePage === "operations") operationsView.setRoute(navigation.route);
+  if (activePage === "journal") {
+    const id = navigation.route.journal ?? "";
+    if (id !== journalExactRoute) { journalExact.replaceChildren(); journalExactSnapshot = ""; journalExactRoute = id; }
+    journalExact.hidden = !id;
+    byId("journal-rows").closest<HTMLElement>(".table-scroll")!.hidden = Boolean(id);
+    byId("older-journal").hidden = Boolean(id);
+  }
   for (const page of document.querySelectorAll<HTMLElement>(".page"))
     page.hidden = page.id !== activePage;
   for (const tab of document.querySelectorAll("[data-page]"))
     tab.removeAttribute("aria-current");
   byId("nav-" + activePage).setAttribute("aria-current", "page");
-  const detail = navigation.route.fill ?? navigation.route.order
-    ?? navigation.route.operation ?? navigation.route.journal;
   const status = byId("route-status");
-  status.hidden = detail === undefined;
-  status.textContent = detail === undefined ? ""
-    : `Запрошена конкретная запись: ${detail}. Точный переход будет доступен после подключения истории.`;
+  status.hidden = true;
+  status.textContent = "";
   void refresh();
 }
 for (const button of document.querySelectorAll<HTMLButtonElement>("[data-page]"))
