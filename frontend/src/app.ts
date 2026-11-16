@@ -52,6 +52,8 @@ const byId = <T extends HTMLElement>(id: string) => {
 let csrf: { token: string; headerName: string };
 let authenticated = false;
 let refreshing = false;
+let refreshRequested = false;
+let routeGeneration = 0;
 let activePage = "assets";
 let earliest = 0;
 let accessEvents: EventSource | null = null;
@@ -543,25 +545,37 @@ async function refreshBackups() {
     );
 }
 async function refresh() {
-  if (!authenticated || refreshing) return;
+  if (!authenticated) return;
+  if (refreshing) {
+    refreshRequested = true;
+    return;
+  }
   refreshing = true;
+  const generation = routeGeneration;
+  const page = activePage;
   try {
     renderStatus(await api<Status>("/status"));
-    if (activePage === "control") await refreshInstruments();
-    else if (activePage === "journal") await refreshJournal();
-    else if (activePage === "notifications") await refreshNotifications();
-    else if (activePage === "backup") await refreshBackups();
-    navigation.restore();
+    if (generation !== routeGeneration || !authenticated) return;
+    if (page === "control") await refreshInstruments();
+    else if (page === "journal") await refreshJournal();
+    else if (page === "notifications") await refreshNotifications();
+    else if (page === "backup") await refreshBackups();
+    if (generation === routeGeneration && authenticated) navigation.restore();
   } catch (error) {
     lock(
       "Связь с приложением потеряна. Журнал скрыт; повторите вход после восстановления связи.",
     );
   } finally {
     refreshing = false;
+    if (refreshRequested) {
+      refreshRequested = false;
+      void refresh();
+    }
   }
 }
 const navigation = new OwnerNavigation(() => activateRoute());
 function activateRoute() {
+  routeGeneration++;
   activePage = navigation.route.page;
   for (const page of document.querySelectorAll<HTMLElement>(".page"))
     page.hidden = page.id !== activePage;

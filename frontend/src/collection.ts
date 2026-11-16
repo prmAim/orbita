@@ -230,12 +230,11 @@ export class CollectionView<T> {
       if (generation !== this.generation)
         return;
       this.result = result;
-      const entries = Object.entries(result.freshness).filter(([key]) => !this.options.freshnessKeys || this.options.freshnessKeys.includes(key));
+      const entries = this.freshnessEntries();
       const stale = !entries.length || entries.some(([, value]) => value.status !== "FRESH");
-      const times = entries.map(([, value]) => value.lastSuccessAt).filter((value): value is string => value !== null);
-      this.status.textContent = stale ? `Данные не подтверждены свежим чтением. Последнее успешное чтение: ${times.length ? times.map(value => new Intl.DateTimeFormat("ru-RU", {
-        timeZone: "Europe/Moscow", dateStyle: "short", timeStyle: "medium"
-      }).format(new Date(value)) + " МСК").join("; ") : "не было"}. ${entries.map(([, value]) => value.detail ?? "").filter(Boolean).join("; ")}` : "";
+      this.status.textContent = stale
+        ? `Данные не подтверждены свежим чтением. Последнее успешное чтение: ${this.lastSuccessfulRead()}. ${entries.map(([, value]) => value.detail ?? "").filter(Boolean).join("; ")}`
+        : "";
       this.status.dataset.state = stale ? "stale" : "ready";
       const snapshot = JSON.stringify(result.items);
       if (snapshot !== this.snapshot) {
@@ -256,7 +255,10 @@ export class CollectionView<T> {
       if (generation !== this.generation)
         return;
       this.status.dataset.state = this.result ? "stale" : "error";
-      this.status.textContent = `${this.result ? "Показаны последние полученные данные. " : "Данные не загружены. "}${error instanceof Error ? error.message : "Ошибка чтения."}`;
+      const retained = this.result
+        ? `Показаны последние полученные данные. Последнее успешное чтение: ${this.lastSuccessfulRead()}. `
+        : "Данные не загружены. ";
+      this.status.textContent = retained + (error instanceof Error ? error.message : "Ошибка чтения.");
       const retry = node("button", "Повторить чтение");
       retry.onclick = () => void this.refresh();
       this.status.append(" ", retry);
@@ -265,6 +267,18 @@ export class CollectionView<T> {
       if (generation === this.generation)
         this.host.setAttribute("aria-busy", "false");
     }
+  }
+  private freshnessEntries() {
+    return Object.entries(this.result?.freshness ?? {}).filter(([key]) =>
+      !this.options.freshnessKeys || this.options.freshnessKeys.includes(key));
+  }
+  private lastSuccessfulRead() {
+    const times = this.freshnessEntries().map(([, value]) => value.lastSuccessAt)
+      .filter((value): value is string => value !== null);
+    const format = new Intl.DateTimeFormat("ru-RU", {
+      timeZone: "Europe/Moscow", dateStyle: "short", timeStyle: "medium",
+    });
+    return times.length ? times.map(value => format.format(new Date(value)) + " МСК").join("; ") : "не было";
   }
   private updatePagination() {
     const total = this.result?.total ?? 0;

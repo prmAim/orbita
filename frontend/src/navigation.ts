@@ -38,6 +38,7 @@ export class OwnerNavigation {
   route = readRoute();
   private viewports: Record<string, Viewport> = {};
   private pendingRestore = true;
+  private destinationGeneration = 0;
   constructor(private changed: () => void) {
     try {
       const saved = JSON.parse(sessionStorage.getItem(storageKey) ?? "{}");
@@ -48,8 +49,10 @@ export class OwnerNavigation {
     }
     history.scrollRestoration = "manual";
     addEventListener("hashchange", () => {
-      this.save();
+      // Native fragment navigation may already have moved focus/scroll. The
+      // outgoing view was saved by navigate() or the focus/scroll listeners.
       this.route = readRoute();
+      this.destinationGeneration++;
       this.pendingRestore = true;
       this.changed();
     });
@@ -88,8 +91,9 @@ export class OwnerNavigation {
       return;
     const state = this.viewports[routeHref(this.route)];
     const href = routeHref(this.route);
+    const generation = this.destinationGeneration;
     requestAnimationFrame(() => {
-      if (routeHref(this.route) !== href)
+      if (routeHref(this.route) !== href || generation !== this.destinationGeneration)
         return;
       if (state?.focus)
         document.getElementById(state.focus)?.focus({
