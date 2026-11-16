@@ -1,6 +1,7 @@
 package ru.orbita.copy;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.math.BigDecimal;
 import java.time.*;
@@ -38,6 +39,7 @@ class CopyLifecycleIT {
   @Autowired PositionRecoveryService recovery;
   @Autowired ManualReconciliationService manual;
   @Autowired ReconciliationService reconciliation;
+  @Autowired ru.orbita.runtime.ApplicationReadiness readiness;
 
   @org.junit.jupiter.api.BeforeEach
   void clean() {
@@ -68,6 +70,8 @@ class CopyLifecycleIT {
     broker.sourceCapital = new BigDecimal("100000");
     broker.failCapital = false;
     broker.historyExecutions.clear();
+    broker.failHistory = false;
+    broker.quotes.clear();
     broker.mirrorExecutions.clear();
     broker.fillEveryPost = false;
     broker.rejectNext = null;
@@ -77,8 +81,235 @@ class CopyLifecycleIT {
     broker.partialNext = -1;
     broker.orders.clear();
     broker.currencyCash = false;
+    broker.zeroFees = false;
     broker.sourceCash = new BigDecimal("100");
     broker.mirrorCash = new BigDecimal("100");
+  }
+
+  @Test
+  void acceptancePermitWaitsForPreviousAttemptAndIndependentFinalReconciliation() {
+    control.markReconciled();
+    control.start();
+    control.markFeedReady(true);
+    control.shadowChecked(algorithms.current(), "BUY", true);
+    control.shadowChecked(algorithms.current(), "SELL", true);
+    clock.now = clock.now.plusSeconds(1);
+    control.issuePermit(new BigDecimal("1000"));
+    clock.now = clock.now.plusSeconds(1);
+    broker.partialNext = 0;
+    copies.accept(source("first-acceptance", Side.BUY, 1, clock.instant()));
+    trading.dispatchReady();
+    assertThat(copies.intents())
+        .singleElement()
+        .satisfies(i -> assertThat(i.status()).isEqualTo("ACTIVE"));
+    assertThatThrownBy(() -> control.issuePermit(new BigDecimal("1000")))
+        .isInstanceOf(IllegalStateException.class);
+    var next =
+        new SourceExecution(
+            "source",
+            "second-acceptance",
+            "second-order",
+            "other",
+            Side.BUY,
+            BigDecimal.ONE,
+            new BigDecimal("100"),
+            "RUB",
+            clock.instant(),
+            clock.instant());
+    copies.accept(next);
+    trading.dispatchReady();
+    assertThat(broker.posts).isEqualTo(1);
+    var request = broker.sent;
+    trading.apply(broker.evidence(request, OrderStatus.UNKNOWN, 0), false);
+    assertThatThrownBy(() -> control.issuePermit(new BigDecimal("1000")))
+        .isInstanceOf(IllegalStateException.class);
+    broker.orders.put(request.requestId(), broker.evidence(request, OrderStatus.CANCELLED, 0));
+    trading.apply(broker.evidence(request, OrderStatus.CANCELLED, 0), true);
+    assertThatThrownBy(() -> control.issuePermit(new BigDecimal("1000")))
+        .isInstanceOf(IllegalStateException.class);
+    trading.reconcileOnly();
+    assertThatThrownBy(() -> control.issuePermit(new BigDecimal("1000")))
+        .isInstanceOf(IllegalStateException.class);
+    broker.historyExecutions.add(next);
+    assertThat(reconciliation.reconcile()).isTrue();
+    clock.now = clock.now.plusSeconds(1);
+    control.issuePermit(new BigDecimal("1000"));
+    clock.now = clock.now.plusSeconds(1);
+    copies.accept(
+        new SourceExecution(
+            "source",
+            "third-acceptance",
+            "third-order",
+            "other",
+            Side.BUY,
+            BigDecimal.ONE,
+            new BigDecimal("100"),
+            "RUB",
+            clock.instant(),
+            clock.instant()));
+    trading.dispatchReady();
+    assertThat(broker.posts).isEqualTo(2);
+  }
+
+  @Test
+  void correctedArtifactReplaysSavedNaturalInputsWithoutChangingOldResultsOrSending() {
+    var old = savedNaturalInputsWithFormerSellFailure();
+    broker.historyExecutions.clear();
+    broker.failHistory = true;
+    control.recoverStartup();
+    new ru.orbita.control.TradingWorker(
+            control, copies, trading, reconciliation, recovery, acceptance, manual, readiness)
+        .run();
+    assertThat(control.shadowQualified()).isTrue();
+    assertThat(acceptance.checks()).hasSize(4).containsAll(old);
+    assertThat(
+            acceptance.checks().stream()
+                .filter(c -> c.algorithmVersion().equals(algorithms.current())))
+        .hasSize(2)
+        .allSatisfy(
+            c -> {
+              assertThat(c.executionMatches()).isTrue();
+              assertThat(c.calculationMatches()).isTrue();
+              assertThat(c.replayNewLots()).isEqualTo(1);
+              assertThat(c.replayContribution()).isEqualByComparingTo("1");
+            });
+    assertThat(
+            db.queryForObject(
+                "select new_lots from source_execution where side='SELL'", Long.class))
+        .isEqualTo(999);
+    assertThat(broker.posts).isZero();
+    assertThat(copies.intents()).hasSize(2);
+  }
+
+  private List<ShadowCheck.View> savedNaturalInputsWithFormerSellFailure() {
+    control.markReconciled();
+    control.start();
+    control.markFeedReady(true);
+    clock.now = clock.now.plusSeconds(1);
+    var buy = source("saved-buy", Side.BUY, 1, clock.instant());
+    copies.accept(buy);
+    clock.now = clock.now.plusSeconds(1);
+    var sell = source("saved-sell", Side.SELL, 1, clock.instant());
+    copies.accept(sell);
+    acceptance.verifySavedShadow();
+    assertThat(acceptance.checks())
+        .hasSize(2)
+        .allSatisfy(c -> assertThat(c.executionMatches()).isTrue());
+    // Model persisted evidence from the former artifact, whose SELL arithmetic was wrong.
+    db.update("update source_execution set contribution=999,new_lots=999 where side='SELL'");
+    db.update(
+        "update shadow_check set algorithm_version='old-buggy-artifact',calculation_matches=false,detail='old incorrect SELL result' where side='SELL'");
+    db.update("update shadow_check set algorithm_version='old-buggy-artifact' where side='BUY'");
+    control.shadowChecked("old-buggy-artifact", "BUY", true);
+    control.shadowChecked("old-buggy-artifact", "SELL", false);
+    return acceptance.checks();
+  }
+
+  @Test
+  void legacyShadowProtocolsAcquireStructuredEvidenceWithoutOverwritingHistoricalFailure() {
+    savedNaturalInputsWithFormerSellFailure();
+    db.update("update shadow_check set algorithm_version='legacy',independent_history=null");
+    var old = acceptance.checks();
+    broker.failHistory = false;
+    acceptance.verifySavedShadow();
+    assertThat(acceptance.checks()).hasSize(4).containsAll(old);
+    assertThat(control.shadowQualified()).isTrue();
+    assertThat(
+            db.queryForObject(
+                "select count(*) from shadow_check where independent_history is not null",
+                Long.class))
+        .isEqualTo(2);
+    assertThat(broker.posts).isZero();
+  }
+
+  @org.junit.jupiter.params.ParameterizedTest
+  @org.junit.jupiter.params.provider.CsvSource({
+    "FILLED,false",
+    "REJECTED,false",
+    "FILLED,true",
+    "REJECTED,true"
+  })
+  void terminalAcceptanceResponseStillRequiresIndependentOrderFeeAndPositionReconciliation(
+      OrderStatus status, boolean zeroFees) {
+    broker.zeroFees = zeroFees;
+    control.markReconciled();
+    control.start();
+    control.markFeedReady(true);
+    control.shadowChecked(algorithms.current(), "BUY", true);
+    control.shadowChecked(algorithms.current(), "SELL", true);
+    clock.now = clock.now.plusSeconds(1);
+    control.issuePermit(new BigDecimal("1000"));
+    clock.now = clock.now.plusSeconds(1);
+    var execution = source("terminal-acceptance", Side.BUY, 1, clock.instant());
+    broker.fillEveryPost = status == OrderStatus.FILLED;
+    if (status == OrderStatus.REJECTED) broker.rejectNext = RejectionReason.OTHER;
+    copies.accept(execution);
+    trading.dispatchReady();
+    assertThat(copies.intents())
+        .singleElement()
+        .satisfies(i -> assertThat(i.status()).isEqualTo("FINAL"));
+    assertThatThrownBy(() -> control.issuePermit(new BigDecimal("2000")))
+        .isInstanceOf(IllegalStateException.class);
+    reconciliation.reconcile();
+    assertThatThrownBy(() -> control.issuePermit(new BigDecimal("2000")))
+        .isInstanceOf(IllegalStateException.class);
+    trading.reconcileOnly();
+    assertThatThrownBy(() -> control.issuePermit(new BigDecimal("2000")))
+        .isInstanceOf(IllegalStateException.class);
+    assertThat(reconciliation.reconcile()).isTrue();
+    control.issuePermit(new BigDecimal("2000"));
+    assertThat(control.status().permitLimit()).isEqualByComparingTo("2000");
+    assertThat(broker.posts).isEqualTo(1);
+  }
+
+  @Test
+  void automaticModeStillDispatchesAnotherInstrumentWhileFirstOrderIsActive() {
+    runningAtFive();
+    clock.now = clock.now.plusSeconds(1);
+    broker.partialNext = 0;
+    copies.accept(source("automatic-one", Side.BUY, 1, clock.instant()));
+    trading.dispatchReady();
+    broker.partialNext = 0;
+    copies.accept(
+        new SourceExecution(
+            "source",
+            "automatic-two",
+            "automatic-two",
+            "other",
+            Side.BUY,
+            BigDecimal.ONE,
+            new BigDecimal("100"),
+            "RUB",
+            clock.instant(),
+            clock.instant()));
+    trading.dispatchReady();
+    assertThat(broker.posts).isEqualTo(2);
+    assertThat(copies.intents())
+        .hasSize(2)
+        .allSatisfy(i -> assertThat(i.status()).isEqualTo("ACTIVE"));
+  }
+
+  @org.junit.jupiter.params.ParameterizedTest
+  @org.junit.jupiter.params.provider.EnumSource(Side.class)
+  void haltRetryRechecksFinalQuoteAndKeepsFullQuantityWhenEqual(Side side) {
+    runningAtFive();
+    if (side == Side.SELL) {
+      clock.now = clock.now.plusSeconds(1);
+      copies.accept(source("holding", Side.BUY, 20, clock.instant()));
+      trading.tick();
+    }
+    clock.now = clock.now.plusSeconds(1);
+    broker.rejectNext = RejectionReason.HALTED;
+    copies.accept(source("halt-price", side, 10, clock.instant()));
+    trading.tick();
+    int posts = broker.posts;
+    broker.quotes.addAll(List.of(new BigDecimal("100"), new BigDecimal("100.1")));
+    trading.dispatchReady();
+    assertThat(broker.posts).isEqualTo(posts);
+    broker.oppositePrice = new BigDecimal("100");
+    trading.dispatchReady();
+    assertThat(broker.posts).isEqualTo(posts + 1);
+    assertThat(broker.sent.lots()).isEqualTo(50);
   }
 
   @Test
@@ -1268,6 +1499,8 @@ class CopyLifecycleIT {
     Runnable capitalHook;
     java.util.function.Function<String, CapitalEvidence> capitalResponse;
     boolean failCapital;
+    boolean failHistory;
+    final Deque<BigDecimal> quotes = new ArrayDeque<>();
     BigDecimal mirrorCapital = new BigDecimal("100000");
     BigDecimal sourceCapital = new BigDecimal("100000");
     final List<SourceExecution> historyExecutions = new ArrayList<>();
@@ -1280,6 +1513,7 @@ class CopyLifecycleIT {
     long partialNext = -1;
     final Map<UUID, OrderEvidence> orders = new HashMap<>();
     boolean currencyCash;
+    boolean zeroFees;
     BigDecimal sourceCash = new BigDecimal("100"), mirrorCash = new BigDecimal("100");
     Runnable afterPostHook;
     Runnable afterReconcileHook;
@@ -1323,8 +1557,8 @@ class CopyLifecycleIT {
           new BigDecimal("10000"),
           100,
           100,
-          new BigDecimal("1"),
-          new BigDecimal("1"),
+          zeroFees ? BigDecimal.ZERO : BigDecimal.ONE,
+          zeroFees ? BigDecimal.ZERO : BigDecimal.ONE,
           clock.instant(),
           clock.instant(),
           !(blockPurchases && r.side() == Side.BUY),
@@ -1332,6 +1566,7 @@ class CopyLifecycleIT {
     }
 
     public History history(Instant a, Instant b) {
+      if (failHistory) throw new IllegalStateException("saved evidence only");
       return new History(
           historyExecutions.stream()
               .filter(e -> !e.executedAt().isBefore(a) && !e.executedAt().isAfter(b))
@@ -1355,6 +1590,26 @@ class CopyLifecycleIT {
               : BigDecimal.valueOf(bankLots + extraBankLots);
       var positions = new ArrayList<Position>();
       positions.add(new Position("instrument", quantity, BigDecimal.ZERO));
+      if ("source".equals(account)) {
+        historyExecutions.stream()
+            .map(SourceExecution::instrumentId)
+            .distinct()
+            .filter(id -> !id.equals("instrument"))
+            .forEach(
+                id ->
+                    positions.add(
+                        new Position(
+                            id,
+                            historyExecutions.stream()
+                                .filter(e -> e.instrumentId().equals(id))
+                                .map(
+                                    e ->
+                                        e.lots()
+                                            .multiply(
+                                                BigDecimal.valueOf(e.side() == Side.BUY ? 1 : -1)))
+                                .reduce(BigDecimal.ZERO, BigDecimal::add),
+                            BigDecimal.ZERO)));
+      }
       if (currencyCash)
         positions.add(
             new Position(
@@ -1368,7 +1623,7 @@ class CopyLifecycleIT {
     }
 
     public Optional<BigDecimal> bestOppositePrice(String id, Side side) {
-      return Optional.ofNullable(oppositePrice);
+      return Optional.ofNullable(quotes.isEmpty() ? oppositePrice : quotes.removeFirst());
     }
 
     public OrderEvidence post(OrderRequest r) {
@@ -1504,7 +1759,7 @@ class CopyLifecycleIT {
       return new CommissionEvidence(
           r.accountId(),
           r.requestId(),
-          BigDecimal.ONE,
+          zeroFees ? BigDecimal.ZERO : BigDecimal.ONE,
           settlementCurrency,
           finalState,
           clock.instant(),

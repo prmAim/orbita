@@ -699,6 +699,13 @@ public class ControlService {
               || limit.signum() <= 0)
             throw new IllegalStateException(
                 "Допуск требует работающего теневого режима, успешных проверок покупки и продажи, сверки и положительного предела RUB");
+          if (em.createQuery(
+                      "select count(i) from CopyIntent i where i.acceptanceAttempt=true and i.requestedLots>0 and i.acceptanceReconciled=false",
+                      Long.class)
+                  .getSingleResult()
+              > 0)
+            throw new IllegalStateException(
+                "Предыдущая приёмочная попытка требует завершения и сверки");
           establishBoundary(s);
           Instant issued =
               time.bound()

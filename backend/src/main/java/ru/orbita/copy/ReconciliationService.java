@@ -38,6 +38,14 @@ public class ReconciliationService {
   public boolean reconcile() {
     var gateway = gateways.getIfAvailable();
     if (gateway == null || !properties.accountsConfigured()) return false;
+    // Only attempts already independently terminal before these position reads can be cleared.
+    var acceptanceCandidates =
+        tx.execute(
+            _ ->
+                em.createQuery(
+                        "select i.id from CopyIntent i where i.acceptanceAttempt=true and i.acceptanceReconciled=false and i.status='FINAL' and i.acceptanceOrderReconciled=true and i.actualCommission is not null",
+                        UUID.class)
+                    .getResultList());
     PositionEvidence source, mirror;
     try {
       source = gateway.positions(properties.sourceAccount());
@@ -85,6 +93,7 @@ public class ReconciliationService {
         .filter(Position::availabilityQualified)
         .forEach(p -> instruments.add(p.instrumentId()));
     boolean all = true;
+    Set<String> matchedInstruments = new HashSet<>();
     for (String id : instruments) {
       Instrument instrument;
       try {
@@ -178,9 +187,27 @@ public class ReconciliationService {
               + ", брокер "
               + bankSource);
       if (!matches) all = false;
+      else matchedInstruments.add(id);
     }
     // A known discrepancy pauses its instrument; the other instruments retain their enabled mode.
     control.markReconciled();
+    if (!acceptanceCandidates.isEmpty()) {
+      tx.executeWithoutResult(
+          _ -> {
+            control.gate();
+            for (UUID id : acceptanceCandidates) {
+              var attempt = em.find(CopyIntent.class, id);
+              if (attempt == null
+                  || !"FINAL".equals(attempt.status)
+                  || !attempt.acceptanceOrderReconciled
+                  || attempt.actualCommission == null
+                  || !matchedInstruments.contains(attempt.instrumentId)) continue;
+              // Fresh matching positions follow independent terminal order and fee evidence.
+              // The owner's next explicit permit supplies the review and a new RUB cap.
+              attempt.acceptanceReconciled = true;
+            }
+          });
+    }
     return all;
   }
 

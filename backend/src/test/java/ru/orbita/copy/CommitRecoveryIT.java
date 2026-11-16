@@ -254,11 +254,16 @@ class CommitRecoveryIT {
             clock.instant(),
             clock.instant()));
     fault.slowSendCommitMillis.set(5050);
+    var originalPermit = control.gate();
+    var replacementFailure = new AtomicReference<Throwable>();
     fault.afterSendCommit =
         switch (ownerAction) {
           case "REVOKE" -> () -> control.revokePermit();
           case "STOP" -> () -> control.stop();
-          case "REPLACE" -> () -> control.issuePermit(new BigDecimal("2000"));
+          case "REPLACE" ->
+              () ->
+                  replacementFailure.set(
+                      catchThrowable(() -> control.issuePermit(new BigDecimal("2000"))));
           default -> null;
         };
     trading.dispatchReady();
@@ -268,9 +273,25 @@ class CommitRecoveryIT {
       trading.dispatchReady();
       assertThat(broker.posts).isEqualTo(1);
     } else if (ownerAction.equals("REPLACE")) {
+      assertThat(replacementFailure.get())
+          .isInstanceOf(IllegalStateException.class)
+          .hasMessageContaining("Предыдущая приёмочная попытка");
+      assertThat(control.gate().permitId()).isEqualTo(originalPermit.permitId());
+      assertThat(control.status().permitLimit()).isEqualByComparingTo("1000");
+      assertThat(copies.intents())
+          .singleElement()
+          .satisfies(i -> assertThat(i.status()).isEqualTo("WAITING"));
+      // The committed known-unsent barrier has now proved there was no broker attempt.
+      // A new explicit permit is legal; the old execution must not consume or replace it.
+      control.issuePermit(new BigDecimal("2000"));
+      var newPermit = control.gate();
+      assertThat(newPermit.permitId()).isNotEqualTo(originalPermit.permitId());
+      assertThat(newPermit.permitEpoch()).isGreaterThan(originalPermit.permitEpoch());
       assertThat(control.status().permitLimit()).isEqualByComparingTo("2000");
       trading.dispatchReady();
       assertThat(broker.posts).isZero();
+      assertThat(control.gate().permitId()).isEqualTo(newPermit.permitId());
+      assertThat(control.status().permitLimit()).isEqualByComparingTo("2000");
     } else {
       assertThat(control.status().permitLimit()).isNull();
       trading.tick();

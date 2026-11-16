@@ -27,6 +27,14 @@ public class ShadowCheck {
   @Column(nullable = false, columnDefinition = "text")
   String detail;
 
+  @Column(columnDefinition = "text")
+  String independentHistory;
+
+  @Column(precision = 150, scale = 100)
+  java.math.BigDecimal replayContribution;
+
+  Long replayNewLots;
+
   protected ShadowCheck() {}
 
   public record View(
@@ -37,7 +45,9 @@ public class ShadowCheck {
       Instant checkedAt,
       boolean executionMatches,
       boolean calculationMatches,
-      String detail) {}
+      String detail,
+      java.math.BigDecimal replayContribution,
+      Long replayNewLots) {}
 
   public View view() {
     return new View(
@@ -48,6 +58,8 @@ public class ShadowCheck {
         checkedAt,
         executionMatches,
         calculationMatches,
-        detail);
+        detail,
+        replayContribution,
+        replayNewLots);
   }
 }

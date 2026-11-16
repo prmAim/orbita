@@ -83,7 +83,7 @@ public class TradingService implements UnsentIntentStop {
         tx.execute(
             _ ->
                 em.createQuery(
-                        "select i.id from CopyIntent i where i.status in :states order by i.createdAt,i.id",
+                        "select i.id from CopyIntent i where i.status in :states or (i.acceptanceAttempt=true and i.status='FINAL' and i.acceptanceOrderReconciled=false and i.requestedLots>0) order by i.createdAt,i.id",
                         UUID.class)
                     .setParameter("states", LIVE)
                     .getResultList());
@@ -92,7 +92,7 @@ public class TradingService implements UnsentIntentStop {
         tx.execute(
             _ ->
                 em.createQuery(
-                        "from CopyIntent where status in ('FINAL','HALTED','RETRIED') and actualCommission is null and commissionReserve>0 order by prioritySequence,id",
+                        "from CopyIntent where status in ('FINAL','HALTED','RETRIED') and actualCommission is null and (commissionReserve>0 or (acceptanceAttempt=true and acceptanceReconciled=false)) order by prioritySequence,id",
                         CopyIntent.class)
                     .getResultList());
     for (var i : fees) {
@@ -234,6 +234,10 @@ public class TradingService implements UnsentIntentStop {
                   || !currentGate.running()
                   || currentGate.recalculationPaused()
                   || !currentGate.reconciled()) return null;
+              if (i.retryOf != null
+                  && (best == null
+                      || i.firstBestOpposite == null
+                      || best.compareTo(i.firstBestOpposite) != 0)) return null;
               if (!age(i.executedAt).allowed) return null;
               if (resources.requestStarted() == null
                   || clock.instant().isBefore(resources.requestStarted())
@@ -589,6 +593,8 @@ public class TradingService implements UnsentIntentStop {
               && evidence.lotsRequested() != i.requestedLots)
             throw new IllegalStateException("Order request volume evidence mismatch");
           if (!evidence.known()) {
+            i.acceptanceOrderReconciled = false;
+            i.acceptanceReconciled = false;
             i.status = "UNKNOWN";
             i.reason = "Неопределённый результат заявки; резерв сохранён";
             if (i.unknownNotification == null)
@@ -627,6 +633,7 @@ public class TradingService implements UnsentIntentStop {
                   || evidence.status() == OrderStatus.CANCELLED
                   || evidence.status() == OrderStatus.REJECTED;
           if (terminal) {
+            if (i.acceptanceAttempt && !postResponse) i.acceptanceOrderReconciled = true;
             i.cancellationPending = false;
             if (evidence.status() == OrderStatus.REJECTED
                 && evidence.rejectionReason() == RejectionReason.HALTED
@@ -670,6 +677,8 @@ public class TradingService implements UnsentIntentStop {
               else notifications.publish("ORDER_FINAL_SKIP", i.instrumentId, clock.instant(), text);
             }
           } else {
+            i.acceptanceOrderReconciled = false;
+            i.acceptanceReconciled = false;
             i.status = i.cancellationPending ? "CANCEL_STARTED" : "ACTIVE";
             if (i.sentAt == null) {
               i.sentAt =

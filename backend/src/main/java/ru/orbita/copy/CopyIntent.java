@@ -64,6 +64,8 @@ public class CopyIntent {
   long recoveryFirstTarget;
   long recoverySecondTarget;
   boolean acceptanceAttempt;
+  boolean acceptanceOrderReconciled;
+  boolean acceptanceReconciled;
   long requestedLots;
   long prioritySequence;
   boolean cancellationPending;

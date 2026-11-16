@@ -11,10 +11,9 @@ import ru.orbita.broker.BrokerGateway;
 import ru.orbita.broker.BrokerGateway.*;
 import ru.orbita.control.*;
 import ru.orbita.journal.JournalEntry;
+import tools.jackson.databind.json.JsonMapper;
 
-/**
- * Automatically verifies saved natural executions against a fresh independent broker-history read.
- */
+/** Automatically replays saved natural executions using retained independent broker evidence. */
 @Service
 public class AcceptanceService {
   private final EntityManager em;
@@ -25,6 +24,7 @@ public class AcceptanceService {
   private final Clock clock;
   private final OrbitaProperties properties;
   private final ru.orbita.valuation.RubValuation rubValuation;
+  private final JsonMapper json;
 
   public AcceptanceService(
       EntityManager em,
@@ -34,7 +34,8 @@ public class AcceptanceService {
       AlgorithmVersion algorithms,
       Clock clock,
       OrbitaProperties properties,
-      ru.orbita.valuation.RubValuation rubValuation) {
+      ru.orbita.valuation.RubValuation rubValuation,
+      JsonMapper json) {
     this.em = em;
     this.tx = tx;
     this.control = control;
@@ -43,11 +44,11 @@ public class AcceptanceService {
     this.clock = clock;
     this.properties = properties;
     this.rubValuation = rubValuation;
+    this.json = json;
   }
 
   public void verifySavedShadow() {
     BrokerGateway gateway = gateways.getIfAvailable();
-    if (gateway == null) return;
     for (String side : List.of("BUY", "SELL")) {
       SourceExecutionEntity event =
           tx.execute(
@@ -75,14 +76,20 @@ public class AcceptanceService {
         control.shadowChecked(algorithms.current(), side, true);
         continue;
       }
-      History history;
-      try {
-        history =
-            gateway.history(event.executedAt.minusSeconds(1), event.executedAt.plusSeconds(1));
-      } catch (RuntimeException e) {
-        PersistenceBoundary.rethrowBrokerPersistence(e);
-        continue;
+      History history = savedHistory(event.id);
+      if (history == null) {
+        // Legacy protocols retain their text unchanged. A fresh read supplies the structured
+        // evidence that later corrected artifacts can replay without another broker request.
+        if (gateway == null) continue;
+        try {
+          history =
+              gateway.history(event.executedAt.minusSeconds(1), event.executedAt.plusSeconds(1));
+        } catch (RuntimeException e) {
+          PersistenceBoundary.rethrowBrokerPersistence(e);
+          continue;
+        }
       }
+      History evidence = history;
       List<SourceExecution> exact =
           history.executions().stream()
               .filter(
@@ -95,10 +102,11 @@ public class AcceptanceService {
             var row = em.find(SourceExecutionEntity.class, event.id);
             Rational previous = prefix(row);
             Rational ratio = CopyService.exactCoefficient(row);
-            long expected = CopyCalculation.increment(previous, row.lots, ratio);
-            boolean calculation =
-                row.contribution.compareTo(ratio.multiply(row.lots).decimal(100)) == 0
-                    && row.newLots == expected;
+            long expected = previous.add(ratio.multiply(row.lots)).floor() - previous.floor();
+            // Run the installed calculation on the retained source inputs. A former artifact's
+            // incorrect output is audit history, not the oracle for a corrected calculation.
+            long replayLots = CopyCalculation.increment(previous, row.lots, ratio);
+            boolean calculation = replayLots == expected;
             ShadowCheck check = new ShadowCheck();
             check.id = UUID.randomUUID();
             check.executionId = row.id;
@@ -107,6 +115,9 @@ public class AcceptanceService {
             check.checkedAt = clock.instant();
             check.executionMatches = identity;
             check.calculationMatches = calculation;
+            check.independentHistory = json.writeValueAsString(evidence);
+            check.replayContribution = ratio.multiply(row.lots).decimal(100);
+            check.replayNewLots = replayLots;
             check.detail =
                 "Независимая история: "
                     + exact
@@ -114,7 +125,9 @@ public class AcceptanceService {
                     + row.coefficient
                     + "; ожидаемый прирост="
                     + expected
-                    + "; сохранённый="
+                    + "; повторный расчёт="
+                    + replayLots
+                    + "; исторически сохранённый="
                     + row.newLots;
             em.persist(check);
             control.shadowChecked(algorithms.current(), side, identity && calculation);
@@ -123,6 +136,21 @@ public class AcceptanceService {
                     clock.instant(), "SHADOW_CHECK", row.instrumentId, check.view().toString()));
           });
     }
+  }
+
+  private History savedHistory(String executionId) {
+    String saved =
+        tx.execute(
+            _ ->
+                em.createQuery(
+                        "select c.independentHistory from ShadowCheck c where c.executionId=:id and c.executionMatches=true and c.independentHistory is not null order by c.checkedAt,c.id",
+                        String.class)
+                    .setParameter("id", executionId)
+                    .setMaxResults(1)
+                    .getResultStream()
+                    .findFirst()
+                    .orElse(null));
+    return saved == null ? null : json.readValue(saved, History.class);
   }
 
   public void verifyLive() {
@@ -295,17 +323,19 @@ public class AcceptanceService {
   }
 
   private Rational prefix(SourceExecutionEntity e) {
-    return em
-        .createQuery(
-            "from SourceExecutionEntity e where e.accountId=:account and e.sourceOrderId=:order and e.acceptedSequence<:sequence and e.acceptedSequence>0",
+    return prefixRows(e).stream()
+        .map(row -> CopyService.exactCoefficient(row).multiply(row.lots))
+        .reduce(Rational.ZERO, Rational::add);
+  }
+
+  private List<SourceExecutionEntity> prefixRows(SourceExecutionEntity e) {
+    return em.createQuery(
+            "from SourceExecutionEntity e where e.accountId=:account and e.sourceOrderId=:order and e.acceptedSequence<:sequence and e.acceptedSequence>0 order by e.acceptedSequence,e.id",
             SourceExecutionEntity.class)
         .setParameter("account", e.accountId)
         .setParameter("order", e.sourceOrderId)
         .setParameter("sequence", e.acceptedSequence)
-        .getResultList()
-        .stream()
-        .map(row -> CopyService.exactCoefficient(row).multiply(row.lots))
-        .reduce(Rational.ZERO, Rational::add);
+        .getResultList();
   }
 
   private static boolean matches(SourceExecutionEntity e, SourceExecution actual) {
