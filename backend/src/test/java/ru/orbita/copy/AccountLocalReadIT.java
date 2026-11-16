@@ -43,6 +43,7 @@ class AccountLocalReadIT {
     CopyLifecycleIT.reset(db, broker, clock);
     db.execute("truncate account_read_document,account_read_freshness,account_read_revision");
     broker.displayOrders = List.of();
+    broker.displayExecutions = List.of();
   }
 
   @Test
@@ -96,13 +97,14 @@ class AccountLocalReadIT {
     assertThat(linkedFill.get("operationIds").get(0).asText()).isEqualTo(group.get("id"));
   }
 
-  @Test
-  void manualOriginRequiresExactDurableReceiptAndNeverInventsSourceOrCoefficient()
-      throws Exception {
+  @org.junit.jupiter.params.ParameterizedTest
+  @org.junit.jupiter.params.provider.CsvSource({"0,0,0", "123456789,123457000,0", "999999500,0,1"})
+  void manualOriginRequiresExactDurableReceiptAndNeverInventsSourceOrCoefficient(
+      long nanos, long roundedNanos, long carry) throws Exception {
     control.markReconciled();
     control.start();
     control.pauseInstrument("instrument", "Synthetic manual reconciliation");
-    clock.now = clock.now.plusSeconds(1);
+    clock.now = Instant.ofEpochSecond(clock.now.getEpochSecond() + 1, nanos);
     var trade =
         new BrokerGateway.SourceExecution(
             "mirror",
@@ -151,6 +153,14 @@ class AccountLocalReadIT {
     assertThat(reads.page("operations", AccountQuery.defaults()).items().getFirst().get("origin"))
         .isEqualTo("UNKNOWN");
     manual.reconcilePaused();
+    var persisted =
+        db.queryForObject(
+                "select executed_at from mirror_trade_receipt where instrument_id=?",
+                java.sql.Timestamp.class,
+                "instrument")
+            .toInstant();
+    assertThat(persisted)
+        .isEqualTo(Instant.ofEpochSecond(fill.executedAt().getEpochSecond() + carry, roundedNanos));
     var operation = reads.page("operations", AccountQuery.defaults()).items().getFirst();
     assertThat(operation.get("origin")).isEqualTo("MANUAL");
     assertThat(operation.get("sourceExecutionId")).isNull();
@@ -371,6 +381,179 @@ class AccountLocalReadIT {
     return java.net.URLEncoder.encode(value.toString(), java.nio.charset.StandardCharsets.UTF_8);
   }
 
+  @org.junit.jupiter.params.ParameterizedTest
+  @org.junit.jupiter.params.provider.CsvSource({"123456789,123457000,0", "999999500,0,1"})
+  void sdkNanosecondsMatchOnlyTheProvenPostgresRoundedTimestamp(
+      long nanos, long roundedNanos, long carry) throws Exception {
+    broker.fillEveryPost = true;
+    control.markReconciled();
+    control.start();
+    control.markFeedReady(true);
+    control.shadowChecked(algorithms.current(), "BUY", true);
+    control.shadowChecked(algorithms.current(), "SELL", true);
+    control.confirmLiveAcceptance();
+    control.enableAutomatic();
+    clock.now = clock.now.plusSeconds(1);
+    copies.accept(
+        new BrokerGateway.SourceExecution(
+            "source",
+            "nano-source",
+            "nano-source-order",
+            "instrument",
+            BrokerGateway.Side.BUY,
+            BigDecimal.ONE,
+            new BigDecimal("100"),
+            "RUB",
+            clock.instant(),
+            clock.instant()));
+    clock.now = Instant.ofEpochSecond(clock.now.getEpochSecond() + 1, nanos);
+    trading.tick();
+    var request = broker.sent;
+    var evidence = broker.orders.get(request.requestId());
+    var raw = evidence.fills().getFirst();
+    var stored =
+        db.queryForObject(
+                "select executed_at from broker_fill where intent_id=?",
+                java.sql.Timestamp.class,
+                request.requestId())
+            .toInstant();
+    assertThat(stored)
+        .isEqualTo(Instant.ofEpochSecond(raw.executedAt().getEpochSecond() + carry, roundedNanos));
+    var execution =
+        new AccountRead.Execution(
+            raw.tradeId(),
+            evidence.brokerOrderId(),
+            "instrument",
+            BrokerGateway.Side.BUY,
+            raw.lots(),
+            "lots",
+            new AccountRead.Price(raw.price(), raw.currency(), "currency per instrument unit"),
+            raw.executedAt(),
+            null,
+            "Synthetic SDK nanosecond stage");
+    var order =
+        new AccountRead.Order(
+            evidence.brokerOrderId(),
+            request.requestId().toString(),
+            "instrument",
+            "SYN",
+            BrokerGateway.Side.BUY,
+            1,
+            1,
+            BrokerGateway.OrderStatus.FILLED,
+            "LIMIT",
+            clock.instant(),
+            null,
+            List.of(execution),
+            true,
+            execution.price(),
+            AccountRead.Origin.UNKNOWN,
+            List.of());
+    broker.displayOrders = List.of(order);
+    reads.refresh();
+    var group = reads.page("operations", AccountQuery.defaults()).items().getFirst();
+    assertThat(((Map<?, ?>) group.get("executionPrice")).get("status")).isEqualTo("CONFIRMED");
+    assertThat(((Map<?, ?>) group.get("executionPrice")).get("value")).isEqualTo("100.5");
+    clock.now = clock.now.plusSeconds(1);
+    broker.displayExecutions =
+        List.of(
+            new AccountRead.Execution(
+                raw.tradeId(),
+                null,
+                "instrument",
+                BrokerGateway.Side.BUY,
+                raw.lots(),
+                "lots",
+                execution.price(),
+                raw.executedAt().plusNanos(1),
+                null,
+                "Synthetic distinct raw history timestamp"));
+    reads.refresh();
+    assertThat(
+            reads.page("operations", AccountQuery.defaults()).items().stream()
+                .filter(row -> row.get("result").equals("UNLINKED_EVIDENCE"))
+                .count())
+        .isEqualTo(1);
+    broker.displayExecutions = List.of();
+    var different =
+        new AccountRead.Execution(
+            raw.tradeId(),
+            evidence.brokerOrderId(),
+            "instrument",
+            BrokerGateway.Side.BUY,
+            raw.lots(),
+            "lots",
+            execution.price(),
+            raw.executedAt().plusNanos(1000),
+            null,
+            "Synthetic genuinely different stage time");
+    broker.displayOrders =
+        List.of(
+            new AccountRead.Order(
+                order.brokerOrderId(),
+                order.requestId(),
+                order.instrumentId(),
+                order.ticker(),
+                order.side(),
+                1,
+                1,
+                order.status(),
+                order.orderType(),
+                order.createdAt(),
+                null,
+                List.of(different),
+                true,
+                different.price(),
+                order.origin(),
+                List.of()));
+    reads.refresh();
+    group =
+        reads.page("operations", AccountQuery.defaults()).items().stream()
+            .filter(row -> row.get("origin").equals("ORBITA"))
+            .findFirst()
+            .orElseThrow();
+    assertThat(((Map<?, ?>) group.get("executionPrice")).get("status")).isEqualTo("UNCONFIRMED");
+    var changedPrice =
+        new AccountRead.Execution(
+            raw.tradeId(),
+            evidence.brokerOrderId(),
+            "instrument",
+            BrokerGateway.Side.BUY,
+            raw.lots(),
+            "lots",
+            new AccountRead.Price(
+                new BigDecimal("999"), raw.currency(), "currency per instrument unit"),
+            raw.executedAt(),
+            null,
+            "Synthetic genuinely different stage price");
+    broker.displayOrders =
+        List.of(
+            new AccountRead.Order(
+                order.brokerOrderId(),
+                order.requestId(),
+                order.instrumentId(),
+                order.ticker(),
+                order.side(),
+                1,
+                1,
+                order.status(),
+                order.orderType(),
+                order.createdAt(),
+                null,
+                List.of(changedPrice),
+                true,
+                changedPrice.price(),
+                order.origin(),
+                List.of()));
+    reads.refresh();
+    group =
+        reads.page("operations", AccountQuery.defaults()).items().stream()
+            .filter(row -> row.get("origin").equals("ORBITA"))
+            .findFirst()
+            .orElseThrow();
+    assertThat(((Map<?, ?>) group.get("executionPrice")).get("status")).isEqualTo("UNCONFIRMED");
+  }
+
   @TestConfiguration(proxyBeanMethods = false)
   static class ReadFixture {
     @Bean
@@ -382,6 +565,7 @@ class AccountLocalReadIT {
 
   static class ReadSimulator extends CopyLifecycleIT.Simulator {
     List<AccountRead.Order> displayOrders = List.of();
+    List<AccountRead.Execution> displayExecutions = List.of();
 
     ReadSimulator(Clock clock) {
       super(clock);
@@ -399,7 +583,7 @@ class AccountLocalReadIT {
 
     public AccountRead.Snapshot<AccountRead.Execution> readExecutions(
         Instant from, Instant through) {
-      return new AccountRead.Snapshot<>(List.of(), from, through, true, List.of());
+      return new AccountRead.Snapshot<>(displayExecutions, from, through, true, List.of());
     }
   }
 }

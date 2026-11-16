@@ -185,4 +185,69 @@ class WholeChainBrokerSimulatorTest {
       assertThat(gateway.resources(request).ownMoney()).isEqualByComparingTo("0");
     }
   }
+
+  @Test
+  void actualSdkReadsExternalPartialPricesAndCurrencyWithoutTradingMutations() throws Exception {
+    try (var bank = WholeChainBrokerSimulator.open(directory);
+        var gateway = bank.gateway(Clock.systemUTC(), BrokerTlsTestSupport.NO_EVENTS)) {
+      var at = Instant.now();
+      bank.enableCashCurrencies();
+      bank.createExternalOrder(
+          "[ТЕСТ] manual-buy",
+          WholeChainBrokerSimulator.INSTRUMENT,
+          BrokerGateway.Side.BUY,
+          10,
+          new BigDecimal("100"),
+          at.minusSeconds(5));
+      bank.fillExternalOrder("[ТЕСТ] manual-buy", 10, new BigDecimal("100"), at.minusSeconds(4));
+      bank.createExternalOrder(
+          "[ТЕСТ] manual-sale /+",
+          WholeChainBrokerSimulator.INSTRUMENT,
+          BrokerGateway.Side.SELL,
+          10,
+          new BigDecimal("99"),
+          at.minusSeconds(3));
+      bank.fillExternalOrder("[ТЕСТ] manual-sale /+", 2, new BigDecimal("100"), at.minusSeconds(2));
+      bank.fillExternalOrder("[ТЕСТ] manual-sale /+", 3, new BigDecimal("110"), at.minusSeconds(1));
+      bank.createExternalOrder(
+          "[ТЕСТ] unknown",
+          WholeChainBrokerSimulator.INSTRUMENT,
+          BrokerGateway.Side.BUY,
+          1,
+          new BigDecimal("98"),
+          at);
+      var orders = gateway.readOrders(java.util.List.of());
+      assertThat(orders.items()).hasSize(2);
+      var sale =
+          orders.items().stream()
+              .filter(o -> o.brokerOrderId().equals("[ТЕСТ] manual-sale /+"))
+              .findFirst()
+              .orElseThrow();
+      assertThat(sale.executionPrice().value()).isEqualByComparingTo("106");
+      assertThat(sale.origin()).isEqualTo(AccountRead.Origin.UNKNOWN);
+      bank.fillExternalOrder("[ТЕСТ] manual-sale /+", 1, new BigDecimal("112"), at);
+      sale =
+          gateway.readOrders(java.util.List.of()).items().stream()
+              .filter(o -> o.brokerOrderId().equals("[ТЕСТ] manual-sale /+"))
+              .findFirst()
+              .orElseThrow();
+      assertThat(sale.executionPrice().value()).isEqualByComparingTo("107");
+      var cash =
+          new java.util.concurrent.LinkedBlockingQueue<AccountRead.Snapshot<AccountRead.Cash>>();
+      try (var feed = gateway.observeCash(cash::add)) {
+        var rows = cash.poll(5, java.util.concurrent.TimeUnit.SECONDS);
+        assertThat(rows.items()).hasSize(2);
+        assertThat(
+                rows.items().stream()
+                    .filter(c -> c.currency().equals("usd"))
+                    .findFirst()
+                    .orElseThrow()
+                    .total())
+            .isEqualByComparingTo("5");
+      }
+      assertThat(bank.calls("PostOrder")).isEmpty();
+      assertThat(bank.calls("CancelOrder")).isEmpty();
+      assertThat(bank.calls("ReplaceOrder")).isEmpty();
+    }
+  }
 }

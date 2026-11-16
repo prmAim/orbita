@@ -133,7 +133,7 @@ final class AccountProjection {
                 .findFirst()
                 .orElse(null);
         if (old == null) rowFills.add(fillView(id, execution));
-        else if (!sameExecution(old, execution)) ambiguous = true;
+        else if (!samePersistedExecution(old, execution)) ambiguous = true;
       }
     for (var fill : rowFills) fills.put(text(fill, "id"), fill);
     boolean complete =
@@ -248,8 +248,7 @@ final class AccountProjection {
                           && text(r, "instrument_id").equals(text(fill, "instrumentId"))
                           && text(r, "side").equals(text(fill, "side"))
                           && number(r, "lots").compareTo(number(fill, "lots")) == 0
-                          && Objects.equals(
-                              instant(r.get("executed_at")), instant(fill.get("executedAt"))));
+                          && sameStoredTime(r.get("executed_at"), fill.get("executedAt")));
       if (!known) return false;
     }
     return true;
@@ -517,6 +516,22 @@ final class AccountProjection {
 
   private static String nullSafeOrder(AccountRead.Execution e) {
     return e.brokerOrderId() == null ? encoded("unlinked", e.tradeId()) : e.brokerOrderId();
+  }
+
+  /** Normalize only a known PostgreSQL timestamptz boundary, never two raw broker observations. */
+  private static boolean sameStoredTime(Object storedValue, Object rawValue) {
+    Instant stored = instant(storedValue), raw = instant(rawValue);
+    if (stored == null || raw == null) return false;
+    long micros = (raw.getNano() + 500L) / 1000L;
+    return stored.equals(Instant.ofEpochSecond(raw.getEpochSecond(), micros * 1000L));
+  }
+
+  private static boolean samePersistedExecution(
+      Map<String, Object> raw, AccountRead.Execution stored) {
+    if (!sameStoredTime(stored.executedAt(), raw.get("executedAt"))) return false;
+    var atStoredPrecision = new LinkedHashMap<String, Object>(raw);
+    atStoredPrecision.put("executedAt", stored.executedAt());
+    return sameExecution(atStoredPrecision, stored);
   }
 
   private static boolean sameExecution(Map<String, Object> f, AccountRead.Execution e) {

@@ -114,7 +114,23 @@ class InterfaceDemoIT {
 
   @Test
   void wholeApplicationChainCreatesAndRemovesOnlyOwnedPreviewData() throws Exception {
-    String url = System.getenv("ORBITA_DEMO_JDBC_URL");
+    String scenario =
+        System.getProperty(
+            "orbita.demo.scenario",
+            Objects.toString(System.getenv("ORBITA_DEMO_SCENARIO"), "Standard"));
+    if (!Set.of("Standard", "Large").contains(scenario))
+      throw new IllegalArgumentException("Scenario must be Standard or Large");
+    runScenario(scenario, true);
+  }
+
+  @Test
+  void largeApplicationChainRetainsEveryHistoricalOrderAcrossAllPageSizes() throws Exception {
+    runScenario("Large", false);
+  }
+
+  private void runScenario(String scenario, boolean allowExternal) throws Exception {
+    boolean large = scenario.equals("Large");
+    String url = allowExternal ? System.getenv("ORBITA_DEMO_JDBC_URL") : null;
     boolean external = url != null && !url.isBlank();
     boolean retain = external && "true".equals(System.getenv("ORBITA_DEMO_RETAIN"));
     if (external) {
@@ -388,7 +404,9 @@ class InterfaceDemoIT {
         assertThat(positions.toString())
             .contains(WholeChainBrokerSimulator.INSTRUMENT, "\"copiedLots\":2");
         assertPortfolioMatrix(browser, db);
-        assertCompleteJournal(browser, db);
+        assertCompleteJournal(browser, db, 28);
+        extendReadScenario(app, bank, db, worker, browser, large);
+        assertCompleteJournal(browser, db, 30);
         JsonNode notices = browser.json.readTree(browser.get("/api/notifications").body());
         assertThat(notices.toString()).contains("DELIVERED", "PENDING");
         assertThat(browser.post("/api/control/stop").statusCode()).isEqualTo(200);
@@ -397,7 +415,7 @@ class InterfaceDemoIT {
                 db.queryForObject(
                     "select count(*) from copy_intent where status in ('WAITING','HALTED','ACTIVE','SEND_STARTED','UNKNOWN','CANCEL_STARTED')",
                     Integer.class))
-            .isZero();
+            .isEqualTo(2);
         app.getBean(SourceFeedLifecycle.class).close();
         app.close();
         app = null;
@@ -420,8 +438,8 @@ class InterfaceDemoIT {
         try (var viewer = start(url, username, dbPassword, null, null)) {
           var view = login(viewer, ownerPassword);
           assertThat(view.get("/api/positions").body()).contains("\"copiedLots\":2");
-          assertPortfolioMatrix(view, db);
-          assertCompleteJournal(view, db);
+          assertRetainedReadScenario(view, db, large);
+          assertCompleteJournal(view, db, 30);
           assertThat(
                   view.post(
                           "/api/instruments/"
@@ -430,7 +448,8 @@ class InterfaceDemoIT {
                                       java.nio.charset.StandardCharsets.UTF_8)
                                   .replace("+", "%20")
                               + "/pause",
-                          "{\"text\":\"[ТЕСТ] проба кнопки после перезапуска\"}")
+                          view.json.writeValueAsString(
+                              Map.of("text", LONG_PAUSE + " [ТЕСТ] После перезапуска")))
                       .statusCode())
               .isEqualTo(200);
           assertThat(db.queryForList("select instrument_id from instrument_state", String.class))
@@ -457,6 +476,7 @@ class InterfaceDemoIT {
               .isGreaterThan(previous);
           assertThat(view.get("/api/notifications/" + summary + "/attempts").body())
               .contains("Доставка Telegram отключена");
+          assertRetainedReadScenario(view, db, large);
           laterJournal = new LinkedHashMap<>();
           db.query(
               "select id,md5(to_jsonb(j)::text) from journal_entry j where category='PROCESS_STARTED' and not exists(select 1 from orbita_demo_preview.owned o where o.relation='journal_entry' and o.row_id=j.id::text)",
@@ -537,6 +557,348 @@ class InterfaceDemoIT {
     } finally {
       if (postgres != null) postgres.close();
     }
+  }
+
+  private static final String MANUAL_BUY = "[ТЕСТ] ui149 ручная покупка /+",
+      MANUAL_SALE = "[ТЕСТ] ui149 ручная продажа /+",
+      UNKNOWN_ORDER = "[ТЕСТ] ui149 происхождение не установлено",
+      LONG_PAUSE =
+          "[ТЕСТ] SBER: длинная причина паузы для точного перехода в журнал. "
+              + "Проверенная ручная продажа не разрешает программе менять внешнюю заявку. "
+                  .repeat(8);
+
+  private static void extendReadScenario(
+      ConfigurableApplicationContext app,
+      WholeChainBrokerSimulator bank,
+      JdbcTemplate db,
+      TradingWorker worker,
+      Browser browser,
+      boolean large)
+      throws Exception {
+    int originalPosts = bank.calls("PostOrder").size(),
+        originalCancels = bank.calls("CancelOrder").size();
+    assertThat(originalPosts).isEqualTo(24);
+    assertThat(originalCancels).isEqualTo(2);
+    bank.enableCashCurrencies();
+    var reads = app.getBean(ru.orbita.account.AccountReadService.class);
+    var manual = app.getBean(ManualReconciliationService.class);
+    var reconciliation = app.getBean(ReconciliationService.class);
+    assertThat(
+            browser
+                .post(
+                    "/api/instruments/" + encoded(WholeChainBrokerSimulator.INSTRUMENT) + "/pause",
+                    "{\"text\":\"[ТЕСТ] Сверка ручных сделок\"}")
+                .statusCode())
+        .isEqualTo(200);
+    bank.createExternalOrder(
+        MANUAL_BUY,
+        WholeChainBrokerSimulator.INSTRUMENT,
+        BrokerGateway.Side.BUY,
+        10,
+        new BigDecimal("100"),
+        now().minusSeconds(5));
+    bank.fillExternalOrder(MANUAL_BUY, 10, new BigDecimal("100"), now());
+    manual.reconcilePaused();
+    reconciliation.reconcile();
+    bank.createExternalOrder(
+        MANUAL_SALE,
+        WholeChainBrokerSimulator.INSTRUMENT,
+        BrokerGateway.Side.SELL,
+        10,
+        new BigDecimal("99"),
+        now());
+    bank.fillExternalOrder(MANUAL_SALE, 2, new BigDecimal("100"), now());
+    bank.fillExternalOrder(MANUAL_SALE, 3, new BigDecimal("110"), now());
+    manual.reconcilePaused();
+    reconciliation.reconcile();
+    reads.refresh();
+    var manualAtFive = findOrder(browser, MANUAL_SALE);
+    assertThat(manualAtFive.get("origin").asText()).isEqualTo("MANUAL");
+    assertThat(manualAtFive.get("executedLots").asText()).isEqualTo("5");
+    assertThat(manualAtFive.get("executionPrice").get("value").asText()).isEqualTo("106");
+    assertThat(manualAtFive.get("limitPrice").get("value").asText()).isEqualTo("99");
+    bank.fillExternalOrder(MANUAL_SALE, 1, new BigDecimal("112"), now());
+    manual.reconcilePaused();
+    reconciliation.reconcile();
+    reads.refresh();
+    var manualAtSix = findOrder(browser, MANUAL_SALE);
+    assertThat(manualAtSix.get("origin").asText()).isEqualTo("MANUAL");
+    assertThat(manualAtSix.get("executionPrice").get("value").asText()).isEqualTo("107");
+    assertThat(manualAtSix.get("fills").size()).isEqualTo(3);
+    for (var fill : manualAtSix.get("fills")) assertThat(fill.get("commission").isNull()).isTrue();
+    bank.createExternalOrder(
+        UNKNOWN_ORDER,
+        WholeChainBrokerSimulator.INSTRUMENT,
+        BrokerGateway.Side.BUY,
+        1,
+        new BigDecimal("98"),
+        now());
+    assertThat(
+            browser
+                .post(
+                    "/api/instruments/" + encoded(WholeChainBrokerSimulator.INSTRUMENT) + "/resume")
+                .statusCode())
+        .isEqualTo(200);
+    bank.setResources(WholeChainBrokerSimulator.INSTRUMENT, new BigDecimal("100000"), 100, 100);
+    bank.setNextPostFill(0);
+    emit(bank, db, "ui149-cancel-source", "ui149-cancel-source-order", BrokerGateway.Side.BUY, 1);
+    worker.run();
+    UUID cancel = intent(db, "[ТЕСТ] ui149-cancel-source");
+    assertThat(db.queryForObject("select status from copy_intent where id=?", String.class, cancel))
+        .isEqualTo("ACTIVE");
+    bank.setNextPostFill(0);
+    bank.loseNextPostAndRequestLookup();
+    emit(bank, db, "ui149-unknown-source", "ui149-unknown-source-order", BrokerGateway.Side.BUY, 1);
+    worker.run();
+    UUID unknown = intent(db, "[ТЕСТ] ui149-unknown-source");
+    assertThat(
+            db.queryForObject("select status from copy_intent where id=?", String.class, unknown))
+        .isEqualTo("UNKNOWN");
+    bank.loseCancelResponseAndRequestLookup(cancel);
+    assertThat(browser.post("/api/control/stop").statusCode()).isEqualTo(200);
+    worker.run();
+    assertThat(db.queryForObject("select status from copy_intent where id=?", String.class, cancel))
+        .isEqualTo("UNKNOWN");
+    assertThat(
+            db.queryForObject(
+                "select cancellation_pending from copy_intent where id=?", Boolean.class, cancel))
+        .isTrue();
+    assertThat(
+            browser
+                .post(
+                    "/api/instruments/" + encoded(WholeChainBrokerSimulator.INSTRUMENT) + "/pause",
+                    browser.json.writeValueAsString(Map.of("text", LONG_PAUSE)))
+                .statusCode())
+        .isEqualTo(200);
+    if (large) {
+      Instant created = now().minusSeconds(30);
+      for (int i = 0; i < 125; i++) {
+        String id = "[ТЕСТ] ui149 large closed / " + String.format("%03d", i);
+        bank.createExternalOrder(
+            id,
+            "[ТЕСТ] ALRS",
+            BrokerGateway.Side.BUY,
+            1,
+            new BigDecimal("790"),
+            created.plusMillis(i * 100L));
+        bank.cancelExternalOrderAtBroker(id);
+      }
+    }
+    try (var cash = app.getBean(BrokerGateway.class).observeCash(reads::acceptCash)) {
+      await(
+          () -> {
+            try {
+              var cashRows =
+                  browser.json.readTree(browser.get("/api/account/assets").body()).get("cash");
+              if (cashRows.size() != 2) return false;
+              for (var row : cashRows)
+                if (row.get("total").isNull()
+                    || row.get("available").isNull()
+                    || row.get("blocked").isNull()) return false;
+              return true;
+            } catch (Exception failure) {
+              throw new RuntimeException(failure);
+            }
+          });
+      reads.refresh();
+      assertRetainedReadScenario(browser, db, large);
+      int posts = bank.calls("PostOrder").size(), cancels = bank.calls("CancelOrder").size();
+      assertThat(posts - originalPosts).isEqualTo(2);
+      assertThat(cancels - originalCancels).isEqualTo(1);
+      for (int i = 0; i < 2; i++) {
+        reads.refresh();
+        assertRetainedReadScenario(browser, db, large);
+      }
+      assertThat(bank.calls("PostOrder")).hasSize(posts);
+      assertThat(bank.calls("CancelOrder")).hasSize(cancels);
+      assertThat(bank.calls("ReplaceOrder")).isEmpty();
+      for (var rpc : bank.calls("PostOrder")) {
+        String id = ((ru.tinkoff.piapi.contract.v1.PostOrderRequest) rpc.request()).getOrderId();
+        assertThat(
+                db.queryForObject(
+                    "select count(*) from copy_intent where id=?",
+                    Integer.class,
+                    UUID.fromString(id)))
+            .isEqualTo(1);
+      }
+      for (var rpc : bank.calls("CancelOrder")) {
+        String id = ((ru.tinkoff.piapi.contract.v1.CancelOrderRequest) rpc.request()).getOrderId();
+        assertThat(id).startsWith("TEST-BANK-").doesNotContain("ручная", "large", "происхождение");
+      }
+    }
+    System.out.println(
+        "[ТЕСТ] v0.149 scenario="
+            + (large ? "Large" : "Standard")
+            + ", assets=15, activeOrders=4, operations="
+            + (large ? 158 : 33)
+            + ", copied=81, SBERmanual=4, SBERbroker=6, manualMean=107, currencies=2, ownPostDelta=2, ownCancelDelta=1");
+  }
+
+  private static JsonNode findOrder(Browser browser, String brokerId) throws Exception {
+    var rows =
+        browser.json.readTree(browser.get("/api/account/orders?size=100").body()).get("items");
+    for (var row : rows) if (row.get("brokerOrderId").asText().equals(brokerId)) return row;
+    throw new AssertionError("Missing order " + brokerId);
+  }
+
+  private static String encoded(String value) {
+    return URLEncoder.encode(value, java.nio.charset.StandardCharsets.UTF_8).replace("+", "%20");
+  }
+
+  private static void assertRetainedReadScenario(Browser browser, JdbcTemplate db, boolean large)
+      throws Exception {
+    var assetPage = browser.json.readTree(browser.get("/api/account/assets?size=25").body());
+    assertThat(assetPage.get("total").asInt()).isEqualTo(15);
+    assertThat(assetPage.get("items").size()).isEqualTo(15);
+    assertThat(assetPage.get("cash").size()).isEqualTo(2);
+    JsonNode sber = null;
+    for (var asset : assetPage.get("items")) {
+      assertThat(asset.get("executionPrice").get("status").asText())
+          .as(asset.get("instrumentId").asText())
+          .isEqualTo("CONFIRMED");
+      if (asset.get("instrumentId").asText().equals(WholeChainBrokerSimulator.INSTRUMENT))
+        sber = asset;
+    }
+    assertThat(sber).isNotNull();
+    assertThat(sber.get("copiedLots").asText()).isEqualTo("2");
+    assertThat(sber.get("manualLots").asText()).isEqualTo("4");
+    assertThat(sber.get("brokerLots").asText()).isEqualTo("6");
+    assertThat(sber.get("executionPrice").get("value").asText()).isEqualTo("107");
+    var orderPage = browser.json.readTree(browser.get("/api/account/orders?size=100").body());
+    assertThat(orderPage.get("total").asInt()).isEqualTo(4);
+    var origins = new ArrayList<String>();
+    var statuses = new ArrayList<String>();
+    for (var order : orderPage.get("items")) {
+      assertThat(order.get("instrumentId").asText())
+          .isEqualTo(WholeChainBrokerSimulator.INSTRUMENT);
+      origins.add(order.get("origin").asText());
+      statuses.add(order.get("status").asText());
+      if (order.get("status").asText().equals("UNKNOWN"))
+        assertThat(order.get("createdAt").isNull()).isTrue();
+      if (order.get("status").asText().equals("CANCEL_STARTED"))
+        assertThat(order.get("cancellationPending").asBoolean()).isTrue();
+    }
+    assertThat(origins).containsExactlyInAnyOrder("ORBITA", "ORBITA", "MANUAL", "UNKNOWN");
+    assertThat(statuses)
+        .containsExactlyInAnyOrder("UNKNOWN", "CANCEL_STARTED", "PARTIALLY_FILLED", "NEW");
+    var sale = findOrder(browser, MANUAL_SALE);
+    assertThat(sber.get("lastOrderId").asText()).isEqualTo(sale.get("id").asText());
+    assertThat(sale.get("executedLots").asText()).isEqualTo("6");
+    assertThat(sale.get("remainingLots").asText()).isEqualTo("4");
+    assertThat(sale.get("executionPrice").get("value").asText()).isEqualTo("107");
+    var fill =
+        browser.json.readTree(
+            browser
+                .get("/api/account/fill?id=" + encoded(sber.get("lastExecutionId").asText()))
+                .body());
+    assertThat(fill.get("price").get("value").asText()).isEqualTo("112");
+    assertThat(fill.get("operationIds").size()).isEqualTo(1);
+    var exact =
+        browser.json.readTree(
+            browser
+                .get(
+                    "/api/account/operation?id="
+                        + encoded(fill.get("operationIds").get(0).asText()))
+                .body());
+    assertThat(exact.get("origin").asText()).isEqualTo("MANUAL");
+    assertThat(exact.get("sourceExecutionId").isNull()).isTrue();
+    assertThat(exact.get("coefficient").isNull()).isTrue();
+    assertThat(exact.get("executionPrice").get("value").asText()).isEqualTo("107");
+    var journal =
+        browser.json.readTree(
+            browser.get("/api/account/journal?id=" + sber.get("journalId").asText()).body());
+    assertThat(journal.get("detail").asText()).startsWith(LONG_PAUSE);
+    for (var cash : assetPage.get("cash")) {
+      assertThat(cash.get("total").isNull()).isFalse();
+      assertThat(
+              new BigDecimal(cash.get("available").asText())
+                  .add(new BigDecimal(cash.get("blocked").asText())))
+          .isEqualByComparingTo(cash.get("total").asText());
+      if (cash.get("currency").asText().equals("usd"))
+        assertThat(cash.get("total").asText()).isEqualTo("5");
+    }
+    assertThat(db.queryForObject("select sum(copied_lots) from mirror_position", Long.class))
+        .isEqualTo(81);
+    assertThat(db.queryForObject("select count(*) from source_execution", Integer.class))
+        .isEqualTo(30);
+    assertThat(db.queryForObject("select count(*) from broker_fill", Integer.class)).isEqualTo(25);
+    var allIds = new LinkedHashSet<String>();
+    int expected = large ? 158 : 33;
+    for (int size : List.of(25, 50, 100)) {
+      var ids = new LinkedHashSet<String>();
+      for (int page = 0; page * size < expected; page++) {
+        var result =
+            browser.json.readTree(
+                browser
+                    .get(
+                        "/api/account/operations?size="
+                            + size
+                            + "&page="
+                            + page
+                            + "&sort=time&direction=desc")
+                    .body());
+        assertThat(result.get("total").asInt()).isEqualTo(expected);
+        for (var row : result.get("items")) assertThat(ids.add(row.get("id").asText())).isTrue();
+      }
+      assertThat(ids).hasSize(expected);
+      if (allIds.isEmpty()) allIds.addAll(ids);
+      else assertThat(ids).containsExactlyElementsOf(allIds);
+    }
+    assertThat(
+            browser
+                .json
+                .readTree(browser.get("/api/account/operations?origin=MANUAL").body())
+                .get("total")
+                .asInt())
+        .isEqualTo(2);
+    assertThat(
+            browser
+                .json
+                .readTree(browser.get("/api/account/operations?origin=UNKNOWN").body())
+                .get("total")
+                .asInt())
+        .isEqualTo(large ? 126 : 1);
+    assertThat(
+            browser
+                .json
+                .readTree(
+                    browser
+                        .get(
+                            "/api/account/operations?q="
+                                + encoded("[ТЕСТ] ALRS")
+                                + "&sort=instrument&direction=asc")
+                        .body())
+                .get("total")
+                .asInt())
+        .isEqualTo(large ? 126 : 1);
+    var directory =
+        Path.of(System.getProperty("user.dir"))
+            .resolve("../.scratch/ui149/demo149-" + (large ? "Large" : "Standard"))
+            .normalize();
+    Files.createDirectories(directory);
+    Files.writeString(directory.resolve("assets.json"), assetPage.toString());
+    Files.writeString(directory.resolve("orders.json"), orderPage.toString());
+    Files.writeString(directory.resolve("manual-operation.json"), exact.toString());
+    Files.writeString(
+        directory.resolve("ids.json"),
+        browser.json.writeValueAsString(
+            Map.of(
+                "synthetic",
+                true,
+                "manualOrderId",
+                sale.get("id").asText(),
+                "manualOperationId",
+                exact.get("id").asText(),
+                "lastFillId",
+                fill.get("id").asText(),
+                "journalId",
+                sber.get("journalId").asText(),
+                "operationTotal",
+                expected,
+                "assetTotal",
+                15,
+                "activeOrderTotal",
+                4)));
   }
 
   private static String required(String key) {
@@ -745,7 +1107,8 @@ class InterfaceDemoIT {
         .doesNotHaveDuplicates();
   }
 
-  private static void assertCompleteJournal(Browser browser, JdbcTemplate db) throws Exception {
+  private static void assertCompleteJournal(Browser browser, JdbcTemplate db, int expectedSources)
+      throws Exception {
     var rows = new ArrayList<JsonNode>();
     var ids = new HashSet<Long>();
     long before = 0;
@@ -773,7 +1136,7 @@ class InterfaceDemoIT {
         rows.stream()
             .filter(row -> row.get("category").asText().equals("SOURCE_RECEIVED"))
             .toList();
-    assertThat(sourceRows).hasSize(28);
+    assertThat(sourceRows).hasSize(expectedSources);
     assertThat(
             sourceRows.stream()
                 .map(row -> row.get("instrument").asText())
