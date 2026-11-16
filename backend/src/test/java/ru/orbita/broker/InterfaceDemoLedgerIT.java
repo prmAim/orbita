@@ -3,12 +3,16 @@ package ru.orbita.broker;
 import static org.assertj.core.api.Assertions.*;
 
 import java.math.BigDecimal;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.List;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.test.context.TestConfiguration;
@@ -16,6 +20,7 @@ import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
+import org.testcontainers.images.builder.Transferable;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
@@ -242,6 +247,137 @@ class InterfaceDemoLedgerIT {
     return new JdbcTemplate(
         new DriverManagerDataSource(
             POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword()));
+  }
+
+  private JdbcTemplate database(String zone) {
+    var source =
+        new DriverManagerDataSource(
+            POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword()) {
+          @Override
+          public java.sql.Connection getConnection() throws java.sql.SQLException {
+            var connection = super.getConnection();
+            try (var statement =
+                connection.prepareStatement("select set_config('TimeZone',?,false)")) {
+              statement.setString(1, zone);
+              statement.execute();
+            } catch (java.sql.SQLException failure) {
+              connection.close();
+              throw failure;
+            }
+            return connection;
+          }
+        };
+    return new JdbcTemplate(source);
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"Asia/Yekaterinburg", "UTC"})
+  void psqlRemovalComparesTypedInstantsAcrossCaptureTimezones(String captureZone) throws Exception {
+    try (var baseline = application("baseline", true)) {
+      baseline.getBean(AccountReadService.class).refresh();
+    }
+    var db = database();
+    var baseline =
+        db.queryForList(
+            "select to_jsonb(d)::text from account_read_document d order by account_id,kind,id",
+            String.class);
+    var capture = database(captureZone);
+    assertThat(capture.queryForObject("select current_setting('TimeZone')", String.class))
+        .isEqualTo(captureZone);
+    var ledger = InterfaceDemoLedger.begin(capture, false);
+    try (var preview = application("preview", true)) {
+      preview.getBean(AccountReadService.class).refresh();
+    }
+    ledger.captureOwnedFacts();
+    ledger.restoreControl();
+    var result = psqlCleanup(captureZone.equals("UTC") ? "Asia/Yekaterinburg" : "UTC");
+    assertThat(result.getExitCode()).withFailMessage(result.getStderr()).isZero();
+    assertThat(
+            db.queryForList(
+                "select to_jsonb(d)::text from account_read_document d order by account_id,kind,id",
+                String.class))
+        .isEqualTo(baseline);
+    assertThat(
+            db.queryForObject(
+                "select to_regnamespace('orbita_demo_preview') is null", Boolean.class))
+        .isTrue();
+  }
+
+  private org.testcontainers.containers.Container.ExecResult psqlCleanup(String zone)
+      throws Exception {
+    String script =
+        "select set_config('orbita.demo.expected_database',current_database(),false),set_config('orbita.demo.expected_role',current_user,false),set_config('orbita.demo.offline_confirmed','broker+telegram+worker+backup-disabled;accounts-empty',false);\n"
+            + Files.readString(
+                Path.of(System.getProperty("basedir"))
+                    .resolve("../deploy/demo/cleanup.sql")
+                    .normalize());
+    POSTGRES.copyFileToContainer(Transferable.of(script, 0644), "/tmp/interface-demo-cleanup.sql");
+    return POSTGRES.execInContainer(
+        "env",
+        "PGOPTIONS=-c TimeZone=" + zone,
+        "psql",
+        "-X",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-U",
+        POSTGRES.getUsername(),
+        "-d",
+        POSTGRES.getDatabaseName(),
+        "-f",
+        "/tmp/interface-demo-cleanup.sql");
+  }
+
+  @Test
+  void psqlRemovalStillRefusesChangedTypedTimestampWithIdenticalRawDocuments() throws Exception {
+    var fixture = capturedPartial();
+    var db = database();
+    var documents =
+        db.queryForList(
+            "select to_jsonb(d)::text from account_read_document d order by account_id,kind,id",
+            String.class);
+    var attempt =
+        db.queryForObject(
+            "select last_attempt_at from account_read_freshness where account_id='preview' and section='cash'",
+            java.sql.Timestamp.class);
+    try (var writer = application("preview", false)) {
+      writer
+          .getBean(AccountReadService.class)
+          .acceptCash(
+              partialSnapshot(
+                  "rub", fixture.at().plusSeconds(1), fixture.at().minusSeconds(4), "900"));
+    }
+    assertThat(
+            db.queryForList(
+                "select to_jsonb(d)::text from account_read_document d order by account_id,kind,id",
+                String.class))
+        .isEqualTo(documents);
+    assertThat(
+            db.queryForObject(
+                "select last_attempt_at from account_read_freshness where account_id='preview' and section='cash'",
+                java.sql.Timestamp.class))
+        .isNotEqualTo(attempt);
+    var freshness =
+        db.queryForList(
+            "select to_jsonb(f)::text from account_read_freshness f order by account_id,section",
+            String.class);
+    var result = psqlCleanup("UTC");
+    assertThat(result.getExitCode()).isNotZero();
+    assertThat(result.getStderr())
+        .contains("changed captured broker observations: account_read_freshness");
+    assertThat(
+            db.queryForList(
+                "select to_jsonb(f)::text from account_read_freshness f order by account_id,section",
+                String.class))
+        .isEqualTo(freshness);
+    assertThat(
+            db.queryForList(
+                "select to_jsonb(d)::text from account_read_document d order by account_id,kind,id",
+                String.class))
+        .isEqualTo(documents);
+    assertThat(
+            db.queryForObject(
+                "select to_regnamespace('orbita_demo_preview') is not null", Boolean.class))
+        .isTrue();
   }
 
   @Test
