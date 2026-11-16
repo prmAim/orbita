@@ -55,12 +55,28 @@
           </dl>
         </section>
         <nav aria-label="Разделы">
-          <button data-page="control" aria-current="page">Управление</button
-          ><button data-page="journal">Журнал</button
-          ><button data-page="notifications">Уведомления</button
-          ><button data-page="backup">Копии</button>
+          <button id="nav-assets" data-page="assets" aria-current="page">Активы</button>
+          <button id="nav-orders" data-page="orders">Инструменты</button>
+          <button id="nav-operations" data-page="operations">Операции</button>
+          <button id="nav-journal" data-page="journal">Журнал</button>
+          <button id="nav-notifications" data-page="notifications">Уведомления</button>
+          <button id="nav-control" data-page="control">Управление</button>
+          <button id="nav-backup" data-page="backup">Копии</button>
         </nav>
-        <section id="control" class="page">
+        <p id="route-status" role="status" hidden></p>
+        <section id="assets" class="page">
+          <h2>Активы счёта повторения</h2>
+          <div id="assets-view"><p>Представление активов ещё не подключено. Остатки не загружены.</p></div>
+        </section>
+        <section id="orders" class="page" hidden>
+          <h2>Активные заявки</h2>
+          <div id="orders-view"><p>Представление заявок ещё не подключено. Заявки не загружены.</p></div>
+        </section>
+        <section id="operations" class="page" hidden>
+          <h2>История заявок и исполнений</h2>
+          <div id="operations-view"><p>Представление истории ещё не подключено. Исполнения не загружены.</p></div>
+        </section>
+        <section id="control" class="page" hidden>
           <h2>Повторение</h2>
           <div class="actions">
             <button data-command="start">Начать</button
@@ -100,8 +116,10 @@
             Доступно после подтверждённой живой приёмки. После ручной остановки
             запуск возвращается в теневой режим.
           </p>
-          <h2>Инструменты</h2>
-          <div id="instruments"></div>
+          <h2>Пауза инструментов</h2>
+          <details><summary>Управление отдельным инструментом</summary>
+            <div id="instruments"></div>
+          </details>
           <h2>Теневая сверка покупки и продажи</h2>
           <p>
             Приложение сверяет сохранённые естественные исполнения с независимой

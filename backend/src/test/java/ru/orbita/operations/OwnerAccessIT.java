@@ -49,6 +49,21 @@ class OwnerAccessIT {
   @Autowired org.springframework.jdbc.core.JdbcTemplate db;
 
   @Test
+  void anonymousLoginLoadsKnownFrontendModulesWhileAccountDataAndUnknownAssetsStayProtected()
+      throws Exception {
+    for (String path :
+        new String[] {"/", "/app.js", "/navigation.js", "/collection.js", "/app.css"}) {
+      mvc.perform(get(path))
+          .andExpect(status().isOk())
+          .andExpect(header().string("Cache-Control", "no-store"));
+    }
+    mvc.perform(get("/unknown-module.js")).andExpect(status().isUnauthorized());
+    mvc.perform(get("/api/account/assets")).andExpect(status().isUnauthorized());
+    mvc.perform(get("/api/account/orders")).andExpect(status().isUnauthorized());
+    mvc.perform(get("/api/account/operations")).andExpect(status().isUnauthorized());
+  }
+
+  @Test
   void positionHttpContractPreservesInventoryQualificationAndExactRatioStrings() throws Exception {
     credentials.replace("synthetic-only-passphrase".toCharArray());
     var login =

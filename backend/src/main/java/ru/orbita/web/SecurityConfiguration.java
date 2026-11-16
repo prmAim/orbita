@@ -36,7 +36,14 @@ class SecurityConfiguration {
             access ->
                 access
                     .requestMatchers(
-                        "/", "/index.html", "/app.js", "/app.css", "/api/csrf", "/error")
+                        "/",
+                        "/index.html",
+                        "/app.js",
+                        "/navigation.js",
+                        "/collection.js",
+                        "/app.css",
+                        "/api/csrf",
+                        "/error")
                     .permitAll()
                     .anyRequest()
                     .hasRole("OWNER"))

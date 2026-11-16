@@ -1,3 +1,4 @@
+import { OwnerNavigation, pages } from "./navigation.js";
 type Status = {
   mode: string;
   coefficient: string | null;
@@ -33,14 +34,6 @@ type Instrument = {
   reconciled: boolean;
   reason: string | null;
 };
-type Position = {
-  instrumentId: string;
-  copiedLots: number;
-  manualLots: number;
-  brokerLots: string | null;
-  brokerReadAt: string | null;
-  brokerInventoryQualified: boolean;
-};
 type ShadowCheck = {
   id: string;
   executionId: string;
@@ -59,7 +52,7 @@ const byId = <T extends HTMLElement>(id: string) => {
 let csrf: { token: string; headerName: string };
 let authenticated = false;
 let refreshing = false;
-let activePage = "control";
+let activePage = "assets";
 let earliest = 0;
 let accessEvents: EventSource | null = null;
 let instrumentsSnapshot = "";
@@ -439,17 +432,13 @@ async function refreshNotifications() {
   }
 }
 async function refreshInstruments() {
-  const [rows, positions, checks] = await Promise.all([
+  const [rows, checks] = await Promise.all([
     api<Instrument[]>("/instruments"),
-    api<Position[]>("/positions"),
     api<ShadowCheck[]>("/acceptance/checks"),
   ]);
-  const snapshot = JSON.stringify([rows, positions, checks]);
+  const snapshot = JSON.stringify([rows, checks]);
   if (snapshot === instrumentsSnapshot) return;
   instrumentsSnapshot = snapshot;
-  const positionById = new Map(
-    positions.map((position) => [position.instrumentId, position]),
-  );
   const list = byId("instruments");
   list.replaceChildren();
   if (!rows.length)
@@ -470,14 +459,6 @@ async function refreshInstruments() {
             : "Наблюдение. ") + (item.reason ?? ""),
       ),
     );
-    const position = positionById.get(item.instrumentId);
-    if (position)
-      row.append(
-        element(
-          "p",
-          `По учёту программы: ${position.copiedLots + position.manualLots} лотов, из них повторение ${position.copiedLots}, ручные ${position.manualLots}. Общий остаток брокера: ${position.brokerLots ?? "не подтверждено"} лотов. ${position.brokerInventoryQualified ? "Основа сопоставления подтверждена." : "Разделение общего остатка и повторения не подтверждено."} Чтение: ${date(position.brokerReadAt)}.`,
-        ),
-      );
     if (item.paused)
       row.append(
         action("Возобновить после сверки", async () => {
@@ -569,7 +550,8 @@ async function refresh() {
     if (activePage === "control") await refreshInstruments();
     else if (activePage === "journal") await refreshJournal();
     else if (activePage === "notifications") await refreshNotifications();
-    else await refreshBackups();
+    else if (activePage === "backup") await refreshBackups();
+    navigation.restore();
   } catch (error) {
     lock(
       "Связь с приложением потеряна. Журнал скрыт; повторите вход после восстановления связи.",
@@ -578,18 +560,29 @@ async function refresh() {
     refreshing = false;
   }
 }
-for (const button of document.querySelectorAll<HTMLButtonElement>(
-  "[data-page]",
-))
+const navigation = new OwnerNavigation(() => activateRoute());
+function activateRoute() {
+  activePage = navigation.route.page;
+  for (const page of document.querySelectorAll<HTMLElement>(".page"))
+    page.hidden = page.id !== activePage;
+  for (const tab of document.querySelectorAll("[data-page]"))
+    tab.removeAttribute("aria-current");
+  byId("nav-" + activePage).setAttribute("aria-current", "page");
+  const detail = navigation.route.fill ?? navigation.route.order
+    ?? navigation.route.operation ?? navigation.route.journal;
+  const status = byId("route-status");
+  status.hidden = detail === undefined;
+  status.textContent = detail === undefined ? ""
+    : `Запрошена конкретная запись: ${detail}. Точный переход будет доступен после подключения истории.`;
+  void refresh();
+}
+for (const button of document.querySelectorAll<HTMLButtonElement>("[data-page]"))
   button.onclick = () => {
-    activePage = button.dataset.page ?? "control";
-    for (const page of document.querySelectorAll<HTMLElement>(".page"))
-      page.hidden = page.id !== activePage;
-    for (const tab of document.querySelectorAll("[data-page]"))
-      tab.removeAttribute("aria-current");
-    button.setAttribute("aria-current", "page");
-    void refresh();
+    const page = button.dataset.page;
+    if (pages.includes(page as (typeof pages)[number]))
+      navigation.navigate({ page: page as (typeof pages)[number] });
   };
+activateRoute();
 for (const button of document.querySelectorAll<HTMLButtonElement>(
   "[data-command]",
 ))
