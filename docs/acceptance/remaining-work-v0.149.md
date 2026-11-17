@@ -29,12 +29,13 @@ HALTED [#40](https://github.com/prmAim/orbita/issues/40) и SELL
 [#41](https://github.com/prmAim/orbita/issues/41) заблокированы уточнениями API
 [#39](https://github.com/prmAim/orbita/issues/39); A/B от этого блокера не зависят.
 
-Этап **A1 / #35 реализован локально** в ветке `codex/f04-a1-sdk-evidence`,
-код `e1b11cb`: доказательства SDK и отрицательная квалификация причин.
+Этап **A1 / #35 завершён и закрыт**, [PR #42](https://github.com/prmAim/orbita/pull/42)
+слит в `main` (`9451ae2`): доказательства SDK и отрицательная квалификация причин.
 [Отчёт A1](f04-a1-sdk-evidence.md): 286 автоматических тестов PASS,
-Astra Standards/Spec — 0/0 замечаний. Это результат ветки, ещё не main:
-push/merge/remote CI не выполнялись, статусы GitHub не менялись.
-A2 / #36 и следующие этапы не начаты. Живая приёмка не проводилась.
+Astra Standards/Spec — 0/0 замечаний. Java/TypeScript и Python CI в `main` — PASS;
+ссылки и границы доказательств приведены в отчёте.
+**A2 / #36 в работе** в отдельной ветке `codex/f04-a2-durable-order-evidence`;
+следующие этапы не начаты. Живая приёмка не проводилась.
 
 ## Spec: функциональные доработки
 
