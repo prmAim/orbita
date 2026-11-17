@@ -12,8 +12,12 @@ T-Invest Java SDK Core/Contract **1.51**.
 и успешного Java/TypeScript и Python CI в `main` / `003522f`: 310 Java-тестов PASS.
 Astra Standards/Spec — 0/0, pre-merge — 0/0/0 открытых замечаний;
 [отчёт A2 и ссылки CI](../acceptance/f04-a2-durable-order-evidence.md).
-Положительный BUY и последующие этапы не начаты; HALTED и SELL сохраняют
-блокировку. Живая приёмка не проводилась.
+**B1 / #37 реализована локально** в `codex/f04-b1-buy-resource-classifier` от
+`main` / `ba4979f`: строгая квалификация причины BUY и регрессии;
+[отчёт B1](../acceptance/f04-b1-buy-resource-classifier.md), 389 локальных тестов,
+frontend и Spotless — PASS; Astra Standards/Spec — 0/0 открытых замечаний.
+Push/PR и CI B1 не выполнялись, #37 остаётся открытой.
+B2 / #38 не начата; HALTED и SELL сохраняют блокировку. Живая приёмка не проводилась.
 
 Нормативные требования остаются в [спецификации #10](https://github.com/prmAim/orbita/issues/10),
 работа относится к [адаптеру #20](https://github.com/prmAim/orbita/issues/20)
@@ -30,8 +34,8 @@ Astra Standards/Spec — 0/0, pre-merge — 0/0/0 открытых замеча�
 | --- | --- | --- |
 | A1 — доказательства SDK | [#35](https://github.com/prmAim/orbita/issues/35) | CLOSED, main / #42, CI PASS |
 | A2 — поток, долговечность и сверка | [#36](https://github.com/prmAim/orbita/issues/36) | CLOSED, main / #43, CI PASS |
-| B1 — строгий BUY-предикат | [#37](https://github.com/prmAim/orbita/issues/37) | #36 выполнена; не начата |
-| B2 — пропуск, резервы и R125 | [#38](https://github.com/prmAim/orbita/issues/38) | #37 |
+| B1 — строгий BUY-предикат | [#37](https://github.com/prmAim/orbita/issues/37) | #36 выполнена; B1 реализована локально, публикация не выполнена |
+| B2 — пропуск, резервы и R125 | [#38](https://github.com/prmAim/orbita/issues/38) | #37; не начата |
 | Уточнения владельца API | [#39](https://github.com/prmAim/orbita/issues/39) | Внешние сведения, needs-info |
 | C — HALTED | [#40](https://github.com/prmAim/orbita/issues/40) | #39 и #36; needs-info |
 | D — собственные бумаги SELL | [#41](https://github.com/prmAim/orbita/issues/41) | #39 и #38; needs-info |
@@ -292,7 +296,10 @@ HALTED и SELL сохраняются.
 Выполненные проверки A1/A2 и их границы теперь приведены в
 [отчёте A1](../acceptance/f04-a1-sdk-evidence.md) и
 [отчёте A2](../acceptance/f04-a2-durable-order-evidence.md).
-Положительная квалификация BUY/HALTED/SELL остаётся NOT_RUN. Проверки SDK
+В [отчёте B1](../acceptance/f04-b1-buy-resource-classifier.md) подтверждены локальные
+проверки предиката B01/B02 и отрицательного SELL-пути D01. Полные B01-критерии
+пропуска/отправки и B03–B05 относятся к B2 / #38 и здесь не объявляются выполненными.
+Положительная квалификация HALTED/SELL остаётся NOT_RUN. Проверки SDK
 используют настоящий SDK **1.51** и локальный TLS-имитатор, доменные — принятые
 границы сервиса, долговечность — PostgreSQL Testcontainers. Реальные брокерские
 счета, токены, Telegram и живая приёмка не участвуют.
