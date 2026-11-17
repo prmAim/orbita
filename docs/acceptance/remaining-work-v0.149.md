@@ -20,7 +20,7 @@ Spotless — PASS; независимые Astra Standards/Spec — без зам
 и опубликован в [#34](https://github.com/prmAim/orbita/issues/34):
 доказательства и ограниченная квалификация BUY выделены в доступный этап;
 HALTED, квалификация SELL и окончательное подтверждение ранних отказов без
-доступной заявки требуют уточнений API. Реализация не начата, статус Ф-04 не изменён.
+доступной заявки требуют уточнений API. Ф-04 целиком остаётся открытой.
 Задачи A/B: [#35](https://github.com/prmAim/orbita/issues/35) →
 [#36](https://github.com/prmAim/orbita/issues/36) →
 [#37](https://github.com/prmAim/orbita/issues/37) →
@@ -28,6 +28,13 @@ HALTED, квалификация SELL и окончательное подтве
 HALTED [#40](https://github.com/prmAim/orbita/issues/40) и SELL
 [#41](https://github.com/prmAim/orbita/issues/41) заблокированы уточнениями API
 [#39](https://github.com/prmAim/orbita/issues/39); A/B от этого блокера не зависят.
+
+Этап **A1 / #35 реализован локально** в ветке `codex/f04-a1-sdk-evidence`,
+код `e1b11cb`: доказательства SDK и отрицательная квалификация причин.
+[Отчёт A1](f04-a1-sdk-evidence.md): 286 автоматических тестов PASS,
+Astra Standards/Spec — 0/0 замечаний. Это результат ветки, ещё не main:
+push/merge/remote CI не выполнялись, статусы GitHub не менялись.
+A2 / #36 и следующие этапы не начаты. Живая приёмка не проводилась.
 
 ## Spec: функциональные доработки
 
