@@ -18,6 +18,44 @@ class BuyResourceRejectionClassifierTest {
       new OrderRequest("mirror", ID, "instrument", Side.BUY, 3, BigDecimal.TEN);
 
   @ParameterizedTest
+  @ValueSource(strings = {"same-ids", "foreign-account", "other-internal", "other-exchange"})
+  void receivedStateWithoutUuidUsesBothRoleSpecificIdsForContradictionOnly(String relation) {
+    var b =
+        streamBuilder(5)
+            .clearOrderRequestId()
+            .clearStatusInfo()
+            .setLotsExecuted(1)
+            .setLotsLeft(2)
+            .setLotsCancelled(0);
+    if (relation.equals("foreign-account")) b.setAccountId("foreign");
+    if (relation.equals("other-internal")) b.setOrderId("other-internal");
+    if (relation.equals("other-exchange")) b.setTradeOrderId("other-exchange");
+    var received = MirrorOrderParser.state(b.build(), AT);
+    assertThat(
+            BuyResourceRejectionClassifier.classify(
+                    REQUEST, List.of(received, stream(2), unary(2)), true)
+                .isPresent())
+        .isEqualTo(!relation.equals("same-ids"));
+  }
+
+  @ParameterizedTest
+  @ValueSource(ints = {4, 2})
+  void earlierStatusVolumeContradictionPreventsLaterZeroQualification(int earlierStatus) {
+    var received =
+        MirrorOrderParser.state(
+            streamBuilder(earlierStatus)
+                .clearStatusInfo()
+                .setLotsLeft(earlierStatus == 4 ? 2 : 3)
+                .setLotsCancelled(earlierStatus == 4 ? 1 : 0)
+                .build(),
+            AT);
+    assertThat(
+            BuyResourceRejectionClassifier.classify(
+                REQUEST, List.of(received, stream(2), unary(2)), true))
+        .isEmpty();
+  }
+
+  @ParameterizedTest
   @ValueSource(ints = {2, 3})
   void agreesOnExactTerminalZeroWithoutChangingCancelledToRejected(int status) {
     var stream = stream(status);

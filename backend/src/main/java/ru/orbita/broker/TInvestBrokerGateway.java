@@ -895,12 +895,23 @@ public final class TInvestBrokerGateway implements BrokerGateway {
   }
 
   static OrderStatus status(OrderExecutionReportStatus status) {
-    return switch (status) {
-      case EXECUTION_REPORT_STATUS_NEW -> OrderStatus.NEW;
-      case EXECUTION_REPORT_STATUS_PARTIALLYFILL -> OrderStatus.PARTIALLY_FILLED;
-      case EXECUTION_REPORT_STATUS_FILL -> OrderStatus.FILLED;
-      case EXECUTION_REPORT_STATUS_CANCELLED -> OrderStatus.CANCELLED;
-      case EXECUTION_REPORT_STATUS_REJECTED -> OrderStatus.REJECTED;
+    return status(
+        status == null || status == OrderExecutionReportStatus.UNRECOGNIZED
+            ? null
+            : status.getNumber());
+  }
+
+  /** Shared numeric SDK status conversion; optional/future values remain UNKNOWN. */
+  static OrderStatus status(Integer value) {
+    return switch (value == null ? 0 : value) {
+      case OrderExecutionReportStatus.EXECUTION_REPORT_STATUS_NEW_VALUE -> OrderStatus.NEW;
+      case OrderExecutionReportStatus.EXECUTION_REPORT_STATUS_PARTIALLYFILL_VALUE ->
+          OrderStatus.PARTIALLY_FILLED;
+      case OrderExecutionReportStatus.EXECUTION_REPORT_STATUS_FILL_VALUE -> OrderStatus.FILLED;
+      case OrderExecutionReportStatus.EXECUTION_REPORT_STATUS_CANCELLED_VALUE ->
+          OrderStatus.CANCELLED;
+      case OrderExecutionReportStatus.EXECUTION_REPORT_STATUS_REJECTED_VALUE ->
+          OrderStatus.REJECTED;
       default -> OrderStatus.UNKNOWN;
     };
   }

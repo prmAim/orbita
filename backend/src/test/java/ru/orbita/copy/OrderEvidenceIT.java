@@ -33,6 +33,77 @@ class OrderEvidenceIT {
   @Autowired ReconciliationService reconciliation;
   @Autowired PositionRecoveryService recovery;
 
+  @Test
+  void earlierReceivedFillStateWithoutUuidPreventsZeroQualificationAndReplaysAfterExactLink() {
+    var request = send(3, 1);
+    var unlinked =
+        new OrderRequest("mirror", null, request.instrumentId(), Side.BUY, 3, request.limitPrice());
+    trading.apply(
+        state(unlinked, OrderStatus.PARTIALLY_FILLED, 1, 2, 0, null, "bank-order"), false);
+    trading.apply(qualifiedUnary(request, OrderStatus.CANCELLED), false);
+    trading.apply(state(request, OrderStatus.CANCELLED, 0, 0, 3, 2, "bank-order"), false);
+    assertThat(count("ORDER_REASON_QUALIFIED")).isZero();
+    trading.replayOrderEvidence();
+    assertThat(copies.intents().getFirst().executedLots()).isEqualTo(1);
+    assertThat(count("ORDER_EVIDENCE_RECHECK")).isPositive();
+    assertThat(broker.posts).isEqualTo(1);
+  }
+
+  @org.junit.jupiter.params.ParameterizedTest
+  @org.junit.jupiter.params.provider.ValueSource(
+      strings = {"same-ids", "foreign-account", "other-exchange"})
+  void lateStateWithoutUuidRevokesOnlyAfterExactOwnIdLink(String relation) {
+    var request = send(3, 1);
+    trading.apply(state(request, OrderStatus.CANCELLED, 0, 0, 3, 2, "bank-order"), false);
+    trading.apply(qualifiedUnary(request, OrderStatus.CANCELLED), false);
+    assertThat(count("ORDER_REASON_QUALIFIED")).isEqualTo(1);
+    var unlinked =
+        new OrderRequest(
+            relation.equals("foreign-account") ? "foreign" : "mirror",
+            null,
+            request.instrumentId(),
+            Side.BUY,
+            3,
+            request.limitPrice());
+    trading.apply(
+        state(
+            unlinked,
+            OrderStatus.PARTIALLY_FILLED,
+            1,
+            2,
+            0,
+            null,
+            relation.equals("other-exchange") ? "unrelated-order" : "bank-order"),
+        false);
+    assertThat(count("ORDER_REASON_INVALIDATED")).isEqualTo(relation.equals("same-ids") ? 1 : 0);
+    assertThat(copies.intents().getFirst().executedLots())
+        .isEqualTo(relation.equals("same-ids") ? 1 : 0);
+    assertThat(broker.posts).isEqualTo(1);
+  }
+
+  @org.junit.jupiter.params.ParameterizedTest
+  @org.junit.jupiter.params.provider.EnumSource(
+      value = OrderStatus.class,
+      names = {"NEW", "REJECTED"})
+  void earlierStatusVolumeContradictionPreventsLaterQualifiedReason(OrderStatus badStatus) {
+    var request = send(3);
+    trading.apply(
+        state(
+            request,
+            badStatus,
+            0,
+            badStatus == OrderStatus.NEW ? 2 : 3,
+            badStatus == OrderStatus.NEW ? 1 : 0,
+            null,
+            "bank-order"),
+        false);
+    assertThat(count("ORDER_EVIDENCE_CONTRADICTION")).isPositive();
+    trading.apply(qualifiedUnary(request, OrderStatus.REJECTED), false);
+    trading.apply(state(request, OrderStatus.REJECTED, 0, 0, 3, 2, "bank-order"), false);
+    assertThat(count("ORDER_REASON_QUALIFIED")).isZero();
+    assertThat(broker.posts).isEqualTo(1);
+  }
+
   @org.junit.jupiter.params.ParameterizedTest
   @org.junit.jupiter.params.provider.EnumSource(
       value = OrderStatus.class,

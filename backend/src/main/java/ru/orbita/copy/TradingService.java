@@ -825,7 +825,8 @@ public class TradingService implements UnsentIntentStop {
     var raw = evidence.sdkEvidence();
     if (!properties.mirrorAccount().equals(evidence.accountId())) return evidence;
     UUID id = evidence.requestId();
-    if (raw.source() == ru.orbita.broker.OrderSdkEvidence.Source.TRADES_STREAM) {
+    if (raw.source() == ru.orbita.broker.OrderSdkEvidence.Source.TRADES_STREAM
+        || id == null && (raw.responseRequestId() == null || raw.responseRequestId().isBlank())) {
       id = tx.execute(_ -> orderJournal.linkedRequest(raw).orElse(null));
       if (id == null) return null;
     }
@@ -947,29 +948,7 @@ public class TradingService implements UnsentIntentStop {
 
   private boolean validMirror(ru.orbita.broker.OrderSdkEvidence raw, CopyIntent i) {
     if (raw.source() == ru.orbita.broker.OrderSdkEvidence.Source.TRADES_STREAM) return true;
-    boolean quantities =
-        raw.requestedLots() != null
-            && raw.requestedLots() == i.requestedLots
-            && i.requestedLots > 0
-            && raw.executedLots() != null
-            && raw.executedLots() >= 0
-            && raw.executedLots() <= i.requestedLots
-            && raw.remainingLots() != null
-            && raw.remainingLots() >= 0
-            && raw.cancelledLots() != null
-            && raw.cancelledLots() >= 0
-            && raw.executedLots() + raw.remainingLots() + raw.cancelledLots() == i.requestedLots;
-    if (!quantities) return false;
-    return switch (raw.executionStatusValue() == null ? 0 : raw.executionStatusValue()) {
-      case 1 ->
-          raw.executedLots() == i.requestedLots
-              && raw.remainingLots() == 0
-              && raw.cancelledLots() == 0;
-      case 2, 3 -> raw.remainingLots() == 0;
-      case 4 -> raw.executedLots() == 0 && raw.cancelledLots() == 0;
-      case 5 -> raw.executedLots() > 0 && raw.executedLots() < i.requestedLots;
-      default -> true; // An unrecognised status remains UNKNOWN; cause never supplies an outcome.
-    };
+    return ru.orbita.broker.MirrorOrderParser.consistentStateQuantities(raw, i.requestedLots);
   }
 
   private void contradiction(CopyIntent i, String detail) {

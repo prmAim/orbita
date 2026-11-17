@@ -98,6 +98,11 @@ public class OrderEvidenceJournal {
             or detail::jsonb #>> '{evidence,sdkEvidence,responseRequestId}'=:request
         )
         select * from own where id in (select id from direct)
+          or (detail::jsonb #>> '{evidence,sdkEvidence,source}'='ORDER_STATE_STREAM'
+            and exists (select 1 from direct d
+              where d.detail::jsonb #>> '{evidence,sdkEvidence,source}'='ORDER_STATE_STREAM'
+                and d.detail::jsonb #>> '{evidence,sdkEvidence,responseOrderId}'=own.detail::jsonb #>> '{evidence,sdkEvidence,responseOrderId}'
+                and d.detail::jsonb #>> '{evidence,sdkEvidence,tradeOrderId}'=own.detail::jsonb #>> '{evidence,sdkEvidence,tradeOrderId}'))
           or (detail::jsonb #>> '{evidence,sdkEvidence,source}'='TRADES_STREAM'
             and detail::jsonb #>> '{evidence,sdkEvidence,responseOrderId}' in (
               select detail::jsonb #>> '{evidence,sdkEvidence,tradeOrderId}' from direct
@@ -230,20 +235,29 @@ public class OrderEvidenceJournal {
             json.writeValueAsString(link)));
   }
 
-  Optional<UUID> linkedRequest(OrderSdkEvidence trade) {
-    var candidates =
+  Optional<UUID> linkedRequest(OrderSdkEvidence observation) {
+    boolean state = observation.source() == OrderSdkEvidence.Source.ORDER_STATE_STREAM;
+    var exchangeId = state ? observation.tradeOrderId() : observation.responseOrderId();
+    if (exchangeId == null
+        || exchangeId.isBlank()
+        || state
+            && (observation.responseOrderId() == null || observation.responseOrderId().isBlank()))
+      return Optional.empty();
+    var query =
         em.createNativeQuery(
                 """
-        with links as materialized (select * from journal_entry where category='ORDER_TRADE_LINK')
-        select distinct on (detail::jsonb ->> 'requestId') * from links
-        where detail::jsonb ->> 'account'=:account
-        and detail::jsonb ->> 'exchangeOrderId'=:orderId
-        order by detail::jsonb ->> 'requestId',id desc limit 201
-        """,
+            with links as materialized (select * from journal_entry where category='ORDER_TRADE_LINK')
+            select distinct on (detail::jsonb ->> 'requestId') * from links
+            where detail::jsonb ->> 'account'=:account
+            and detail::jsonb ->> 'exchangeOrderId'=:orderId
+            """
+                    + (state ? " and detail::jsonb ->> 'internalOrderId'=:internalId" : "")
+                    + " order by detail::jsonb ->> 'requestId',id desc limit 201",
                 JournalEntry.class)
-            .setParameter("account", trade.responseAccountId())
-            .setParameter("orderId", trade.responseOrderId())
-            .getResultList();
+            .setParameter("account", observation.responseAccountId())
+            .setParameter("orderId", exchangeId);
+    if (state) query.setParameter("internalId", observation.responseOrderId());
+    var candidates = query.getResultList();
     if (candidates.size() > 200)
       return Optional.empty(); // Ambiguous excessive history needs unary reconciliation.
     Set<UUID> ids = new HashSet<>();

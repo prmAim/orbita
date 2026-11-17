@@ -47,16 +47,46 @@ RED интеграционного теста обнаружил также не
 
 | Проверка | Покрытие | Результат |
 | --- | --- | --- |
-| `BuyResourceRejectionClassifierTest` | B01 REJECTED/CANCELLED, B02 по одному нарушению, D01, отсутствующие raw поля, wrapper/raw, чужие IDs, внутренний ID вместо exchange, все полученные исполнения/противоречия, контекст другой мутации | Уточняется после заключительного focused-прогона |
-| `BuyResourceRejectionTlsTest` | SDK 1.51, настоящий loopback TLS, две BUY-положительные и две SELL-отрицательные фикстуры; проверен REQUEST lookup исходного UUID/счёта | Уточняется после заключительного focused-прогона |
-| `OrderSdkEvidenceTest`, `OrderSdkTlsTest`, `MirrorOrderFeedTlsTest` | A02/A05/A06/E01 и существующие raw/SDK/потоковые регрессии | Уточняется после заключительного focused-прогона |
-| `OrderEvidenceIT` | Поздняя причина/дубликаты/кадр без причины, один конечный результат, неприменённая сделка, позднее исполнение и отзыв нулевой квалификации, собственная отмена, все прежние A2-регрессии | Уточняется после заключительного focused-прогона |
-| `OrderEvidenceRestartIT` | Две отдельные пары закрытого/нового application context: прежний UNKNOWN-кейс и сохранённый unary + committed unapplied stream cause | Уточняется после заключительного focused-прогона |
+| `BuyResourceRejectionClassifierTest` | B01 REJECTED/CANCELLED, B02 по одному нарушению, D01, отсутствующие raw поля, wrapper/raw, чужие IDs, внутренний ID вместо exchange, все полученные исполнения/противоречия, контекст другой мутации | PASS: 57 до ревью; 63 после исправлений |
+| `BuyResourceRejectionTlsTest` | SDK 1.51, настоящий loopback TLS, две BUY-положительные и две SELL-отрицательные фикстуры; проверен REQUEST lookup исходного UUID/счёта | PASS: 4 |
+| `OrderSdkEvidenceTest`, `OrderSdkTlsTest`, `MirrorOrderFeedTlsTest` | A02/A05/A06/E01 и существующие raw/SDK/потоковые регрессии | PASS: 32 (4 + 23 + 5), до и после исправлений |
+| `OrderEvidenceIT` | Поздняя причина/дубликаты/кадр без причины, один конечный результат, неприменённая сделка, позднее исполнение и отзыв нулевой квалификации, собственная отмена, все прежние A2-регрессии | PASS: 23 до ревью; 29 после исправлений |
+| `OrderEvidenceRestartIT` | Две отдельные пары закрытого/нового application context: прежний UNKNOWN-кейс и сохранённый unary + committed unapplied stream cause | PASS: 2, до и после исправлений |
 
-Независимое ревью GPT-6 Astra — NOT_RUN на момент подготовки отчёта; полный набор
-проверок выполняется после ревью отдельным заключительным шагом. CI, push/PR,
+Исходный focused-прогон `b1-focused-final.log`: **PASS, 93 unit/SDK/TLS + 25 PostgreSQL IT**,
+0 failures/errors/skipped; `spotless:apply`, `git diff --check` — PASS.
+Первое независимое ревью GPT-6 Astra проведено, замечания и исправления описаны ниже;
+повторное ревью и полный набор выполняются отдельными заключительными шагами. CI, push/PR,
 настоящий брокер, реальные счета, Telegram и живая приёмка — NOT_RUN.
 
 Локальный TLS-имитатор подтверждает обработку заданных сообщений и исходный REQUEST
 lookup; он не доказывает, что production API выдаёт это сочетание полей, и не
 квалифицирует полноту производственного покрытия BUY.
+
+## Исправления первого независимого ревью
+
+Первый Spec review выявил два P2: история пропускала UUID-less OrderStateStream с
+совпадающими account/internal/exchange IDs, а проверка всей истории не учитывала
+ограничения объёмов конкретного статуса (например NEW с cancelled>0). Standards
+review также отметил дублирование преобразования SDK status (P3, рекомендация).
+
+Для обоих P2 до исправления воспроизведён настоящий поведенческий RED:
+`b1-review-unit-red.log` — 63 теста, 3 ожидаемых failures; `b1-review-durable-red.log`
+— 6 целевых PostgreSQL IT, 4 ожидаемых failures. Ошибки показали ложную квалификацию
+после раннего исполнения/противоречия и отсутствие отзыва после позднего состояния
+с исполнением; foreign-account и unrelated-ID отрицательные проверки уже проходили.
+
+Исправление включает такую историю по точной паре role-specific ID и счёту, не по
+инструменту/времени. UUID-less состояние не может дать положительную причину, но
+после доказанной долговечной связи участвует в существующем учёте исполнений;
+несвязанные receipts остаются pending без блокировки следующих страниц replay.
+Общая A2/B1-проверка status/quantity находится в `MirrorOrderParser`, преобразование
+SDK status — в единственной null/unknown-safe функции адаптера. Новых классов-корней
+fingerprint нет: оба изменённых типа уже входят в `AlgorithmVersion`.
+
+Первый GREEN исправлений: `b1-review-green.log` — **PASS, 63 unit + 29 PostgreSQL IT**,
+0 failures/errors/skipped. Заключительный focused-прогон исправлений:
+`b1-review-focused-final.log` — **PASS, 99 unit/SDK/TLS + 31 PostgreSQL IT = 130**,
+0 failures/errors/skipped, включая существующие SDK/TLS и оба настоящих restart-кейса.
+`spotless:apply` и `git diff --check` — PASS. Повторное ревью и полный набор —
+NOT_RUN на этом checkpoint; полного набора focused-проверки не заменяют.

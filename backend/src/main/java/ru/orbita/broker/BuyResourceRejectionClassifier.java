@@ -1,5 +1,7 @@
 package ru.orbita.broker;
 
+import static ru.orbita.broker.TInvestBrokerGateway.status;
+
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -85,8 +87,14 @@ public final class BuyResourceRejectionClassifier {
         r != null
             && r.source() == OrderSdkEvidence.Source.TRADES_STREAM
             && candidate.tradeOrderId().equals(r.responseOrderId());
+    boolean linkedState =
+        r != null
+            && r.source() == OrderSdkEvidence.Source.ORDER_STATE_STREAM
+            && candidate.responseOrderId().equals(r.responseOrderId())
+            && candidate.tradeOrderId().equals(r.tradeOrderId());
     if (!a.requestId().equals(e.requestId())
         && !linkedTrade
+        && !linkedState
         && (r == null || !a.requestId().toString().equals(r.responseRequestId()))) return false;
     if (!a.instrumentId().equals(e.instrumentId())
         || e.side() != a.side()
@@ -117,18 +125,11 @@ public final class BuyResourceRejectionClassifier {
         || terminal(r.executionStatusValue())
             && !r.executionStatusValue().equals(candidate.executionStatusValue())) return true;
     if (r.source() == OrderSdkEvidence.Source.ORDER_STATE_STREAM) {
+      if (!MirrorOrderParser.consistentStateQuantities(r, a.lots())) return true;
       if (!blank(r.responseOrderId())
               && !Objects.equals(candidate.responseOrderId(), r.responseOrderId())
           || !blank(r.tradeOrderId())
               && !Objects.equals(candidate.tradeOrderId(), r.tradeOrderId())) return true;
-      if (r.requestedLots() == null
-          || r.executedLots() == null
-          || r.remainingLots() == null
-          || r.cancelledLots() == null
-          || r.remainingLots() < 0
-          || r.cancelledLots() < 0
-          || r.remainingLots() > a.lots()
-          || r.cancelledLots() != a.lots() - r.remainingLots()) return true;
     } else if (!blank(r.responseOrderId()) && !candidate.tradeOrderId().equals(r.responseOrderId()))
       return true;
     return false;
@@ -136,15 +137,6 @@ public final class BuyResourceRejectionClassifier {
 
   private static boolean terminalStatus(OrderStatus s) {
     return s == OrderStatus.REJECTED || s == OrderStatus.CANCELLED;
-  }
-
-  private static OrderStatus status(Integer value) {
-    if (Integer.valueOf(1).equals(value)) return OrderStatus.FILLED;
-    if (Integer.valueOf(2).equals(value)) return OrderStatus.REJECTED;
-    if (Integer.valueOf(3).equals(value)) return OrderStatus.CANCELLED;
-    if (Integer.valueOf(4).equals(value)) return OrderStatus.NEW;
-    if (Integer.valueOf(5).equals(value)) return OrderStatus.PARTIALLY_FILLED;
-    return OrderStatus.UNKNOWN;
   }
 
   private static boolean blank(String value) {
