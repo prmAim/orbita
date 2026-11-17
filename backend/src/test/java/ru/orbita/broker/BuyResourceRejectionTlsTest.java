@@ -95,7 +95,8 @@ class BuyResourceRejectionTlsTest {
       var stream = received.poll(5, TimeUnit.SECONDS);
       assertThat(stream).isNotNull();
       var unary = gateway.reconcile(request);
-      var result = BuyResourceRejectionClassifier.classify(request, List.of(stream, unary), true);
+      var result =
+          BuyResourceRejectionClassifier.classify(request, List.of(stream, unary), true, 10);
       assertThat(result.isPresent()).isEqualTo(qualifies);
       assertThat(stream.sdkEvidence().responseOrderId()).isEqualTo("internal-id");
       assertThat(unary.brokerOrderId()).isEqualTo("exchange-id");

@@ -165,19 +165,13 @@ public class OrderEvidenceJournal {
       OrderRequest attempt,
       BuyResourceRejectionClassifier.Qualification result,
       List<Pending> history) {
-    em.persist(
-        new JournalEntry(
-            clock.instant(),
-            "ORDER_REASON_QUALIFIED",
-            attempt.instrumentId(),
-            json.writeValueAsString(
-                new ReasonEvidence(
-                    BuyResourceRejectionClassifier.VERSION,
-                    attempt.requestId(),
-                    result.status(),
-                    result.reason(),
-                    result.detail(),
-                    history.stream().map(Pending::sequence).toList()))));
+    writeReason(
+        "ORDER_REASON_QUALIFIED",
+        attempt,
+        result.status(),
+        result.reason(),
+        result.detail(),
+        history);
   }
 
   void invalidateReason(
@@ -185,17 +179,33 @@ public class OrderEvidenceJournal {
       ru.orbita.broker.BrokerGateway.OrderStatus status,
       String detail,
       List<Pending> history) {
+    writeReason(
+        "ORDER_REASON_INVALIDATED",
+        attempt,
+        status,
+        ru.orbita.broker.BrokerGateway.RejectionReason.OTHER,
+        detail,
+        history);
+  }
+
+  private void writeReason(
+      String category,
+      OrderRequest attempt,
+      ru.orbita.broker.BrokerGateway.OrderStatus status,
+      ru.orbita.broker.BrokerGateway.RejectionReason reason,
+      String detail,
+      List<Pending> history) {
     em.persist(
         new JournalEntry(
             clock.instant(),
-            "ORDER_REASON_INVALIDATED",
+            category,
             attempt.instrumentId(),
             json.writeValueAsString(
                 new ReasonEvidence(
                     BuyResourceRejectionClassifier.VERSION,
                     attempt.requestId(),
                     status,
-                    ru.orbita.broker.BrokerGateway.RejectionReason.OTHER,
+                    reason,
                     detail,
                     history.stream().map(Pending::sequence).toList()))));
   }

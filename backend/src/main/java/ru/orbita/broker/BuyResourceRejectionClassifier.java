@@ -18,8 +18,13 @@ public final class BuyResourceRejectionClassifier {
 
   /** The caller supplies the saved original attempt and all its received durable evidence. */
   public static Optional<Qualification> classify(
-      OrderRequest attempt, List<OrderEvidence> history, boolean onlyOriginalMutation) {
-    if (!onlyOriginalMutation
+      OrderRequest attempt,
+      List<OrderEvidence> history,
+      boolean onlyOriginalMutation,
+      Integer qualifiedLotSize) {
+    if (qualifiedLotSize == null
+        || qualifiedLotSize <= 0
+        || !onlyOriginalMutation
         || attempt.side() != Side.BUY
         || attempt.lots() <= 0
         || attempt.requestId() == null
@@ -54,7 +59,7 @@ public final class BuyResourceRejectionClassifier {
             && Long.valueOf(attempt.lots()).equals(u.requestedLots())
             && Long.valueOf(0).equals(u.executedLots())
             && u.stages().isEmpty()
-            && history.stream().noneMatch(e -> contradiction(attempt, s, e)))
+            && history.stream().noneMatch(e -> contradiction(attempt, s, e, qualifiedLotSize)))
           return Optional.of(
               new Qualification(stream.status(), RejectionReason.INSUFFICIENT_RESOURCES, DETAIL));
       }
@@ -79,7 +84,7 @@ public final class BuyResourceRejectionClassifier {
   }
 
   private static boolean contradiction(
-      OrderRequest a, OrderSdkEvidence candidate, OrderEvidence e) {
+      OrderRequest a, OrderSdkEvidence candidate, OrderEvidence e, int qualifiedLotSize) {
     var r = e.sdkEvidence();
     // Foreign accounts are not observations of this attempt even if a UUID happens to match.
     if (!a.accountId().equals(e.accountId())) return false;
@@ -108,6 +113,7 @@ public final class BuyResourceRejectionClassifier {
               || e.status() == OrderStatus.PARTIALLY_FILLED
               || terminalStatus(e.status())
                   && e.status() != status(candidate.executionStatusValue()));
+    if (r.lotSize() != null && r.lotSize() != qualifiedLotSize) return true;
     if (!r.trades().isEmpty()
         || !r.stages().isEmpty()
         || r.executedLots() != null && r.executedLots() != 0) return true;

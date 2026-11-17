@@ -141,6 +141,107 @@ class OrderEvidenceIT {
     assertThat(control.instruments()).noneMatch(ControlService.InstrumentStatus::paused);
   }
 
+  @org.junit.jupiter.params.ParameterizedTest
+  @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+  void historicalStreamLotSizeMismatchDeniesOrRevokesResourceReason(boolean alreadyQualified) {
+    var request = send(3, 10);
+    trading.apply(qualifiedUnary(request, OrderStatus.CANCELLED), false);
+    if (alreadyQualified) {
+      trading.apply(state(request, OrderStatus.CANCELLED, 0, 0, 3, 2, "bank-order"), false);
+      assertThat(count("ORDER_REASON_QUALIFIED")).isEqualTo(1);
+    }
+    broker.instrumentLotSize = 20;
+    var mismatch = state(request, OrderStatus.CANCELLED, 0, 0, 3, 2, "bank-order");
+    broker.instrumentLotSize = 10;
+    trading.apply(mismatch, false);
+    assertThat(count("ORDER_REASON_QUALIFIED")).isEqualTo(alreadyQualified ? 1 : 0);
+    assertThat(count("ORDER_REASON_INVALIDATED")).isEqualTo(alreadyQualified ? 1 : 0);
+    // Later correct evidence and inbox replay still respect the durable contradiction.
+    trading.apply(qualifiedUnary(request, OrderStatus.CANCELLED), false);
+    trading.apply(state(request, OrderStatus.CANCELLED, 0, 0, 3, 2, "bank-order"), false);
+    trading.replayOrderEvidence();
+    assertThat(count("ORDER_REASON_QUALIFIED")).isEqualTo(alreadyQualified ? 1 : 0);
+    assertThat(copies.intents())
+        .singleElement()
+        .satisfies(
+            i -> {
+              assertThat(i.status()).isEqualTo("FINAL");
+              assertThat(i.executedLots()).isZero();
+              assertThat(i.skippedLots()).isEqualTo(3);
+              assertThat(i.reason())
+                  .isNotEqualTo("нехватка средств; подтверждена потоком состояний");
+            });
+    assertThat(control.instruments())
+        .singleElement()
+        .satisfies(i -> assertThat(i.paused()).isTrue());
+    assertThat(count("ORDER_EVIDENCE_CONTRADICTION")).isPositive();
+    assertThat(count("NOTIFICATION_ORDER_FINAL_SKIP")).isEqualTo(1);
+    assertThat(broker.posts).isEqualTo(1);
+  }
+
+  @org.junit.jupiter.params.ParameterizedTest
+  @org.junit.jupiter.params.provider.ValueSource(
+      strings = {"throws", "unqualified", "qualified-throws", "qualified-unqualified"})
+  void unavailableReasonMetadataDoesNotPreventKnownUnaryOutcome(String failure) {
+    var request = send(3, 10);
+    trading.apply(state(request, OrderStatus.CANCELLED, 0, 0, 3, 2, "bank-order"), false);
+    boolean qualified = failure.startsWith("qualified-");
+    if (qualified) trading.apply(qualifiedUnary(request, OrderStatus.CANCELLED), false);
+    broker.instrumentHook =
+        () -> {
+          if (failure.endsWith("throws"))
+            throw new IllegalStateException("synthetic instrument unavailable");
+          broker.instrumentLotSize = 0;
+        };
+    try {
+      trading.apply(qualifiedUnary(request, OrderStatus.CANCELLED), false);
+    } finally {
+      broker.instrumentHook = null;
+      broker.instrumentLotSize = 10;
+    }
+    assertThat(copies.intents())
+        .singleElement()
+        .satisfies(
+            i -> {
+              assertThat(i.status()).isEqualTo("FINAL");
+              assertThat(i.executedLots()).isZero();
+              assertThat(i.skippedLots()).isEqualTo(3);
+            });
+    assertThat(count("ORDER_REASON_QUALIFIED")).isEqualTo(qualified ? 1 : 0);
+    assertThat(count("ORDER_REASON_INVALIDATED")).isEqualTo(qualified ? 1 : 0);
+    if (qualified)
+      assertThat(copies.intents().getFirst().reason())
+          .contains("OTHER", "независимый размер лота недоступен", "требуется сверка")
+          .doesNotContain("опровергнута");
+    assertThat(count("NOTIFICATION_ORDER_FINAL_SKIP")).isEqualTo(1);
+    assertThat(broker.posts).isEqualTo(1);
+  }
+
+  @Test
+  void filledUnaryDoesNotReadMetadataOnlyNeededForResourceReason() {
+    var request = send(3, 10);
+    var filled = broker.evidence(request, OrderStatus.FILLED, 3);
+    broker.instrumentHook =
+        () -> {
+          throw new IllegalStateException("filled unary must not need a reason metadata read");
+        };
+    try {
+      trading.apply(filled, false);
+    } finally {
+      broker.instrumentHook = null;
+    }
+    assertThat(copies.intents())
+        .singleElement()
+        .satisfies(
+            i -> {
+              assertThat(i.status()).isEqualTo("FINAL");
+              assertThat(i.executedLots()).isEqualTo(3);
+              assertThat(i.skippedLots()).isZero();
+            });
+    assertThat(count("ORDER_REASON_QUALIFIED")).isZero();
+    assertThat(broker.posts).isEqualTo(1);
+  }
+
   private OrderEvidence qualifiedUnary(OrderRequest request, OrderStatus status) {
     var raw =
         new OrderSdkEvidence(

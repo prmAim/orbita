@@ -18,6 +18,16 @@ class BuyResourceRejectionClassifierTest {
       new OrderRequest("mirror", ID, "instrument", Side.BUY, 3, BigDecimal.TEN);
 
   @ParameterizedTest
+  @org.junit.jupiter.params.provider.NullSource
+  @ValueSource(ints = {0, -1, 20})
+  void missingOrContradictoryIndependentLotSizeCannotQualify(Integer lotSize) {
+    assertThat(
+            BuyResourceRejectionClassifier.classify(
+                REQUEST, List.of(stream(2), unary(2)), true, lotSize))
+        .isEmpty();
+  }
+
+  @ParameterizedTest
   @ValueSource(strings = {"same-ids", "foreign-account", "other-internal", "other-exchange"})
   void receivedStateWithoutUuidUsesBothRoleSpecificIdsForContradictionOnly(String relation) {
     var b =
@@ -33,7 +43,7 @@ class BuyResourceRejectionClassifierTest {
     var received = MirrorOrderParser.state(b.build(), AT);
     assertThat(
             BuyResourceRejectionClassifier.classify(
-                    REQUEST, List.of(received, stream(2), unary(2)), true)
+                    REQUEST, List.of(received, stream(2), unary(2)), true, 10)
                 .isPresent())
         .isEqualTo(!relation.equals("same-ids"));
   }
@@ -51,7 +61,7 @@ class BuyResourceRejectionClassifierTest {
             AT);
     assertThat(
             BuyResourceRejectionClassifier.classify(
-                REQUEST, List.of(received, stream(2), unary(2)), true))
+                REQUEST, List.of(received, stream(2), unary(2)), true, 10))
         .isEmpty();
   }
 
@@ -60,7 +70,7 @@ class BuyResourceRejectionClassifierTest {
   void agreesOnExactTerminalZeroWithoutChangingCancelledToRejected(int status) {
     var stream = stream(status);
     var unary = unary(status);
-    var result = BuyResourceRejectionClassifier.classify(REQUEST, List.of(stream, unary), true);
+    var result = BuyResourceRejectionClassifier.classify(REQUEST, List.of(stream, unary), true, 10);
     assertThat(result).isPresent();
     assertThat(result.orElseThrow().status())
         .isEqualTo(status == 2 ? OrderStatus.REJECTED : OrderStatus.CANCELLED);
@@ -175,7 +185,8 @@ class BuyResourceRejectionClassifierTest {
       default -> throw new AssertionError(changed);
     }
     var stream = MirrorOrderParser.state(builder.build(), AT);
-    assertThat(BuyResourceRejectionClassifier.classify(REQUEST, List.of(stream, unary(2)), true))
+    assertThat(
+            BuyResourceRejectionClassifier.classify(REQUEST, List.of(stream, unary(2)), true, 10))
         .isEmpty();
   }
 
@@ -212,7 +223,7 @@ class BuyResourceRejectionClassifierTest {
     }
     assertThat(
             BuyResourceRejectionClassifier.classify(
-                REQUEST, List.of(stream(2), unary(builder.build())), true))
+                REQUEST, List.of(stream(2), unary(builder.build())), true, 10))
         .isEmpty();
   }
 
@@ -242,7 +253,7 @@ class BuyResourceRejectionClassifierTest {
       history.add(unary(unaryBuilder(2).setLotsExecuted(1).build()));
     if (changed.equals("received-contradiction"))
       history.add(unary(unaryBuilder(2).setInstrumentUid("other").build()));
-    assertThat(BuyResourceRejectionClassifier.classify(attempt, history, true)).isEmpty();
+    assertThat(BuyResourceRejectionClassifier.classify(attempt, history, true, 10)).isEmpty();
   }
 
   @ParameterizedTest
@@ -285,7 +296,7 @@ class BuyResourceRejectionClassifierTest {
             r.trades());
     assertThat(
             BuyResourceRejectionClassifier.classify(
-                REQUEST, List.of(withRaw(e, raw), unary(2)), true))
+                REQUEST, List.of(withRaw(e, raw), unary(2)), true, 10))
         .isEmpty();
   }
 
@@ -323,7 +334,7 @@ class BuyResourceRejectionClassifierTest {
             null,
             null,
             e.sdkEvidence());
-    assertThat(BuyResourceRejectionClassifier.classify(REQUEST, List.of(stream(2), bad), true))
+    assertThat(BuyResourceRejectionClassifier.classify(REQUEST, List.of(stream(2), bad), true, 10))
         .isEmpty();
   }
 
@@ -359,14 +370,15 @@ class BuyResourceRejectionClassifierTest {
             AT);
     assertThat(
             BuyResourceRejectionClassifier.classify(
-                REQUEST, List.of(early, stream(2), unary(2)), true))
+                REQUEST, List.of(early, stream(2), unary(2)), true, 10))
         .isPresent();
   }
 
   @org.junit.jupiter.api.Test
   void anotherMutatingInstructionExcludesThisNarrowOriginalAttemptPath() {
     assertThat(
-            BuyResourceRejectionClassifier.classify(REQUEST, List.of(stream(2), unary(2)), false))
+            BuyResourceRejectionClassifier.classify(
+                REQUEST, List.of(stream(2), unary(2)), false, 10))
         .isEmpty();
   }
 
@@ -387,7 +399,7 @@ class BuyResourceRejectionClassifierTest {
             "saved legacy observation");
     assertThat(
             BuyResourceRejectionClassifier.classify(
-                REQUEST, List.of(known, stream(2), unary(2)), true))
+                REQUEST, List.of(known, stream(2), unary(2)), true, 10))
         .isEmpty();
   }
 }

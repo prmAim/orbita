@@ -22,9 +22,12 @@ class OrderEvidenceRestartIT {
   @Container static final PostgreSQLContainer POSTGRES = new PostgreSQLContainer("postgres:17.11");
 
   @org.junit.jupiter.params.ParameterizedTest
-  @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+  @org.junit.jupiter.params.provider.ValueSource(
+      strings = {"unknown", "resource", "mismatch", "late-mismatch"})
   void lostResponseAndCommittedUnappliedEvidenceSurviveNewApplicationContextWithoutSecondPost(
-      boolean resourceReason) {
+      String scenario) {
+    boolean resourceReason = !scenario.equals("unknown");
+    boolean mismatch = scenario.endsWith("mismatch");
     var clock = new CopyLifecycleIT.MutableClock();
     var broker = new CopyLifecycleIT.Simulator(clock);
     OrderRequest request;
@@ -75,6 +78,8 @@ class OrderEvidenceRestartIT {
               });
       var db = first.getBean(JdbcTemplate.class);
       if (resourceReason) trading.apply(resourceEvidence(request, clock, false), false);
+      if (scenario.equals("late-mismatch"))
+        trading.apply(resourceEvidence(request, clock, true), false);
       db.execute(
           "create function synthetic_restart_failure() returns trigger language plpgsql as $$ begin if new.category='ORDER_EVIDENCE_APPLIED' then raise exception 'synthetic crash before decision commit'; end if; return new; end $$");
       db.execute(
@@ -83,7 +88,7 @@ class OrderEvidenceRestartIT {
               () ->
                   trading.apply(
                       resourceReason
-                          ? resourceEvidence(request, clock, true)
+                          ? resourceEvidence(request, clock, true, mismatch ? 20 : 1)
                           : broker.evidence(request, OrderStatus.CANCELLED, 0),
                       false))
           .isInstanceOf(RuntimeException.class);
@@ -100,6 +105,10 @@ class OrderEvidenceRestartIT {
       var copies = second.getBean(CopyService.class);
       trading.replayOrderEvidence();
       trading.tick();
+      if (mismatch) {
+        trading.apply(resourceEvidence(request, clock, false), false);
+        trading.apply(resourceEvidence(request, clock, true), false);
+      }
       trading.replayOrderEvidence();
       assertThat(copies.intents())
           .singleElement()
@@ -117,7 +126,7 @@ class OrderEvidenceRestartIT {
                   .count())
           .isEqualTo(1);
       assertThat(second.getBean(ControlService.class).status().permitLimit()).isNull();
-      if (resourceReason) {
+      if (resourceReason && !mismatch) {
         assertThat(copies.intents().getFirst().reason())
             .isEqualTo("нехватка средств; подтверждена потоком состояний");
         assertThat(
@@ -126,11 +135,33 @@ class OrderEvidenceRestartIT {
                     .count())
             .isEqualTo(1);
       }
+      if (mismatch) {
+        assertThat(copies.intents().getFirst().reason())
+            .isNotEqualTo("нехватка средств; подтверждена потоком состояний");
+        assertThat(
+                copies.journal(0, 200).stream()
+                    .filter(e -> e.category().equals("ORDER_REASON_QUALIFIED"))
+                    .count())
+            .isEqualTo(scenario.equals("late-mismatch") ? 1 : 0);
+        assertThat(
+                copies.journal(0, 200).stream()
+                    .filter(e -> e.category().equals("ORDER_REASON_INVALIDATED"))
+                    .count())
+            .isEqualTo(scenario.equals("late-mismatch") ? 1 : 0);
+        assertThat(second.getBean(ControlService.class).instruments())
+            .singleElement()
+            .satisfies(i -> assertThat(i.paused()).isTrue());
+      }
       assertThat(broker.posts).isEqualTo(1);
     }
   }
 
   private OrderEvidence resourceEvidence(OrderRequest request, Clock clock, boolean stream) {
+    return resourceEvidence(request, clock, stream, 1);
+  }
+
+  private OrderEvidence resourceEvidence(
+      OrderRequest request, Clock clock, boolean stream, int lotSize) {
     var raw =
         new ru.orbita.broker.OrderSdkEvidence(
             stream
@@ -155,7 +186,7 @@ class OrderEvidenceRestartIT {
             clock.instant(),
             null,
             null,
-            stream ? 1 : null,
+            stream ? lotSize : null,
             List.of());
     return new OrderEvidence(
         request.requestId(),
