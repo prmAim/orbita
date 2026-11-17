@@ -5,6 +5,10 @@
 Локальные синтетические проверки выполнены 2026-11-18. Этот отчёт относится только
 к B1; #38 не начата. Ф-04 и #20 целиком не закрываются.
 
+**#37 завершена и закрыта** после [PR #44](https://github.com/prmAim/orbita/pull/44)
+и успешного CI `main` / `7f03930`. [Итог задачи](https://github.com/prmAim/orbita/issues/37#issuecomment-6959892284).
+Итоговый полный CI: **402 Java-теста PASS**; ссылки и результаты приведены ниже.
+
 ## Реализованная граница
 
 `BuyResourceRejectionClassifier` квалифицирует только точный BUY-предикат:
@@ -56,8 +60,9 @@ RED интеграционного теста обнаружил также не
 Исходный focused-прогон `b1-focused-final.log`: **PASS, 93 unit/SDK/TLS + 25 PostgreSQL IT**,
 0 failures/errors/skipped; `spotless:apply`, `git diff --check` — PASS.
 Независимое ревью GPT-6 Astra и повторная проверка исправлений проведены;
-результаты приведены ниже. Полный набор завершён после повторного ревью. CI, push/PR,
-настоящий брокер, реальные счета, Telegram и живая приёмка — NOT_RUN.
+результаты приведены ниже. Полный локальный набор завершён после повторного ревью;
+последующая публикация и CI описаны отдельно. Настоящий брокер, реальные счета,
+Telegram и живая приёмка — NOT_RUN.
 
 Локальный TLS-имитатор подтверждает обработку заданных сообщений и исходный REQUEST
 lookup; он не доказывает, что production API выдаёт это сочетание полей, и не
@@ -157,9 +162,38 @@ FILLED unary без чтения справочника причины. `spotles
 Это на 79 тестов больше исходного набора A2 (310). `spotless:check` — PASS;
 frontend `npm run typecheck` и `npm run build` — PASS. Ссылки локальных отчёта,
 спецификации и списка оставшихся работ, а также `git diff --check` — PASS.
-После полного прогона менялись только эти документы; повторной сборки не требовалось.
+На завершении локального этапа после этого прогона менялись только документы.
+Последующие исправления pre-merge (`635217e`) проверены целевыми тестами и полным CI.
 
-#37 реализована и проверена локально; задача GitHub остаётся открытой до публикации.
-Push, PR, remote CI, merge, живая приёмка и реальные внешние вызовы — **NOT_RUN**.
+## Публикация, pre-merge review и CI
+
+[PR #44](https://github.com/prmAim/orbita/pull/44) слит в `main`:
+`7f03930aca060a4e6645c721d6f68597aaaef867`. #37 закрыта только после успешного CI
+этого merge-коммита. Код и исправления — GPT-6.1 Sol.
+
+[Повторное pre-merge review GPT-6 Astra](https://github.com/prmAim/orbita/pull/44#issuecomment-6959542845)
+проверило код `635217e` тремя независимыми агентами:
+
+| Ось | Итог | Результат |
+| --- | --- | --- |
+| Security | PASS, 0 замечаний | Параметризованные запросы, сохранённые блокировки/транзакции; новые RPC используют сохранённый ID инструмента |
+| Business Logic | PASS, 0 открытых | P2 размера лота закрыт; история/restart и отказ справочника проверены регрессиями, известный исход не теряется |
+| Duplication + Dead Code | PASS, 0 открытых | P3 закрыт общим writer для квалификации/отзыва; PreparedMirror исключает повторный lookup |
+
+Консервативный отзыв причины при недоступности независимых метаданных отмечен
+Business Logic reviewer как допустимое решение (judgement call), не как дефект.
+Сами ревьюеры тесты не запускали. Полные отчёты каждой оси сохранены в PR.
+
+| Проверка | Результат |
+| --- | --- |
+| [PR Java/TypeScript](https://github.com/prmAim/orbita/actions/runs/44165886976), `635217e` | PASS: 205 unit/SDK/TLS + 197 IT = 402, 0 failures/errors/skipped; frontend и Spotless PASS |
+| [PR Python](https://github.com/prmAim/orbita/actions/runs/44165886821), `635217e` | PASS: 43 теста, 1 предусмотренный Windows-only skip на Linux; offline PASS |
+| [Ветка Java/TypeScript](https://github.com/prmAim/orbita/actions/runs/44165871585) / [Python](https://github.com/prmAim/orbita/actions/runs/44165872495) | PASS на том же `635217e` |
+| [main Java/TypeScript](https://github.com/prmAim/orbita/actions/runs/44167127715), `7f03930` | PASS: 205 + 197 = 402, 0 failures/errors/skipped; frontend и Spotless PASS |
+| [main Python](https://github.com/prmAim/orbita/actions/runs/44167127761), `7f03930` | PASS: 43 теста, 1 предусмотренный Windows-only skip на Linux; offline PASS |
+
+Полный локальный набор после pre-merge исправления не повторялся: полный набор
+проверен в GitHub CI на исправленном коммите и после слияния. Живая приёмка и
+реальные брокерские/Telegram-вызовы — **NOT_RUN**.
 #38 не начата; HALTED/SELL не подключены. Положительный BUY в синтетических
 проверках не доказывает полноту покрытия производственных отказов брокера.

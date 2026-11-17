@@ -12,11 +12,11 @@ T-Invest Java SDK Core/Contract **1.51**.
 и успешного Java/TypeScript и Python CI в `main` / `003522f`: 310 Java-тестов PASS.
 Astra Standards/Spec — 0/0, pre-merge — 0/0/0 открытых замечаний;
 [отчёт A2 и ссылки CI](../acceptance/f04-a2-durable-order-evidence.md).
-**B1 / #37 реализована локально** в `codex/f04-b1-buy-resource-classifier` от
-`main` / `ba4979f`: строгая квалификация причины BUY и регрессии;
-[отчёт B1](../acceptance/f04-b1-buy-resource-classifier.md), 389 локальных тестов,
-frontend и Spotless — PASS; Astra Standards/Spec — 0/0 открытых замечаний.
-Push/PR и CI B1 не выполнялись, #37 остаётся открытой.
+**B1 / #37 завершена и закрыта** после [PR #44](https://github.com/prmAim/orbita/pull/44)
+и CI `main` / `7f03930`: строгая квалификация причины BUY и регрессии;
+[отчёт B1 и ссылки CI](../acceptance/f04-b1-buy-resource-classifier.md), 402 теста,
+frontend, Spotless, Java/TypeScript и Python CI — PASS. Astra Standards/Spec — 0/0,
+pre-merge — 0/0/0 открытых замечаний после исправлений.
 B2 / #38 не начата; HALTED и SELL сохраняют блокировку. Живая приёмка не проводилась.
 
 Нормативные требования остаются в [спецификации #10](https://github.com/prmAim/orbita/issues/10),
@@ -34,13 +34,13 @@ B2 / #38 не начата; HALTED и SELL сохраняют блокировк
 | --- | --- | --- |
 | A1 — доказательства SDK | [#35](https://github.com/prmAim/orbita/issues/35) | CLOSED, main / #42, CI PASS |
 | A2 — поток, долговечность и сверка | [#36](https://github.com/prmAim/orbita/issues/36) | CLOSED, main / #43, CI PASS |
-| B1 — строгий BUY-предикат | [#37](https://github.com/prmAim/orbita/issues/37) | #36 выполнена; B1 реализована локально, публикация не выполнена |
-| B2 — пропуск, резервы и R125 | [#38](https://github.com/prmAim/orbita/issues/38) | #37; не начата |
+| B1 — строгий BUY-предикат | [#37](https://github.com/prmAim/orbita/issues/37) | CLOSED, main / #44, CI PASS |
+| B2 — пропуск, резервы и R125 | [#38](https://github.com/prmAim/orbita/issues/38) | #37 выполнена; не начата |
 | Уточнения владельца API | [#39](https://github.com/prmAim/orbita/issues/39) | Внешние сведения, needs-info |
 | C — HALTED | [#40](https://github.com/prmAim/orbita/issues/40) | #39 и #36; needs-info |
 | D — собственные бумаги SELL | [#41](https://github.com/prmAim/orbita/issues/41) | #39 и #38; needs-info |
 
-A/B не зависят от #39. #35 и #36 закрыты; остальные задачи открыты. Публикация сама
+A/B не зависят от #39. #35, #36 и #37 закрыты; остальные задачи открыты. Публикация сама
 по себе не означает завершение критериев или разрешение начать код. Навигация добавлена в
 [#20](https://github.com/prmAim/orbita/issues/20#issuecomment-6942852720) и
 [#10](https://github.com/prmAim/orbita/issues/10#issuecomment-6942853478).
