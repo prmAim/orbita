@@ -13,6 +13,22 @@ Spotless — PASS; независимые Astra Standards/Spec — без зам
 Ф-04 и остальные P2 остаются открытыми; Т-01/Т-02 сохраняют приоритет P1
 перед торговым допуском. Исторические основания находок ниже сохранены.
 
+Для Ф-04 / R52 подготовлено [исследование официальных API/SDK-источников](../research/r52-broker-rejection-classification-2026-11-17.md)
+с условиями квалификации причин, ограничениями доказательств и планом проверок.
+Исследование не закрывает Ф-04 и не заменяет реализацию или живую приёмку.
+Подготовлен [проект спецификации Ф-04 / R52](../specifications/f04-r52-rejection-classification.md)
+и опубликован в [#34](https://github.com/prmAim/orbita/issues/34):
+доказательства и ограниченная квалификация BUY выделены в доступный этап;
+HALTED, квалификация SELL и окончательное подтверждение ранних отказов без
+доступной заявки требуют уточнений API. Реализация не начата, статус Ф-04 не изменён.
+Задачи A/B: [#35](https://github.com/prmAim/orbita/issues/35) →
+[#36](https://github.com/prmAim/orbita/issues/36) →
+[#37](https://github.com/prmAim/orbita/issues/37) →
+[#38](https://github.com/prmAim/orbita/issues/38).
+HALTED [#40](https://github.com/prmAim/orbita/issues/40) и SELL
+[#41](https://github.com/prmAim/orbita/issues/41) заблокированы уточнениями API
+[#39](https://github.com/prmAim/orbita/issues/39); A/B от этого блокера не зависят.
+
 ## Spec: функциональные доработки
 
 Исходный аудит выявил **11 групп функциональных несоответствий**, затрагивающих
