@@ -6,6 +6,8 @@ import java.util.*;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionTemplate;
 import ru.orbita.broker.BrokerGateway.OrderEvidence;
+import ru.orbita.broker.BrokerGateway.OrderRequest;
+import ru.orbita.broker.BuyResourceRejectionClassifier;
 import ru.orbita.broker.OrderSdkEvidence;
 import ru.orbita.journal.JournalEntry;
 import tools.jackson.databind.json.JsonMapper;
@@ -80,6 +82,117 @@ public class OrderEvidenceJournal {
                 .stream()
                 .map(this::decode)
                 .toList());
+  }
+
+  /** Complete attempt history, including unapplied receipts and trades linked by the stream IDs. */
+  List<Pending> history(OrderRequest attempt) {
+    var rows =
+        em.createNativeQuery(
+                """
+        with receipts as materialized (
+          select * from journal_entry where category='ORDER_EVIDENCE_RECEIVED'
+        ), own as materialized (
+          select * from receipts where detail::jsonb #>> '{evidence,accountId}'=:account
+        ), direct as materialized (
+          select * from own where detail::jsonb #>> '{evidence,requestId}'=:request
+            or detail::jsonb #>> '{evidence,sdkEvidence,responseRequestId}'=:request
+        )
+        select * from own where id in (select id from direct)
+          or (detail::jsonb #>> '{evidence,sdkEvidence,source}'='TRADES_STREAM'
+            and detail::jsonb #>> '{evidence,sdkEvidence,responseOrderId}' in (
+              select detail::jsonb #>> '{evidence,sdkEvidence,tradeOrderId}' from direct
+              where detail::jsonb #>> '{evidence,sdkEvidence,source}'='ORDER_STATE_STREAM'))
+        order by id
+        """,
+                JournalEntry.class)
+            .setParameter("account", attempt.accountId())
+            .setParameter("request", attempt.requestId().toString())
+            .getResultList();
+    return rows.stream().map(row -> decode((JournalEntry) row)).toList();
+  }
+
+  record ReasonEvidence(
+      String classifierVersion,
+      UUID requestId,
+      ru.orbita.broker.BrokerGateway.OrderStatus status,
+      ru.orbita.broker.BrokerGateway.RejectionReason reason,
+      String detail,
+      List<Long> receipts) {}
+
+  /**
+   * Successful cancel returns GET_ORDER_STATE facts, so its mutation barrier must be checked too.
+   */
+  boolean onlyOriginalMutation(UUID requestId) {
+    return em.createQuery(
+                """
+        select count(c) from JournalEntry c where c.category='CANCEL_STARTED' and c.detail=:request
+          and not exists (select n.id from JournalEntry n where n.category='CANCEL_KNOWN_NOT_SENT'
+            and n.id>c.id and n.detail like :notSent
+            and not exists (select later.id from JournalEntry later where later.category='CANCEL_STARTED'
+              and later.detail=:request and later.id>c.id and later.id<n.id))
+        """,
+                Long.class)
+            .setParameter("request", requestId.toString())
+            .setParameter("notSent", requestId + ":%")
+            .getSingleResult()
+        == 0;
+  }
+
+  Optional<ReasonEvidence> latestReason(UUID requestId) {
+    var rows =
+        em.createNativeQuery(
+                """
+        with reasons as materialized (
+          select * from journal_entry where category in ('ORDER_REASON_QUALIFIED','ORDER_REASON_INVALIDATED')
+        )
+        select * from reasons where detail::jsonb ->> 'requestId'=:request order by id desc limit 1
+        """,
+                JournalEntry.class)
+            .setParameter("request", requestId.toString())
+            .getResultList();
+    return rows.isEmpty()
+        ? Optional.empty()
+        : Optional.of(
+            json.readValue(((JournalEntry) rows.getFirst()).view().detail(), ReasonEvidence.class));
+  }
+
+  void qualifyReason(
+      OrderRequest attempt,
+      BuyResourceRejectionClassifier.Qualification result,
+      List<Pending> history) {
+    em.persist(
+        new JournalEntry(
+            clock.instant(),
+            "ORDER_REASON_QUALIFIED",
+            attempt.instrumentId(),
+            json.writeValueAsString(
+                new ReasonEvidence(
+                    BuyResourceRejectionClassifier.VERSION,
+                    attempt.requestId(),
+                    result.status(),
+                    result.reason(),
+                    result.detail(),
+                    history.stream().map(Pending::sequence).toList()))));
+  }
+
+  void invalidateReason(
+      OrderRequest attempt,
+      ru.orbita.broker.BrokerGateway.OrderStatus status,
+      String detail,
+      List<Pending> history) {
+    em.persist(
+        new JournalEntry(
+            clock.instant(),
+            "ORDER_REASON_INVALIDATED",
+            attempt.instrumentId(),
+            json.writeValueAsString(
+                new ReasonEvidence(
+                    BuyResourceRejectionClassifier.VERSION,
+                    attempt.requestId(),
+                    status,
+                    ru.orbita.broker.BrokerGateway.RejectionReason.OTHER,
+                    detail,
+                    history.stream().map(Pending::sequence).toList()))));
   }
 
   /** Only a previously correlated stream UUID can establish the exchange trade-order link. */

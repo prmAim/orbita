@@ -630,6 +630,7 @@ public class TradingService implements UnsentIntentStop {
           CopyIntent i =
               em.find(CopyIntent.class, evidence.requestId(), LockModeType.PESSIMISTIC_WRITE);
           if (i == null) return;
+          refineBuyResourceReason(i, evidence);
           if (!i.instrumentId.equals(evidence.instrumentId())
               || evidence.side() == null
               || !i.side.equals(evidence.side().name())) {
@@ -910,6 +911,38 @@ public class TradingService implements UnsentIntentStop {
         null,
         null,
         raw);
+  }
+
+  private void refineBuyResourceReason(CopyIntent i, OrderEvidence current) {
+    if (!"BUY".equals(i.side) || i.requestedLots <= 0) return;
+    boolean qualified =
+        orderJournal
+            .latestReason(i.id)
+            .map(r -> r.reason() == RejectionReason.INSUFFICIENT_RESOURCES)
+            .orElse(false);
+    boolean terminal =
+        current.status() == OrderStatus.REJECTED || current.status() == OrderStatus.CANCELLED;
+    if (!terminal && !qualified) return;
+    var attempt = request(i);
+    var history = orderJournal.history(attempt);
+    var result =
+        i.executedLots == 0
+            ? ru.orbita.broker.BuyResourceRejectionClassifier.classify(
+                attempt,
+                history.stream().map(OrderEvidenceJournal.Pending::evidence).toList(),
+                orderJournal.onlyOriginalMutation(i.id))
+            : Optional.<ru.orbita.broker.BuyResourceRejectionClassifier.Qualification>empty();
+    if (result.isPresent()) {
+      if (!qualified && terminal && result.get().status() == current.status()) {
+        i.reason = result.get().detail();
+        orderJournal.qualifyReason(attempt, result.get(), history);
+      }
+    } else if (qualified) {
+      i.reason =
+          "Причина OTHER; прежняя квалификация нехватки средств опровергнута; требуется сверка";
+      orderJournal.invalidateReason(attempt, current.status(), i.reason, history);
+      contradiction(i, "Late evidence contradicts qualified zero resource rejection");
+    }
   }
 
   private boolean validMirror(ru.orbita.broker.OrderSdkEvidence raw, CopyIntent i) {
