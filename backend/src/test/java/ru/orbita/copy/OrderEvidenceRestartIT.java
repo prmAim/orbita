@@ -36,6 +36,8 @@ class OrderEvidenceRestartIT {
       control.markFeedReady(true);
       control.shadowChecked(first.getBean(AlgorithmVersion.class).current(), "BUY", true);
       control.shadowChecked(first.getBean(AlgorithmVersion.class).current(), "SELL", true);
+      control
+          .confirmLiveAcceptance(); // Synthetic multi-lot fixture, not a real-account acceptance.
       clock.now = clock.now.plusSeconds(1);
       control.issuePermit(new BigDecimal("1000"));
       clock.now = clock.now.plusSeconds(1);

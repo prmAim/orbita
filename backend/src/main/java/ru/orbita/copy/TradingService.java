@@ -669,7 +669,6 @@ public class TradingService implements UnsentIntentStop {
             contradiction(i, "Broker execution exceeds intent or units are unqualified");
             return;
           }
-          if (stream) orderJournal.rememberLink(pending.sequence(), evidence);
           Set<String> incomingTradeIds = new HashSet<>();
           for (Fill fill : evidence.fills()) {
             var previous =
@@ -694,6 +693,7 @@ public class TradingService implements UnsentIntentStop {
               return;
             }
           }
+          if (stream) orderJournal.rememberLink(pending.sequence(), evidence);
           long delta = evidence.lotsExecuted() - i.executedLots;
           if (delta > 0) {
             MirrorPosition p = position(i.instrumentId);
@@ -723,7 +723,11 @@ public class TradingService implements UnsentIntentStop {
                   || evidence.status() == OrderStatus.CANCELLED
                   || evidence.status() == OrderStatus.REJECTED;
           if (terminal) {
-            if (i.acceptanceAttempt && !postResponse) i.acceptanceOrderReconciled = true;
+            if (i.acceptanceAttempt && !postResponse && !stream) i.acceptanceOrderReconciled = true;
+            if (stream)
+              em.persist(
+                  new JournalEntry(
+                      clock.instant(), "ORDER_EVIDENCE_RECHECK", i.instrumentId, i.id.toString()));
             i.cancellationPending = false;
             if (evidence.status() == OrderStatus.REJECTED
                 && evidence.rejectionReason() == RejectionReason.HALTED
@@ -771,7 +775,7 @@ public class TradingService implements UnsentIntentStop {
             i.acceptanceOrderReconciled = false;
             i.acceptanceReconciled = false;
             i.status = i.cancellationPending ? "CANCEL_STARTED" : "ACTIVE";
-            if (i.sentAt == null) {
+            if (i.sentAt == null && !stream) {
               i.sentAt =
                   Objects.requireNonNull(
                       evidence.observedAt(), "Raw order-response receipt required");
@@ -816,9 +820,12 @@ public class TradingService implements UnsentIntentStop {
     if (intent == null || !properties.mirrorAccount().equals(evidence.accountId())) return evidence;
     // Instrument lookup belongs outside the control transaction. Never trust stream lot size alone.
     var gateway = gateways.getIfAvailable();
-    if (gateway == null) return null;
+    if (gateway == null)
+      throw new IllegalStateException(
+          "Own mirror observation requires broker instrument qualification");
     var instrument = gateway.instrument(intent.instrumentId);
-    if (instrument.lotSize() <= 0 || !intent.instrumentId.equals(instrument.id())) return null;
+    if (instrument.lotSize() <= 0 || !intent.instrumentId.equals(instrument.id()))
+      throw new IllegalStateException("Own mirror observation has unqualified instrument lot size");
     List<Fill> fills = new ArrayList<>();
     Set<String> unique = new HashSet<>();
     boolean valid = raw.lotSize() == null || raw.lotSize() == instrument.lotSize();
@@ -894,17 +901,29 @@ public class TradingService implements UnsentIntentStop {
 
   private boolean validMirror(ru.orbita.broker.OrderSdkEvidence raw, CopyIntent i) {
     if (raw.source() == ru.orbita.broker.OrderSdkEvidence.Source.TRADES_STREAM) return true;
-    return raw.requestedLots() != null
-        && raw.requestedLots() == i.requestedLots
-        && i.requestedLots > 0
-        && raw.executedLots() != null
-        && raw.executedLots() >= 0
-        && raw.executedLots() <= i.requestedLots
-        && raw.remainingLots() != null
-        && raw.remainingLots() >= 0
-        && raw.cancelledLots() != null
-        && raw.cancelledLots() >= 0
-        && raw.executedLots() + raw.remainingLots() + raw.cancelledLots() == i.requestedLots;
+    boolean quantities =
+        raw.requestedLots() != null
+            && raw.requestedLots() == i.requestedLots
+            && i.requestedLots > 0
+            && raw.executedLots() != null
+            && raw.executedLots() >= 0
+            && raw.executedLots() <= i.requestedLots
+            && raw.remainingLots() != null
+            && raw.remainingLots() >= 0
+            && raw.cancelledLots() != null
+            && raw.cancelledLots() >= 0
+            && raw.executedLots() + raw.remainingLots() + raw.cancelledLots() == i.requestedLots;
+    if (!quantities) return false;
+    return switch (raw.executionStatusValue() == null ? 0 : raw.executionStatusValue()) {
+      case 1 ->
+          raw.executedLots() == i.requestedLots
+              && raw.remainingLots() == 0
+              && raw.cancelledLots() == 0;
+      case 2, 3 -> raw.remainingLots() == 0;
+      case 4 -> raw.executedLots() == 0 && raw.cancelledLots() == 0;
+      case 5 -> raw.executedLots() > 0 && raw.executedLots() < i.requestedLots;
+      default -> true; // An unrecognised status remains UNKNOWN; cause never supplies an outcome.
+    };
   }
 
   private void contradiction(CopyIntent i, String detail) {

@@ -28,10 +28,90 @@ class OrderEvidenceIT {
   @Autowired CopyLifecycleIT.MutableClock clock;
   @Autowired CopyLifecycleIT.Simulator broker;
   @Autowired JdbcTemplate db;
+  @Autowired DurableSourceFeedJournal feed;
+  @Autowired ru.orbita.runtime.ApplicationReadiness readiness;
 
   @BeforeEach
   void reset() {
     CopyLifecycleIT.reset(db, broker, clock);
+  }
+
+  @Test
+  void ownPendingObservationWithUnqualifiedInstrumentCannotReopenPersistenceReadiness() {
+    var request = send(3);
+    feed.mirrorPersistenceUnavailable();
+    broker.instrumentLotSize = 0;
+    try {
+      assertThatThrownBy(() -> feed.mirrorOrder(state(request, OrderStatus.NEW, 0, 3, 0, null)))
+          .isInstanceOf(RuntimeException.class);
+      assertThatThrownBy(feed::mirrorRecovered).isInstanceOf(RuntimeException.class);
+      assertThat(readiness.ready()).isFalse();
+      assertThat(copies.intents())
+          .singleElement()
+          .satisfies(i -> assertThat(i.status()).isEqualTo("ACTIVE"));
+    } finally {
+      broker.instrumentLotSize = 10;
+      feed.mirrorRecovered();
+    }
+  }
+
+  @Test
+  void streamBeforePostReplyCannotConsumeIndependentTimerAnchor() {
+    broker.afterPostHook =
+        () -> trading.apply(state(broker.sent, OrderStatus.NEW, 0, 3, 0, null), false);
+    send(3);
+    broker.afterPostHook = null;
+    assertThat(copies.intents())
+        .singleElement()
+        .satisfies(i -> assertThat(i.deadlineReliable()).isTrue());
+    clock.now = clock.now.plusSeconds(61);
+    trading.reconcileOnly();
+    assertThat(broker.cancels).isEqualTo(1);
+  }
+
+  @Test
+  void streamTerminalAfterUnknownStillRequiresIndependentUnaryReconciliation() {
+    broker.afterPostHook =
+        () -> {
+          throw new IllegalStateException("synthetic lost response");
+        };
+    var request = send(3);
+    trading.apply(state(request, OrderStatus.CANCELLED, 0, 0, 3, null), false);
+    int reads = broker.orderReads;
+    broker.orders.put(request.requestId(), broker.evidence(request, OrderStatus.CANCELLED, 0));
+    trading.reconcileOnly();
+    assertThat(broker.orderReads).isGreaterThan(reads);
+    assertThat(copies.journal(0, 200))
+        .anyMatch(
+            e ->
+                e.category().equals("NOTIFICATION_ORDER_UNKNOWN")
+                    && e.detail().contains("Неопределённость результата заявки снята"));
+    assertThat(copies.intents())
+        .singleElement()
+        .satisfies(i -> assertThat(i.status()).isEqualTo("FINAL"));
+    assertThat(broker.posts).isEqualTo(1);
+  }
+
+  @org.junit.jupiter.params.ParameterizedTest
+  @org.junit.jupiter.params.provider.EnumSource(
+      value = OrderStatus.class,
+      names = {"FILLED", "CANCELLED", "REJECTED"})
+  void terminalStatusCannotReleaseReserveWithActiveRemainingQuantity(OrderStatus status) {
+    var request = send(3);
+    var reserve = copies.intents().getFirst().reservedMoney();
+    trading.apply(state(request, status, 0, 3, 0, null), false);
+    assertThat(copies.intents())
+        .singleElement()
+        .satisfies(
+            i -> {
+              assertThat(i.status()).isEqualTo("UNKNOWN");
+              assertThat(i.reservedMoney()).isEqualByComparingTo(reserve);
+              assertThat(i.executedLots()).isZero();
+              assertThat(i.skippedLots()).isZero();
+            });
+    assertThat(control.instruments())
+        .singleElement()
+        .satisfies(i -> assertThat(i.paused()).isTrue());
   }
 
   @org.junit.jupiter.params.ParameterizedTest
@@ -354,6 +434,8 @@ class OrderEvidenceIT {
     control.markFeedReady(true);
     control.shadowChecked(algorithms.current(), "BUY", true);
     control.shadowChecked(algorithms.current(), "SELL", true);
+    control.confirmLiveAcceptance(); // Synthetic fixture permits a multi-lot attempt; no live
+    // acceptance is performed.
     clock.now = clock.now.plusSeconds(1);
     control.issuePermit(new BigDecimal("10000"));
     clock.now = clock.now.plusSeconds(1);
