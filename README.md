@@ -81,6 +81,14 @@ Python 3.13.18, uv 0.13.7; точные версии пакетов сохран
 
 ## Проверки разработки
 
+Перед сборкой выполните [диагностику окружения и проверку схемы](docs/development/checks.md).
+Команды работают без установки зависимостей Python и сетевых загрузок:
+
+```powershell
+python tools/check_demo_schema.py
+python tools/check_dev_environment.py --java-home "<каталог JDK 25>"
+```
+
 Сначала собрать интерфейс (Node.js и npm):
 
 ```powershell
