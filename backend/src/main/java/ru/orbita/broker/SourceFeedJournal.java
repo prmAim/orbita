@@ -59,4 +59,18 @@ public interface SourceFeedJournal {
   default void readSucceeded() {}
 
   default void persistenceUnavailable() {}
+
+  default void mirrorOrder(BrokerGateway.OrderEvidence evidence) {}
+
+  default boolean supportsMirrorOrders() {
+    return false;
+  }
+
+  default void mirrorGap() {}
+
+  default void mirrorPersistenceUnavailable() {
+    persistenceUnavailable();
+  }
+
+  default void mirrorRecovered() {}
 }

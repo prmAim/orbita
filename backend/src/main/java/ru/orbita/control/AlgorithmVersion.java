@@ -26,6 +26,7 @@ public class AlgorithmVersion {
             CopyService.class,
             PositionRecoveryService.class,
             TradingService.class,
+            OrderEvidenceJournal.class,
             ControlService.class,
             CapitalCandidateService.class,
             TimeAuthority.class,
@@ -37,6 +38,7 @@ public class AlgorithmVersion {
             ClockEvidence.class,
             ru.orbita.broker.BrokerGateway.class,
             ru.orbita.broker.OrderSdkEvidence.class,
+            ru.orbita.broker.MirrorOrderParser.class,
             ru.orbita.broker.BrokerReceiptClock.class,
             ru.orbita.broker.BrokerQualifications.class,
             ru.orbita.broker.BrokerQualificationSettings.class,
@@ -51,6 +53,9 @@ public class AlgorithmVersion {
       // The stream parser remains package-private to its broker module.
       collect(
           Class.forName("ru.orbita.broker.SourceExecutionFeed", false, getClass().getClassLoader()),
+          types);
+      collect(
+          Class.forName("ru.orbita.broker.MirrorOrderFeed", false, getClass().getClassLoader()),
           types);
       for (Class<?> type : types.values()) {
         try (var input =

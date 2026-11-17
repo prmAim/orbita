@@ -82,6 +82,7 @@ class CopyLifecycleIT {
     broker.orders.clear();
     broker.currencyCash = false;
     broker.zeroFees = false;
+    broker.instrumentLotSize = 1;
     broker.sourceCash = new BigDecimal("100");
     broker.mirrorCash = new BigDecimal("100");
   }
@@ -1492,6 +1493,7 @@ class CopyLifecycleIT {
   }
 
   static class Simulator implements BrokerGateway {
+    int instrumentLotSize = 1;
     final Clock clock;
     int posts;
     int capitalCalls;
@@ -1528,7 +1530,8 @@ class CopyLifecycleIT {
     }
 
     public Instrument instrument(String id) {
-      return new Instrument(id, 1, new BigDecimal("0.01"), settlementCurrency, true, true, true);
+      return new Instrument(
+          id, instrumentLotSize, new BigDecimal("0.01"), settlementCurrency, true, true, true);
     }
 
     public CapitalEvidence capital(String account) {
@@ -1727,15 +1730,16 @@ class CopyLifecycleIT {
           r.lots(),
           filled,
           state,
-          filled == 0
-              ? List.of()
-              : List.of(
-                  new Fill(
-                      "fill-" + r.requestId(),
-                      BigDecimal.valueOf(filled),
-                      r.limitPrice(),
-                      settlementCurrency,
-                      clock.instant())),
+          java.util.stream.LongStream.range(0, filled)
+              .mapToObj(
+                  index ->
+                      new Fill(
+                          "fill-" + r.requestId() + "-" + index,
+                          BigDecimal.ONE,
+                          r.limitPrice(),
+                          settlementCurrency,
+                          clock.instant()))
+              .toList(),
           clock.instant(),
           "simulator",
           state == OrderStatus.REJECTED ? RejectionReason.OTHER : RejectionReason.NONE,

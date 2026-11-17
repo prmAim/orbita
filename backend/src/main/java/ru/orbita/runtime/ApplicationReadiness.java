@@ -9,13 +9,14 @@ import org.springframework.stereotype.Component;
 public final class ApplicationReadiness {
   private volatile boolean initialized;
   private volatile boolean brokerPersistenceAvailable = true;
+  private volatile boolean mirrorPersistenceAvailable = true;
 
   public boolean initialized() {
     return initialized;
   }
 
   public boolean ready() {
-    return initialized && brokerPersistenceAvailable;
+    return initialized && brokerPersistenceAvailable && mirrorPersistenceAvailable;
   }
 
   void initializationCompleted() {
@@ -28,5 +29,13 @@ public final class ApplicationReadiness {
 
   public void brokerPersistenceRecovered() {
     brokerPersistenceAvailable = true;
+  }
+
+  public void mirrorPersistenceUnavailable() {
+    mirrorPersistenceAvailable = false;
+  }
+
+  public void mirrorPersistenceRecovered() {
+    mirrorPersistenceAvailable = true;
   }
 }

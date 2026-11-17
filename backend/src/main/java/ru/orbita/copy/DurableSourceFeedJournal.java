@@ -20,6 +20,7 @@ public class DurableSourceFeedJournal implements SourceFeedJournal {
   private final TimeAuthority time;
   private final BrokerConnectivityEvents connectivity;
   private final ApplicationReadiness readiness;
+  private final TradingService trading;
 
   public DurableSourceFeedJournal(
       CopyService copies,
@@ -28,7 +29,8 @@ public class DurableSourceFeedJournal implements SourceFeedJournal {
       TransactionTemplate tx,
       TimeAuthority time,
       BrokerConnectivityEvents connectivity,
-      ApplicationReadiness readiness) {
+      ApplicationReadiness readiness,
+      TradingService trading) {
     this.copies = copies;
     this.control = control;
     this.em = em;
@@ -36,6 +38,7 @@ public class DurableSourceFeedJournal implements SourceFeedJournal {
     this.time = time;
     this.connectivity = connectivity;
     this.readiness = readiness;
+    this.trading = trading;
   }
 
   public Instant observationBoundary() {
@@ -152,5 +155,26 @@ public class DurableSourceFeedJournal implements SourceFeedJournal {
 
   public void persistenceUnavailable() {
     readiness.brokerPersistenceUnavailable();
+  }
+
+  public void mirrorOrder(BrokerGateway.OrderEvidence evidence) {
+    trading.apply(evidence, false);
+  }
+
+  public boolean supportsMirrorOrders() {
+    return true;
+  }
+
+  public void mirrorGap() {
+    trading.mirrorStreamGap();
+  }
+
+  public void mirrorPersistenceUnavailable() {
+    readiness.mirrorPersistenceUnavailable();
+  }
+
+  public void mirrorRecovered() {
+    trading.replayOrderEvidence();
+    readiness.mirrorPersistenceRecovered();
   }
 }
