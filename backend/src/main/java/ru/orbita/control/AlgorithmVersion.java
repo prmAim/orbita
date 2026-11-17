@@ -36,6 +36,7 @@ public class AlgorithmVersion {
             DurableSourceFeedJournal.class,
             ClockEvidence.class,
             ru.orbita.broker.BrokerGateway.class,
+            ru.orbita.broker.OrderSdkEvidence.class,
             ru.orbita.broker.BrokerReceiptClock.class,
             ru.orbita.broker.BrokerQualifications.class,
             ru.orbita.broker.BrokerQualificationSettings.class,
