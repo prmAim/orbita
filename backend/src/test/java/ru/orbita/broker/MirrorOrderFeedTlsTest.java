@@ -15,6 +15,63 @@ class MirrorOrderFeedTlsTest {
   @TempDir Path directory;
 
   @Test
+  void wholeChainFixtureAcknowledgesBothMirrorStreamsAndSourceSeparately() throws Exception {
+    var ready = new CountDownLatch(1);
+    var sink = journal(new LinkedBlockingQueue<>(), () -> {}, () -> {}, ready::countDown);
+    try (var bank = WholeChainBrokerSimulator.open(directory);
+        var gateway = bank.gateway(Clock.systemUTC(), BrokerTlsTestSupport.NO_EVENTS);
+        var feed = gateway.observe(sink)) {
+      assertThat(ready.await(5, TimeUnit.SECONDS)).isTrue();
+      assertThat(bank.calls("OrderStateStream"))
+          .singleElement()
+          .satisfies(
+              call ->
+                  assertThat(((OrderStateStreamRequest) call.request()).getAccountsList())
+                      .containsExactly(WholeChainBrokerSimulator.MIRROR));
+      assertThat(bank.calls("TradesStream"))
+          .extracting(call -> ((TradesStreamRequest) call.request()).getAccounts(0))
+          .containsExactlyInAnyOrder(
+              WholeChainBrokerSimulator.SOURCE, WholeChainBrokerSimulator.MIRROR);
+    }
+  }
+
+  @Test
+  void intentionalCloseDuringMirrorJournalWorkDoesNotReportPersistenceFailure() throws Exception {
+    var entered = new CountDownLatch(1);
+    var interrupted = new CountDownLatch(1);
+    var failure = new CountDownLatch(1);
+    var observations = new LinkedBlockingQueue<BrokerGateway.OrderEvidence>();
+    var sink =
+        journal(
+            observations,
+            () -> {
+              entered.countDown();
+              try {
+                new CountDownLatch(1).await();
+              } catch (InterruptedException shutdown) {
+                interrupted.countDown();
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(
+                    "synthetic journal interrupted by intentional close", shutdown);
+              }
+            },
+            failure::countDown);
+    try (var server = BrokerTlsTestSupport.open(directory);
+        var gateway =
+            BrokerTlsTestSupport.gateway(
+                server.port(), Clock.systemUTC(), BrokerTlsTestSupport.NO_EVENTS)) {
+      var feed = gateway.observe(sink);
+      try {
+        assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+      } finally {
+        feed.close();
+      }
+      assertThat(interrupted.await(5, TimeUnit.SECONDS)).isTrue();
+      assertThat(failure.await(300, TimeUnit.MILLISECONDS)).isFalse();
+    }
+  }
+
+  @Test
   void earlyFailureWithoutOrderIdAndNotFoundDoesNotInventOrderOrCommission() throws Exception {
     var broker =
         new OrdersServiceGrpc.OrdersServiceImplBase() {
@@ -192,7 +249,34 @@ class MirrorOrderFeedTlsTest {
   }
 
   static SourceFeedJournal journal(BlockingQueue<BrokerGateway.OrderEvidence> observations) {
+    return journal(observations, () -> {}, () -> {});
+  }
+
+  static SourceFeedJournal journal(
+      BlockingQueue<BrokerGateway.OrderEvidence> observations,
+      Runnable mirrorGap,
+      Runnable unavailable) {
+    return journal(observations, mirrorGap, unavailable, () -> {});
+  }
+
+  static SourceFeedJournal journal(
+      BlockingQueue<BrokerGateway.OrderEvidence> observations,
+      Runnable mirrorGap,
+      Runnable unavailable,
+      Runnable recovered) {
     return new SourceFeedJournal() {
+      public void mirrorGap() {
+        mirrorGap.run();
+      }
+
+      public void mirrorPersistenceUnavailable() {
+        unavailable.run();
+      }
+
+      public void mirrorRecovered() {
+        recovered.run();
+      }
+
       public boolean supportsMirrorOrders() {
         return true;
       }

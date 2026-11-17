@@ -429,6 +429,7 @@ class OrderEvidenceIT {
 
   private OrderRequest send(long lots) {
     broker.instrumentLotSize = 10;
+    broker.individualLotFills = true;
     control.markReconciled();
     control.start();
     control.markFeedReady(true);

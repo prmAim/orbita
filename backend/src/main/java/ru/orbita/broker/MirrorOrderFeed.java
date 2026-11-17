@@ -167,6 +167,7 @@ final class MirrorOrderFeed implements AutoCloseable {
   }
 
   private void failed() {
+    if (closed) return;
     journal.mirrorPersistenceUnavailable();
     disconnect();
   }
@@ -181,7 +182,7 @@ final class MirrorOrderFeed implements AutoCloseable {
     try {
       journal.mirrorGap();
     } catch (RuntimeException failure) {
-      journal.mirrorPersistenceUnavailable();
+      if (!closed) journal.mirrorPersistenceUnavailable();
     }
     if (!closed) lane.schedule(this::connect, 1, TimeUnit.SECONDS);
   }
