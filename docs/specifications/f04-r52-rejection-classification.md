@@ -8,8 +8,12 @@ T-Invest Java SDK Core/Contract **1.51**.
 После отдельного разрешения владельца этап **A1 / #35 завершён и закрыт**:
 [PR #42](https://github.com/prmAim/orbita/pull/42), `main` / `9451ae2`, remote CI PASS;
 [отчёт и проверки](../acceptance/f04-a1-sdk-evidence.md).
-**A2 / #36 в работе** после отдельного разрешения владельца. Последующие этапы
-не начаты; HALTED и SELL сохраняют блокировку. Живая приёмка не проводилась.
+**A2 / #36 реализована локально** после отдельного разрешения владельца:
+`codex/f04-a2-durable-order-evidence`, код `901a945`, 308 тестов PASS,
+Astra Standards/Spec — 0/0; [отчёт A2](../acceptance/f04-a2-durable-order-evidence.md).
+Push/PR/merge/CI ветки не выполнялись; #36 остаётся открытой до публикации.
+Положительный BUY и последующие этапы не начаты; HALTED и SELL сохраняют
+блокировку. Живая приёмка не проводилась.
 
 Нормативные требования остаются в [спецификации #10](https://github.com/prmAim/orbita/issues/10),
 работа относится к [адаптеру #20](https://github.com/prmAim/orbita/issues/20)
@@ -25,7 +29,7 @@ T-Invest Java SDK Core/Contract **1.51**.
 | Этап | Задача | Нативные зависимости GitHub |
 | --- | --- | --- |
 | A1 — доказательства SDK | [#35](https://github.com/prmAim/orbita/issues/35) | CLOSED, main / #42, CI PASS |
-| A2 — поток, долговечность и сверка | [#36](https://github.com/prmAim/orbita/issues/36) | #35 выполнена; реализация в работе |
+| A2 — поток, долговечность и сверка | [#36](https://github.com/prmAim/orbita/issues/36) | #35 выполнена; локально реализована, публикация не выполнена |
 | B1 — строгий BUY-предикат | [#37](https://github.com/prmAim/orbita/issues/37) | #36 |
 | B2 — пропуск, резервы и R125 | [#38](https://github.com/prmAim/orbita/issues/38) | #37 |
 | Уточнения владельца API | [#39](https://github.com/prmAim/orbita/issues/39) | Внешние сведения, needs-info |
