@@ -1,16 +1,25 @@
 # Ф-04 / A2: долговечные доказательства заявки
 
-Дата: 17 ноября 2026. Задача #36, спецификация #34,
+Реализация: 17 ноября 2026; публикация и закрытие: 18 ноября 2026.
+Задача #36, спецификация #34,
 [§§3.2–3.4](../specifications/f04-r52-rejection-classification.md).
 
-Статус: **локальная реализация #36 завершена** в ветке
-`codex/f04-a2-durable-order-evidence`, код проверен на `901a945`.
-Полный `spotless:check verify` — **PASS: 134 unit + 174 integration = 308**,
+Статус: **#36 завершена и закрыта**, [PR #43](https://github.com/prmAim/orbita/pull/43)
+слит в `main`, merge-коммит `003522fd45618f1cc89e0c618dac99fb401d754f`.
+[Java/TypeScript CI main](https://github.com/prmAim/orbita/actions/runs/44152586503)
+— **PASS: 134 unit + 176 integration = 310**, failures/errors/skipped = 0;
+frontend, Spotless и проверка схемы прошли.
+[Python CI main](https://github.com/prmAim/orbita/actions/runs/44152586471)
+— PASS, 43 теста, один Windows-specific пропуск на Linux, lint/format PASS.
+[Результат и закрытие #36](https://github.com/prmAim/orbita/issues/36#issuecomment-6957886380).
+
+Исходный локальный `spotless:check verify` на `901a945` — **PASS: 134 unit + 174 integration = 308**,
 failures/errors/skipped = 0. В исходном локальном результате добавлены 22
 проверки: 5 TLS и 17 PostgreSQL. При публикации PR #43 добавлены ещё две
 PostgreSQL-регрессии позднего исполнения FINAL; исправление `97cdcb4`
 прошло целевой набор 66/66 и повторное pre-merge ревью 0/0/0.
-Полный CI обновлённого PR проверяется отдельно от исходных 308 тестов.
+Итого добавлены 24 проверки: 5 TLS и 19 PostgreSQL.
+Полный CI обновлённого PR и `main` подтвердил 310 тестов отдельно от исходных 308.
 После запуска
 Docker владельцем свежий preflight подтвердил Engine 29.7.2. Первый независимый
 раунд GPT-6 Astra: Standards — 0 замечаний, Spec — 3 замечания. Для всех трёх
@@ -56,7 +65,8 @@ Replay восстанавливает неприменённые receipts пос
 | Регрессии после полного прогона | Shutdown race воспроизведён RED 1: intentional close ошибочно сообщал persistence failure. Добавлены guards закрытия; подтверждены отдельные source/mirror ACK; агрегированный fill возвращён по умолчанию. GREEN 43/43: BrokerConnectivity 12, Mirror TLS 5, AccountLocalRead 10, A2 OrderEvidence 16. `a2-shutdown-red.log`, `a2-full-suite-findings-green.log` |
 | Повторный полный backend verify | PASS: 134 unit + 174 integration = 308; failures/errors/skipped = 0, `spotless:check` PASS. Проверен код `901a945`, `a2-full-verify-final.log`, 7:58 |
 | Frontend | `npm run typecheck` и `npm run build` — PASS |
-| Публикация | [PR #43](https://github.com/prmAim/orbita/pull/43), ветка отправлена. Первый Java/TypeScript и Python CI на `d1c554b` PASS; CI исправленного коммита проверяется отдельно. Merge и закрытие #36 ожидают успешного CI |
+| CI исправленного PR | [Java/TypeScript](https://github.com/prmAim/orbita/actions/runs/44151356439) и [Python](https://github.com/prmAim/orbita/actions/runs/44151356440) на `aa8ce4e` — PASS; push-проверки того же head также PASS |
+| Публикация | PR #43 MERGED; `main` / `003522f`, Java/TypeScript 310 тестов PASS и Python PASS; #36 закрыта только после успеха обоих workflow |
 | Pre-merge исправление позднего FINAL fill | RED 2/2 → GREEN 66/66 (CopyLifecycle 47, OrderEvidence 18, restart 1); `a2-late-partial-premerge-red-confirmed.log`, `a2-late-partial-premerge-green.log`. Коммит `97cdcb4` |
 | Живая приёмка / реальные API / Telegram | NOT_RUN |
 
@@ -163,8 +173,8 @@ FINAL атомарно обновляются объёмы, назначаетс
 
 Ветка создана от актуальной `main` / `9451ae2`. #35 закрыта после PR #42
 и успешного CI в `main`; это отдельное доказательство, описанное в
-[отчёте A1](f04-a1-sdk-evidence.md), и не CI этой ветки. #36 реализована и
-закоммичена локально; следующие #37/#38 не начаты. Ф-04, #20 и #34 целиком
+[отчёте A1](f04-a1-sdk-evidence.md), и не CI этой ветки. #36 слита через PR #43
+и закрыта после CI `main`; следующие #37/#38 не начаты. Ф-04, #20 и #34 целиком
 не закрыты; #40/#41 сохраняют зависимость от уточнений API #39.
 
 Локальный TLS-имитатор подтверждает обработку заданных SDK 1.51 сообщений,

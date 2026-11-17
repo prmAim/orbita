@@ -8,10 +8,10 @@ T-Invest Java SDK Core/Contract **1.51**.
 После отдельного разрешения владельца этап **A1 / #35 завершён и закрыт**:
 [PR #42](https://github.com/prmAim/orbita/pull/42), `main` / `9451ae2`, remote CI PASS;
 [отчёт и проверки](../acceptance/f04-a1-sdk-evidence.md).
-**A2 / #36 реализована локально** после отдельного разрешения владельца:
-`codex/f04-a2-durable-order-evidence`, код `901a945`, 308 тестов PASS,
-Astra Standards/Spec — 0/0; [отчёт A2](../acceptance/f04-a2-durable-order-evidence.md).
-Push/PR/merge/CI ветки не выполнялись; #36 остаётся открытой до публикации.
+**A2 / #36 завершена и закрыта** после [PR #43](https://github.com/prmAim/orbita/pull/43)
+и успешного Java/TypeScript и Python CI в `main` / `003522f`: 310 Java-тестов PASS.
+Astra Standards/Spec — 0/0, pre-merge — 0/0/0 открытых замечаний;
+[отчёт A2 и ссылки CI](../acceptance/f04-a2-durable-order-evidence.md).
 Положительный BUY и последующие этапы не начаты; HALTED и SELL сохраняют
 блокировку. Живая приёмка не проводилась.
 
@@ -29,14 +29,14 @@ Push/PR/merge/CI ветки не выполнялись; #36 остаётся о
 | Этап | Задача | Нативные зависимости GitHub |
 | --- | --- | --- |
 | A1 — доказательства SDK | [#35](https://github.com/prmAim/orbita/issues/35) | CLOSED, main / #42, CI PASS |
-| A2 — поток, долговечность и сверка | [#36](https://github.com/prmAim/orbita/issues/36) | #35 выполнена; локально реализована, публикация не выполнена |
-| B1 — строгий BUY-предикат | [#37](https://github.com/prmAim/orbita/issues/37) | #36 |
+| A2 — поток, долговечность и сверка | [#36](https://github.com/prmAim/orbita/issues/36) | CLOSED, main / #43, CI PASS |
+| B1 — строгий BUY-предикат | [#37](https://github.com/prmAim/orbita/issues/37) | #36 выполнена; не начата |
 | B2 — пропуск, резервы и R125 | [#38](https://github.com/prmAim/orbita/issues/38) | #37 |
 | Уточнения владельца API | [#39](https://github.com/prmAim/orbita/issues/39) | Внешние сведения, needs-info |
 | C — HALTED | [#40](https://github.com/prmAim/orbita/issues/40) | #39 и #36; needs-info |
 | D — собственные бумаги SELL | [#41](https://github.com/prmAim/orbita/issues/41) | #39 и #38; needs-info |
 
-A/B не зависят от #39. #35 закрыта; остальные задачи открыты. Публикация сама
+A/B не зависят от #39. #35 и #36 закрыты; остальные задачи открыты. Публикация сама
 по себе не означает завершение критериев или разрешение начать код. Навигация добавлена в
 [#20](https://github.com/prmAim/orbita/issues/20#issuecomment-6942852720) и
 [#10](https://github.com/prmAim/orbita/issues/10#issuecomment-6942853478).
@@ -288,7 +288,11 @@ HALTED и SELL сохраняются.
 
 ## 6. Критерии автоматической проверки
 
-Все сценарии ниже — **NOT_RUN**, требования к будущей реализации. Проверки SDK
+При первоначальной публикации все сценарии ниже были **NOT_RUN**.
+Выполненные проверки A1/A2 и их границы теперь приведены в
+[отчёте A1](../acceptance/f04-a1-sdk-evidence.md) и
+[отчёте A2](../acceptance/f04-a2-durable-order-evidence.md).
+Положительная квалификация BUY/HALTED/SELL остаётся NOT_RUN. Проверки SDK
 используют настоящий SDK **1.51** и локальный TLS-имитатор, доменные — принятые
 границы сервиса, долговечность — PostgreSQL Testcontainers. Реальные брокерские
 счета, токены, Telegram и живая приёмка не участвуют.
@@ -343,8 +347,8 @@ SELL-семантика и оговорённые ранние отказы ещ
 а не переименования ограниченного этапа в готовую Ф-04.
 
 При первоначальной публикации версии 0.1 были подготовлены только документы;
-кодирование и все проверки реализации были NOT_RUN. Последующий локальный
-результат A1 отмечен в начале документа и отдельном отчёте. Сама спецификация
+кодирование и все проверки реализации были NOT_RUN. Последующие результаты
+A1/A2 и CI отмечены в начале документа и отдельных отчётах. Сама спецификация
 не является протоколом выполненных проверок остальных этапов.
 
 [core151]: https://repo.maven.apache.org/maven2/ru/tinkoff/piapi/java-sdk-core/1.51/java-sdk-core-1.51-sources.jar
