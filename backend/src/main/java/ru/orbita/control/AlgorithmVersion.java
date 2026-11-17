@@ -38,6 +38,7 @@ public class AlgorithmVersion {
             ClockEvidence.class,
             ru.orbita.broker.BrokerGateway.class,
             ru.orbita.broker.OrderSdkEvidence.class,
+            ru.orbita.broker.BuyResourceRejectionClassifier.class,
             ru.orbita.broker.MirrorOrderParser.class,
             ru.orbita.broker.BrokerReceiptClock.class,
             ru.orbita.broker.BrokerQualifications.class,

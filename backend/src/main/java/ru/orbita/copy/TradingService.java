@@ -611,9 +611,10 @@ public class TradingService implements UnsentIntentStop {
         raw != null
             && (raw.source() == ru.orbita.broker.OrderSdkEvidence.Source.ORDER_STATE_STREAM
                 || raw.source() == ru.orbita.broker.OrderSdkEvidence.Source.TRADES_STREAM);
-    var prepared = stream ? prepareMirror(original) : original;
+    var prepared = stream ? prepareMirror(original) : new PreparedMirror(original, null);
     if (prepared == null) return; // Unlinked trades remain durable until a UUID mapping arrives.
-    final var evidence = prepared;
+    final var evidence = prepared.evidence();
+    var qualifiedLotSize = stream ? prepared.qualifiedLotSize() : qualifiedBuyLotSize(evidence);
     boolean postResponse = pending.postResponse();
     var confirmationBound =
         evidence.receivedMonotonicNanos() == null
@@ -630,6 +631,7 @@ public class TradingService implements UnsentIntentStop {
           CopyIntent i =
               em.find(CopyIntent.class, evidence.requestId(), LockModeType.PESSIMISTIC_WRITE);
           if (i == null) return;
+          refineBuyResourceReason(i, evidence, qualifiedLotSize);
           if (!i.instrumentId.equals(evidence.instrumentId())
               || evidence.side() == null
               || !i.side.equals(evidence.side().name())) {
@@ -820,17 +822,22 @@ public class TradingService implements UnsentIntentStop {
         });
   }
 
-  private OrderEvidence prepareMirror(OrderEvidence evidence) {
+  private record PreparedMirror(OrderEvidence evidence, Integer qualifiedLotSize) {}
+
+  private PreparedMirror prepareMirror(OrderEvidence evidence) {
     var raw = evidence.sdkEvidence();
-    if (!properties.mirrorAccount().equals(evidence.accountId())) return evidence;
+    if (!properties.mirrorAccount().equals(evidence.accountId()))
+      return new PreparedMirror(evidence, null);
     UUID id = evidence.requestId();
-    if (raw.source() == ru.orbita.broker.OrderSdkEvidence.Source.TRADES_STREAM) {
+    if (raw.source() == ru.orbita.broker.OrderSdkEvidence.Source.TRADES_STREAM
+        || id == null && (raw.responseRequestId() == null || raw.responseRequestId().isBlank())) {
       id = tx.execute(_ -> orderJournal.linkedRequest(raw).orElse(null));
       if (id == null) return null;
     }
     final UUID linkedId = id;
     var intent = id == null ? null : tx.execute(_ -> em.find(CopyIntent.class, linkedId));
-    if (intent == null || !properties.mirrorAccount().equals(evidence.accountId())) return evidence;
+    if (intent == null || !properties.mirrorAccount().equals(evidence.accountId()))
+      return new PreparedMirror(evidence, null);
     // Instrument lookup belongs outside the control transaction. Never trust stream lot size alone.
     var gateway = gateways.getIfAvailable();
     if (gateway == null)
@@ -894,49 +901,101 @@ public class TradingService implements UnsentIntentStop {
             ? total == intent.requestedLots ? OrderStatus.FILLED : OrderStatus.PARTIALLY_FILLED
             : evidence.status();
     // PARTIALLY_FILL after cancel is deliberately active until independent unary reconciliation.
-    return new OrderEvidence(
-        linkedId,
-        evidence.accountId(),
-        null,
-        evidence.instrumentId(),
-        evidence.side(),
-        intent.requestedLots,
-        valid ? total : -1,
-        status,
-        fills,
-        evidence.observedAt(),
-        evidence.detail(),
-        evidence.rejectionReason(),
-        null,
-        null,
-        raw);
+    return new PreparedMirror(
+        new OrderEvidence(
+            linkedId,
+            evidence.accountId(),
+            null,
+            evidence.instrumentId(),
+            evidence.side(),
+            intent.requestedLots,
+            valid ? total : -1,
+            status,
+            fills,
+            evidence.observedAt(),
+            evidence.detail(),
+            evidence.rejectionReason(),
+            null,
+            null,
+            raw),
+        instrument.lotSize());
+  }
+
+  /**
+   * Resolve independent instrument facts outside the control transaction, including unary replay.
+   */
+  private Integer qualifiedBuyLotSize(OrderEvidence evidence) {
+    if (evidence.requestId() == null || !properties.mirrorAccount().equals(evidence.accountId()))
+      return null;
+    var intent = tx.execute(_ -> em.find(CopyIntent.class, evidence.requestId()));
+    if (intent == null || !"BUY".equals(intent.side)) return null;
+    boolean terminal =
+        evidence.status() == OrderStatus.REJECTED || evidence.status() == OrderStatus.CANCELLED;
+    if (!terminal
+        && !tx.execute(
+            _ ->
+                orderJournal
+                    .latestReason(intent.id)
+                    .map(r -> r.reason() == RejectionReason.INSUFFICIENT_RESOURCES)
+                    .orElse(false))) return null;
+    var gateway = gateways.getIfAvailable();
+    if (gateway == null) return null;
+    Instrument instrument;
+    try {
+      instrument = gateway.instrument(intent.instrumentId);
+    } catch (RuntimeException unavailable) {
+      // Reason refinement must never prevent application of independently known unary facts.
+      return null;
+    }
+    if (instrument == null) return null;
+    return intent.instrumentId.equals(instrument.id()) && instrument.lotSize() > 0
+        ? instrument.lotSize()
+        : null;
+  }
+
+  private void refineBuyResourceReason(
+      CopyIntent i, OrderEvidence current, Integer qualifiedLotSize) {
+    if (!"BUY".equals(i.side) || i.requestedLots <= 0) return;
+    boolean qualified =
+        orderJournal
+            .latestReason(i.id)
+            .map(r -> r.reason() == RejectionReason.INSUFFICIENT_RESOURCES)
+            .orElse(false);
+    boolean terminal =
+        current.status() == OrderStatus.REJECTED || current.status() == OrderStatus.CANCELLED;
+    if (!terminal && !qualified) return;
+    var attempt = request(i);
+    var history = orderJournal.history(attempt);
+    var result =
+        i.executedLots == 0
+            ? ru.orbita.broker.BuyResourceRejectionClassifier.classify(
+                attempt,
+                history.stream().map(OrderEvidenceJournal.Pending::evidence).toList(),
+                orderJournal.onlyOriginalMutation(i.id),
+                qualifiedLotSize)
+            : Optional.<ru.orbita.broker.BuyResourceRejectionClassifier.Qualification>empty();
+    if (result.isPresent()) {
+      if (!qualified && terminal && result.get().status() == current.status()) {
+        i.reason = result.get().detail();
+        orderJournal.qualifyReason(attempt, result.get(), history);
+      }
+    } else if (qualified) {
+      i.reason =
+          qualifiedLotSize == null
+              ? "Причина OTHER; независимый размер лота недоступен; требуется сверка"
+              : "Причина OTHER; прежняя квалификация нехватки средств опровергнута; требуется сверка";
+      orderJournal.invalidateReason(attempt, current.status(), i.reason, history);
+      contradiction(
+          i,
+          qualifiedLotSize == null
+              ? "Independent instrument metadata unavailable; resource reason requires reconciliation"
+              : "Late evidence contradicts qualified zero resource rejection");
+    }
   }
 
   private boolean validMirror(ru.orbita.broker.OrderSdkEvidence raw, CopyIntent i) {
     if (raw.source() == ru.orbita.broker.OrderSdkEvidence.Source.TRADES_STREAM) return true;
-    boolean quantities =
-        raw.requestedLots() != null
-            && raw.requestedLots() == i.requestedLots
-            && i.requestedLots > 0
-            && raw.executedLots() != null
-            && raw.executedLots() >= 0
-            && raw.executedLots() <= i.requestedLots
-            && raw.remainingLots() != null
-            && raw.remainingLots() >= 0
-            && raw.cancelledLots() != null
-            && raw.cancelledLots() >= 0
-            && raw.executedLots() + raw.remainingLots() + raw.cancelledLots() == i.requestedLots;
-    if (!quantities) return false;
-    return switch (raw.executionStatusValue() == null ? 0 : raw.executionStatusValue()) {
-      case 1 ->
-          raw.executedLots() == i.requestedLots
-              && raw.remainingLots() == 0
-              && raw.cancelledLots() == 0;
-      case 2, 3 -> raw.remainingLots() == 0;
-      case 4 -> raw.executedLots() == 0 && raw.cancelledLots() == 0;
-      case 5 -> raw.executedLots() > 0 && raw.executedLots() < i.requestedLots;
-      default -> true; // An unrecognised status remains UNKNOWN; cause never supplies an outcome.
-    };
+    return ru.orbita.broker.MirrorOrderParser.consistentStateQuantities(raw, i.requestedLots);
   }
 
   private void contradiction(CopyIntent i, String detail) {

@@ -5,7 +5,6 @@ import static org.assertj.core.api.Assertions.*;
 import java.math.BigDecimal;
 import java.time.Clock;
 import java.util.*;
-import org.junit.jupiter.api.Test;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
@@ -22,8 +21,13 @@ import ru.orbita.control.*;
 class OrderEvidenceRestartIT {
   @Container static final PostgreSQLContainer POSTGRES = new PostgreSQLContainer("postgres:17.11");
 
-  @Test
-  void lostResponseAndCommittedUnappliedEvidenceSurviveNewApplicationContextWithoutSecondPost() {
+  @org.junit.jupiter.params.ParameterizedTest
+  @org.junit.jupiter.params.provider.ValueSource(
+      strings = {"unknown", "resource", "mismatch", "late-mismatch"})
+  void lostResponseAndCommittedUnappliedEvidenceSurviveNewApplicationContextWithoutSecondPost(
+      String scenario) {
+    boolean resourceReason = !scenario.equals("unknown");
+    boolean mismatch = scenario.endsWith("mismatch");
     var clock = new CopyLifecycleIT.MutableClock();
     var broker = new CopyLifecycleIT.Simulator(clock);
     OrderRequest request;
@@ -31,6 +35,7 @@ class OrderEvidenceRestartIT {
       var control = first.getBean(ControlService.class);
       var copies = first.getBean(CopyService.class);
       var trading = first.getBean(TradingService.class);
+      CopyLifecycleIT.reset(first.getBean(JdbcTemplate.class), broker, clock);
       control.markReconciled();
       control.start();
       control.markFeedReady(true);
@@ -72,16 +77,24 @@ class OrderEvidenceRestartIT {
                 assertThat(i.reservedMoney()).isPositive();
               });
       var db = first.getBean(JdbcTemplate.class);
+      if (resourceReason) trading.apply(resourceEvidence(request, clock, false), false);
+      if (scenario.equals("late-mismatch"))
+        trading.apply(resourceEvidence(request, clock, true), false);
       db.execute(
           "create function synthetic_restart_failure() returns trigger language plpgsql as $$ begin if new.category='ORDER_EVIDENCE_APPLIED' then raise exception 'synthetic crash before decision commit'; end if; return new; end $$");
       db.execute(
           "create trigger synthetic_restart_failure before insert on journal_entry for each row execute function synthetic_restart_failure()");
       assertThatThrownBy(
-              () -> trading.apply(broker.evidence(request, OrderStatus.CANCELLED, 0), false))
+              () ->
+                  trading.apply(
+                      resourceReason
+                          ? resourceEvidence(request, clock, true, mismatch ? 20 : 1)
+                          : broker.evidence(request, OrderStatus.CANCELLED, 0),
+                      false))
           .isInstanceOf(RuntimeException.class);
       assertThat(copies.intents())
           .singleElement()
-          .satisfies(i -> assertThat(i.status()).isEqualTo("UNKNOWN"));
+          .satisfies(i -> assertThat(i.status()).isEqualTo(resourceReason ? "FINAL" : "UNKNOWN"));
       db.execute("drop trigger synthetic_restart_failure on journal_entry");
       db.execute("drop function synthetic_restart_failure()");
     }
@@ -92,6 +105,10 @@ class OrderEvidenceRestartIT {
       var copies = second.getBean(CopyService.class);
       trading.replayOrderEvidence();
       trading.tick();
+      if (mismatch) {
+        trading.apply(resourceEvidence(request, clock, false), false);
+        trading.apply(resourceEvidence(request, clock, true), false);
+      }
       trading.replayOrderEvidence();
       assertThat(copies.intents())
           .singleElement()
@@ -109,8 +126,84 @@ class OrderEvidenceRestartIT {
                   .count())
           .isEqualTo(1);
       assertThat(second.getBean(ControlService.class).status().permitLimit()).isNull();
+      if (resourceReason && !mismatch) {
+        assertThat(copies.intents().getFirst().reason())
+            .isEqualTo("нехватка средств; подтверждена потоком состояний");
+        assertThat(
+                copies.journal(0, 200).stream()
+                    .filter(e -> e.category().equals("ORDER_REASON_QUALIFIED"))
+                    .count())
+            .isEqualTo(1);
+      }
+      if (mismatch) {
+        assertThat(copies.intents().getFirst().reason())
+            .isNotEqualTo("нехватка средств; подтверждена потоком состояний");
+        assertThat(
+                copies.journal(0, 200).stream()
+                    .filter(e -> e.category().equals("ORDER_REASON_QUALIFIED"))
+                    .count())
+            .isEqualTo(scenario.equals("late-mismatch") ? 1 : 0);
+        assertThat(
+                copies.journal(0, 200).stream()
+                    .filter(e -> e.category().equals("ORDER_REASON_INVALIDATED"))
+                    .count())
+            .isEqualTo(scenario.equals("late-mismatch") ? 1 : 0);
+        assertThat(second.getBean(ControlService.class).instruments())
+            .singleElement()
+            .satisfies(i -> assertThat(i.paused()).isTrue());
+      }
       assertThat(broker.posts).isEqualTo(1);
     }
+  }
+
+  private OrderEvidence resourceEvidence(OrderRequest request, Clock clock, boolean stream) {
+    return resourceEvidence(request, clock, stream, 1);
+  }
+
+  private OrderEvidence resourceEvidence(
+      OrderRequest request, Clock clock, boolean stream, int lotSize) {
+    var raw =
+        new ru.orbita.broker.OrderSdkEvidence(
+            stream
+                ? ru.orbita.broker.OrderSdkEvidence.Source.ORDER_STATE_STREAM
+                : ru.orbita.broker.OrderSdkEvidence.Source.GET_ORDER_STATE,
+            "1.51",
+            "restart-synthetic",
+            request.requestId().toString(),
+            stream ? "mirror" : null,
+            stream ? "internal-id" : "exchange-id",
+            stream ? "exchange-id" : null,
+            request.instrumentId(),
+            1,
+            3,
+            stream,
+            stream ? 2 : null,
+            3L,
+            0L,
+            stream ? 0L : null,
+            stream ? 3L : null,
+            List.of(),
+            clock.instant(),
+            null,
+            null,
+            stream ? lotSize : null,
+            List.of());
+    return new OrderEvidence(
+        request.requestId(),
+        "mirror",
+        stream ? null : "exchange-id",
+        request.instrumentId(),
+        Side.BUY,
+        3,
+        0,
+        OrderStatus.CANCELLED,
+        List.of(),
+        clock.instant(),
+        "synthetic durable resource proof",
+        RejectionReason.OTHER,
+        null,
+        null,
+        raw);
   }
 
   private ConfigurableApplicationContext start(

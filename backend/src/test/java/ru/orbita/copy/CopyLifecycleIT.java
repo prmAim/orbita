@@ -84,6 +84,7 @@ class CopyLifecycleIT {
     broker.zeroFees = false;
     broker.finalCommissionAvailable = true;
     broker.instrumentLotSize = 1;
+    broker.instrumentHook = null;
     broker.individualLotFills = false;
     broker.sourceCash = new BigDecimal("100");
     broker.mirrorCash = new BigDecimal("100");
@@ -1524,6 +1525,7 @@ class CopyLifecycleIT {
     Runnable afterPostHook;
     Runnable afterReconcileHook;
     Runnable resourcesHook;
+    Runnable instrumentHook;
     boolean blockPurchases;
     String settlementCurrency = "RUB";
     int cancels;
@@ -1534,6 +1536,7 @@ class CopyLifecycleIT {
     }
 
     public Instrument instrument(String id) {
+      if (instrumentHook != null) instrumentHook.run();
       return new Instrument(
           id, instrumentLotSize, new BigDecimal("0.01"), settlementCurrency, true, true, true);
     }

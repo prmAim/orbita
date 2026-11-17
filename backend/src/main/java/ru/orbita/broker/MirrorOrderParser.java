@@ -10,6 +10,33 @@ import ru.tinkoff.piapi.contract.v1.*;
 public final class MirrorOrderParser {
   private MirrorOrderParser() {}
 
+  /** Shared stream status/volume consistency. A cause never supplies a missing outcome. */
+  public static boolean consistentStateQuantities(OrderSdkEvidence raw, long requested) {
+    if (raw == null
+        || raw.source() != OrderSdkEvidence.Source.ORDER_STATE_STREAM
+        || requested <= 0
+        || raw.requestedLots() == null
+        || raw.requestedLots() != requested
+        || raw.executedLots() == null
+        || raw.executedLots() < 0
+        || raw.executedLots() > requested
+        || raw.remainingLots() == null
+        || raw.remainingLots() < 0
+        || raw.remainingLots() > requested - raw.executedLots()
+        || raw.cancelledLots() == null
+        || raw.cancelledLots() < 0
+        || raw.cancelledLots() != requested - raw.executedLots() - raw.remainingLots())
+      return false;
+    return switch (TInvestBrokerGateway.status(raw.executionStatusValue())) {
+      case FILLED ->
+          raw.executedLots() == requested && raw.remainingLots() == 0 && raw.cancelledLots() == 0;
+      case REJECTED, CANCELLED -> raw.remainingLots() == 0;
+      case NEW -> raw.executedLots() == 0 && raw.cancelledLots() == 0;
+      case PARTIALLY_FILLED -> raw.executedLots() > 0 && raw.executedLots() < requested;
+      default -> true;
+    };
+  }
+
   static BrokerGateway.OrderEvidence state(OrderStateStreamResponse.OrderState s, Instant at) {
     var raw =
         new OrderSdkEvidence(
