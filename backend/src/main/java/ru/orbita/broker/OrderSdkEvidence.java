@@ -32,12 +32,18 @@ public record OrderSdkEvidence(
     List<ru.tinkoff.piapi.contract.v1.OrderStage> stages,
     Instant receivedAt,
     Instant eventAt,
-    Transport transport) {
+    Transport transport,
+    Integer lotSize,
+    List<TradeFact> trades) {
   public enum Source {
     POST_ORDER,
     GET_ORDER_STATE,
-    CANCEL_ORDER
+    CANCEL_ORDER,
+    ORDER_STATE_STREAM,
+    TRADES_STREAM
   }
+
+  public record TradeFact(String tradeId, long pieces, java.math.BigDecimal price, Instant at) {}
 
   public record Transport(
       String grpcStatus, String errorCode, String description, String trackingId) {
@@ -51,6 +57,7 @@ public record OrderSdkEvidence(
 
   public OrderSdkEvidence {
     stages = List.copyOf(stages);
+    trades = List.copyOf(trades);
   }
 
   static OrderSdkEvidence post(PostOrderResponse reply, Instant at) {
@@ -74,7 +81,9 @@ public record OrderSdkEvidence(
         List.of(),
         at,
         null,
-        null);
+        null,
+        null,
+        List.of());
   }
 
   static OrderSdkEvidence state(OrderState reply, Instant at) {
@@ -98,7 +107,9 @@ public record OrderSdkEvidence(
         reply.getStagesList(),
         at,
         orderDate(reply),
-        null);
+        null,
+        null,
+        List.of());
   }
 
   private static Instant orderDate(OrderState reply) {
@@ -132,7 +143,9 @@ public record OrderSdkEvidence(
         List.of(),
         at,
         null,
-        transport(failure));
+        transport(failure),
+        null,
+        List.of());
   }
 
   /** Only the four whitelisted SDK fields are retained. Never call SDK toString/metadata dump. */

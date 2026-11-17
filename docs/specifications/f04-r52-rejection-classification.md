@@ -5,9 +5,14 @@
 реализацию, изменение схемы или живую приёмку. Кодовая база спецификации: `344985a88c597a443247feb6690d967a78313feb`,
 T-Invest Java SDK Core/Contract **1.51**.
 
-После отдельного разрешения владельца этап **A1 / #35 реализован локально**
-в `codex/f04-a1-sdk-evidence`, код `e1b11cb`; [отчёт и проверки](../acceptance/f04-a1-sdk-evidence.md).
-Остальные этапы не начаты, статусы GitHub не менялись; HALTED и SELL сохраняют
+После отдельного разрешения владельца этап **A1 / #35 завершён и закрыт**:
+[PR #42](https://github.com/prmAim/orbita/pull/42), `main` / `9451ae2`, remote CI PASS;
+[отчёт и проверки](../acceptance/f04-a1-sdk-evidence.md).
+**A2 / #36 реализована локально** после отдельного разрешения владельца:
+`codex/f04-a2-durable-order-evidence`, код `901a945`, 308 тестов PASS,
+Astra Standards/Spec — 0/0; [отчёт A2](../acceptance/f04-a2-durable-order-evidence.md).
+Push/PR/merge/CI ветки не выполнялись; #36 остаётся открытой до публикации.
+Положительный BUY и последующие этапы не начаты; HALTED и SELL сохраняют
 блокировку. Живая приёмка не проводилась.
 
 Нормативные требования остаются в [спецификации #10](https://github.com/prmAim/orbita/issues/10),
@@ -23,16 +28,16 @@ T-Invest Java SDK Core/Contract **1.51**.
 
 | Этап | Задача | Нативные зависимости GitHub |
 | --- | --- | --- |
-| A1 — доказательства SDK | [#35](https://github.com/prmAim/orbita/issues/35) | Реализован локально после отдельного разрешения; в GitHub ещё OPEN |
-| A2 — поток, долговечность и сверка | [#36](https://github.com/prmAim/orbita/issues/36) | #35 |
+| A1 — доказательства SDK | [#35](https://github.com/prmAim/orbita/issues/35) | CLOSED, main / #42, CI PASS |
+| A2 — поток, долговечность и сверка | [#36](https://github.com/prmAim/orbita/issues/36) | #35 выполнена; локально реализована, публикация не выполнена |
 | B1 — строгий BUY-предикат | [#37](https://github.com/prmAim/orbita/issues/37) | #36 |
 | B2 — пропуск, резервы и R125 | [#38](https://github.com/prmAim/orbita/issues/38) | #37 |
 | Уточнения владельца API | [#39](https://github.com/prmAim/orbita/issues/39) | Внешние сведения, needs-info |
 | C — HALTED | [#40](https://github.com/prmAim/orbita/issues/40) | #39 и #36; needs-info |
 | D — собственные бумаги SELL | [#41](https://github.com/prmAim/orbita/issues/41) | #39 и #38; needs-info |
 
-A/B не зависят от #39. Все задачи открыты; публикация не означает завершение
-критериев или разрешение начать код. Навигация добавлена в
+A/B не зависят от #39. #35 закрыта; остальные задачи открыты. Публикация сама
+по себе не означает завершение критериев или разрешение начать код. Навигация добавлена в
 [#20](https://github.com/prmAim/orbita/issues/20#issuecomment-6942852720) и
 [#10](https://github.com/prmAim/orbita/issues/10#issuecomment-6942853478).
 

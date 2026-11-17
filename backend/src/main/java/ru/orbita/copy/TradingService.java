@@ -32,6 +32,7 @@ public class TradingService implements UnsentIntentStop {
   private final TimeAuthority time;
   private final NotificationService notificationService;
   private final ru.orbita.valuation.RubValuation rubValuation;
+  private final OrderEvidenceJournal orderJournal;
 
   public TradingService(
       EntityManager em,
@@ -43,7 +44,8 @@ public class TradingService implements UnsentIntentStop {
       NotificationPublisher notifications,
       TimeAuthority time,
       NotificationService notificationService,
-      ru.orbita.valuation.RubValuation rubValuation) {
+      ru.orbita.valuation.RubValuation rubValuation,
+      OrderEvidenceJournal orderJournal) {
     this.em = em;
     this.tx = tx;
     this.control = control;
@@ -54,6 +56,7 @@ public class TradingService implements UnsentIntentStop {
     this.time = time;
     this.notificationService = notificationService;
     this.rubValuation = rubValuation;
+    this.orderJournal = orderJournal;
   }
 
   public void tick() {
@@ -75,6 +78,7 @@ public class TradingService implements UnsentIntentStop {
   }
 
   public void reconcileOnly() {
+    replayOrderEvidence();
     BrokerGateway gateway = gateways.getIfAvailable();
     if (gateway == null) return;
     // Failure to read or commit any transaction escapes the worker: no further sends or cancels in
@@ -83,7 +87,7 @@ public class TradingService implements UnsentIntentStop {
         tx.execute(
             _ ->
                 em.createQuery(
-                        "select i.id from CopyIntent i where i.status in :states or (i.acceptanceAttempt=true and i.status='FINAL' and i.acceptanceOrderReconciled=false and i.requestedLots>0) order by i.createdAt,i.id",
+                        "select i.id from CopyIntent i where i.status in :states or (i.acceptanceAttempt=true and i.status='FINAL' and i.acceptanceOrderReconciled=false and i.requestedLots>0) or (i.status='FINAL' and exists (select r.id from JournalEntry r where r.category='ORDER_EVIDENCE_RECHECK' and r.detail=str(i.id) and not exists (select c.id from JournalEntry c where c.category='ORDER_EVIDENCE_RECHECKED' and c.detail=r.detail and c.id>r.id))) order by i.createdAt,i.id",
                         UUID.class)
                     .setParameter("states", LIVE)
                     .getResultList());
@@ -121,6 +125,7 @@ public class TradingService implements UnsentIntentStop {
   }
 
   public void dispatchReady() {
+    replayOrderEvidence();
     BrokerGateway gateway = gateways.getIfAvailable();
     if (gateway == null) return;
     List<UUID> waiting =
@@ -574,6 +579,42 @@ public class TradingService implements UnsentIntentStop {
   }
 
   public void apply(OrderEvidence evidence, boolean postResponse) {
+    orderJournal.receive(evidence, postResponse);
+    replayOrderEvidence();
+  }
+
+  /** Replays committed observations only; each marker commits atomically with its decision. */
+  public synchronized void replayOrderEvidence() {
+    long through = orderJournal.highWater(), after = 0;
+    while (after < through) {
+      var batch = orderJournal.pending(after, through);
+      if (batch.isEmpty()) break;
+      for (var pending : batch) applySaved(pending);
+      after = batch.getLast().sequence();
+    }
+  }
+
+  public void mirrorStreamGap() {
+    var uncertain =
+        tx.execute(
+            _ ->
+                em.createQuery("from CopyIntent where status in :states", CopyIntent.class)
+                    .setParameter("states", LIVE)
+                    .getResultList());
+    for (var intent : uncertain) apply(unknown(request(intent)), false);
+  }
+
+  private void applySaved(OrderEvidenceJournal.Pending pending) {
+    var original = pending.evidence();
+    var raw = original.sdkEvidence();
+    boolean stream =
+        raw != null
+            && (raw.source() == ru.orbita.broker.OrderSdkEvidence.Source.ORDER_STATE_STREAM
+                || raw.source() == ru.orbita.broker.OrderSdkEvidence.Source.TRADES_STREAM);
+    var prepared = stream ? prepareMirror(original) : original;
+    if (prepared == null) return; // Unlinked trades remain durable until a UUID mapping arrives.
+    final var evidence = prepared;
+    boolean postResponse = pending.postResponse();
     var confirmationBound =
         evidence.receivedMonotonicNanos() == null
             ? Optional.<ClockEvidence.Bound>empty()
@@ -581,18 +622,33 @@ public class TradingService implements UnsentIntentStop {
     tx.executeWithoutResult(
         _ -> {
           control.gate();
+          if (orderJournal.applied(pending.sequence())) return;
+          // Marking and state changes share this transaction. Any failure rolls both back.
+          orderJournal.markApplied(pending.sequence(), evidence.instrumentId());
+          if (evidence.requestId() == null
+              || !properties.mirrorAccount().equals(evidence.accountId())) return;
           CopyIntent i =
               em.find(CopyIntent.class, evidence.requestId(), LockModeType.PESSIMISTIC_WRITE);
-          if (i == null) throw new IllegalArgumentException("Unknown order intent");
-          if (!properties.mirrorAccount().equals(evidence.accountId())
-              || !i.instrumentId.equals(evidence.instrumentId())
-              || !i.side.equals(evidence.side().name()))
-            throw new IllegalStateException("Order evidence identity mismatch");
+          if (i == null) return;
+          if (!i.instrumentId.equals(evidence.instrumentId())
+              || evidence.side() == null
+              || !i.side.equals(evidence.side().name())) {
+            contradiction(i, "Order evidence identity mismatch");
+            return;
+          }
           if (evidence.known()
               && i.requestedLots > 0
-              && evidence.lotsRequested() != i.requestedLots)
-            throw new IllegalStateException("Order request volume evidence mismatch");
+              && evidence.lotsRequested() != i.requestedLots) {
+            contradiction(i, "Order request volume evidence mismatch");
+            return;
+          }
+          if (stream && !validMirror(raw, i)) {
+            contradiction(i, "Mirror stream identity/quantity contradicts attempt");
+            return;
+          }
+          boolean wasFinal = "FINAL".equals(i.status);
           if (!evidence.known()) {
+            if (wasFinal) return;
             i.acceptanceOrderReconciled = false;
             i.acceptanceReconciled = false;
             i.status = "UNKNOWN";
@@ -602,10 +658,42 @@ public class TradingService implements UnsentIntentStop {
                   notifications.publish("ORDER_UNKNOWN", i.instrumentId, clock.instant(), i.reason);
             return;
           }
-          if (evidence.lotsExecuted() < i.executedLots)
-            return; // older snapshot cannot reverse a confirmed fill
-          if (evidence.lotsExecuted() > i.lots - i.skippedLots)
-            throw new IllegalStateException("Broker execution exceeds intent");
+          if (evidence.lotsExecuted() < i.executedLots) {
+            if (evidence.status() == OrderStatus.FILLED
+                || evidence.status() == OrderStatus.CANCELLED
+                || evidence.status() == OrderStatus.REJECTED)
+              contradiction(i, "Terminal evidence contradicts confirmed fills");
+            return;
+          }
+          if (evidence.lotsExecuted() > i.requestedLots || evidence.lotsExecuted() < 0) {
+            contradiction(i, "Broker execution exceeds intent or units are unqualified");
+            return;
+          }
+          Set<String> incomingTradeIds = new HashSet<>();
+          for (Fill fill : evidence.fills()) {
+            var previous =
+                fill.tradeId() == null
+                    ? null
+                    : em.find(BrokerFillEntity.class, i.id + ":" + fill.tradeId());
+            if (fill.tradeId() == null
+                || fill.tradeId().isBlank()
+                || !incomingTradeIds.add(fill.tradeId())
+                || fill.lots() == null
+                || fill.lots().signum() <= 0
+                || fill.price() == null
+                || fill.price().signum() <= 0
+                || fill.currency() == null
+                || fill.currency().isBlank()
+                || fill.executedAt() == null
+                || previous != null
+                    && (previous.lots.compareTo(fill.lots()) != 0
+                        || previous.price.compareTo(fill.price()) != 0
+                        || !previous.currency.equalsIgnoreCase(fill.currency()))) {
+              contradiction(i, "Conflicting or duplicate trade identity/quantity");
+              return;
+            }
+          }
+          if (stream) orderJournal.rememberLink(pending.sequence(), evidence);
           long delta = evidence.lotsExecuted() - i.executedLots;
           if (delta > 0) {
             MirrorPosition p = position(i.instrumentId);
@@ -613,7 +701,19 @@ public class TradingService implements UnsentIntentStop {
             if (p.copiedLots < 0) throw new IllegalStateException("Negative copied holding");
           }
           i.executedLots = evidence.lotsExecuted();
-          i.brokerOrderId = evidence.brokerOrderId();
+          if (wasFinal && delta > 0) {
+            i.skippedLots = i.lots - i.executedLots;
+            i.acceptanceOrderReconciled = false;
+            i.acceptanceReconciled = false;
+            // The former final fee cannot qualify an acceptance attempt whose execution changed.
+            // The existing independent-fee pass will read it again before R125 can be cleared.
+            if (i.acceptanceAttempt) i.actualCommission = null;
+            em.persist(
+                new JournalEntry(
+                    clock.instant(), "ORDER_EVIDENCE_RECHECK", i.instrumentId, i.id.toString()));
+          }
+          if (evidence.brokerOrderId() != null && !evidence.brokerOrderId().isBlank())
+            i.brokerOrderId = evidence.brokerOrderId();
           for (Fill fill : evidence.fills()) {
             String key = i.id + ":" + fill.tradeId();
             if (em.find(BrokerFillEntity.class, key) == null) {
@@ -633,7 +733,11 @@ public class TradingService implements UnsentIntentStop {
                   || evidence.status() == OrderStatus.CANCELLED
                   || evidence.status() == OrderStatus.REJECTED;
           if (terminal) {
-            if (i.acceptanceAttempt && !postResponse) i.acceptanceOrderReconciled = true;
+            if (i.acceptanceAttempt && !postResponse && !stream) i.acceptanceOrderReconciled = true;
+            if (stream && !(wasFinal && delta > 0))
+              em.persist(
+                  new JournalEntry(
+                      clock.instant(), "ORDER_EVIDENCE_RECHECK", i.instrumentId, i.id.toString()));
             i.cancellationPending = false;
             if (evidence.status() == OrderStatus.REJECTED
                 && evidence.rejectionReason() == RejectionReason.HALTED
@@ -659,7 +763,7 @@ public class TradingService implements UnsentIntentStop {
             // Fee reserve is released only after independent final commission reconciliation.
             i.reservedMoney = i.commissionReserve;
             allocateRecovery(i);
-            if (i.skippedLots > 0) {
+            if (i.skippedLots > 0 && !wasFinal) {
               String text =
                   i.side
                       + ": исполнено "
@@ -677,10 +781,14 @@ public class TradingService implements UnsentIntentStop {
               else notifications.publish("ORDER_FINAL_SKIP", i.instrumentId, clock.instant(), text);
             }
           } else {
+            if (wasFinal) {
+              if (delta > 0) allocateRecovery(i);
+              return;
+            }
             i.acceptanceOrderReconciled = false;
             i.acceptanceReconciled = false;
             i.status = i.cancellationPending ? "CANCEL_STARTED" : "ACTIVE";
-            if (i.sentAt == null) {
+            if (i.sentAt == null && !stream) {
               i.sentAt =
                   Objects.requireNonNull(
                       evidence.observedAt(), "Raw order-response receipt required");
@@ -694,7 +802,7 @@ public class TradingService implements UnsentIntentStop {
                     "Исходная точка таймера сохранена; достоверность оставшегося времени не подтверждена, новая минута не назначается";
             }
           }
-          if (i.unknownNotification != null && (terminal || !i.cancellationPending)) {
+          if (i.unknownNotification != null && !stream && (terminal || !i.cancellationPending)) {
             notificationService.resolve(
                 i.unknownNotification,
                 clock.instant(),
@@ -705,7 +813,150 @@ public class TradingService implements UnsentIntentStop {
           em.persist(
               new JournalEntry(
                   clock.instant(), "ORDER_RECONCILED", i.instrumentId, i.view().toString()));
+          if (!stream && !postResponse)
+            em.persist(
+                new JournalEntry(
+                    clock.instant(), "ORDER_EVIDENCE_RECHECKED", i.instrumentId, i.id.toString()));
         });
+  }
+
+  private OrderEvidence prepareMirror(OrderEvidence evidence) {
+    var raw = evidence.sdkEvidence();
+    if (!properties.mirrorAccount().equals(evidence.accountId())) return evidence;
+    UUID id = evidence.requestId();
+    if (raw.source() == ru.orbita.broker.OrderSdkEvidence.Source.TRADES_STREAM) {
+      id = tx.execute(_ -> orderJournal.linkedRequest(raw).orElse(null));
+      if (id == null) return null;
+    }
+    final UUID linkedId = id;
+    var intent = id == null ? null : tx.execute(_ -> em.find(CopyIntent.class, linkedId));
+    if (intent == null || !properties.mirrorAccount().equals(evidence.accountId())) return evidence;
+    // Instrument lookup belongs outside the control transaction. Never trust stream lot size alone.
+    var gateway = gateways.getIfAvailable();
+    if (gateway == null)
+      throw new IllegalStateException(
+          "Own mirror observation requires broker instrument qualification");
+    var instrument = gateway.instrument(intent.instrumentId);
+    if (instrument.lotSize() <= 0 || !intent.instrumentId.equals(instrument.id()))
+      throw new IllegalStateException("Own mirror observation has unqualified instrument lot size");
+    List<Fill> fills = new ArrayList<>();
+    Set<String> unique = new HashSet<>();
+    boolean valid = raw.lotSize() == null || raw.lotSize() == instrument.lotSize();
+    for (var t : raw.trades()) {
+      if (t.tradeId() == null
+          || t.tradeId().isBlank()
+          || !unique.add(t.tradeId())
+          || t.pieces() <= 0
+          || t.pieces() % instrument.lotSize() != 0
+          || t.price() == null
+          || t.at() == null) {
+        valid = false;
+        break;
+      }
+      fills.add(
+          new Fill(
+              t.tradeId(),
+              BigDecimal.valueOf(t.pieces() / instrument.lotSize()),
+              t.price(),
+              intent.currency,
+              t.at()));
+    }
+    long total;
+    if (raw.source() == ru.orbita.broker.OrderSdkEvidence.Source.TRADES_STREAM) {
+      total =
+          tx.execute(
+              _ -> {
+                var known =
+                    em.createQuery(
+                            "from BrokerFillEntity f where f.intentId=:id", BrokerFillEntity.class)
+                        .setParameter("id", linkedId)
+                        .getResultList();
+                Map<String, BigDecimal> quantities = new HashMap<>();
+                for (var f : known) quantities.put(f.tradeId, f.lots);
+                for (var f : fills) quantities.putIfAbsent(f.tradeId(), f.lots());
+                return quantities.values().stream()
+                    .reduce(BigDecimal.ZERO, BigDecimal::add)
+                    .longValueExact();
+              });
+      // A prior unary snapshot may already include a trade whose individual record is still late.
+      total = Math.max(total, intent.executedLots);
+    } else {
+      total = evidence.lotsExecuted();
+      if (!fills.isEmpty()
+          && fills.stream()
+                  .map(Fill::lots)
+                  .reduce(BigDecimal.ZERO, BigDecimal::add)
+                  .longValueExact()
+              != total) valid = false;
+    }
+    var status =
+        raw.source() == ru.orbita.broker.OrderSdkEvidence.Source.TRADES_STREAM
+            ? total == intent.requestedLots ? OrderStatus.FILLED : OrderStatus.PARTIALLY_FILLED
+            : evidence.status();
+    // PARTIALLY_FILL after cancel is deliberately active until independent unary reconciliation.
+    return new OrderEvidence(
+        linkedId,
+        evidence.accountId(),
+        null,
+        evidence.instrumentId(),
+        evidence.side(),
+        intent.requestedLots,
+        valid ? total : -1,
+        status,
+        fills,
+        evidence.observedAt(),
+        evidence.detail(),
+        evidence.rejectionReason(),
+        null,
+        null,
+        raw);
+  }
+
+  private boolean validMirror(ru.orbita.broker.OrderSdkEvidence raw, CopyIntent i) {
+    if (raw.source() == ru.orbita.broker.OrderSdkEvidence.Source.TRADES_STREAM) return true;
+    boolean quantities =
+        raw.requestedLots() != null
+            && raw.requestedLots() == i.requestedLots
+            && i.requestedLots > 0
+            && raw.executedLots() != null
+            && raw.executedLots() >= 0
+            && raw.executedLots() <= i.requestedLots
+            && raw.remainingLots() != null
+            && raw.remainingLots() >= 0
+            && raw.cancelledLots() != null
+            && raw.cancelledLots() >= 0
+            && raw.executedLots() + raw.remainingLots() + raw.cancelledLots() == i.requestedLots;
+    if (!quantities) return false;
+    return switch (raw.executionStatusValue() == null ? 0 : raw.executionStatusValue()) {
+      case 1 ->
+          raw.executedLots() == i.requestedLots
+              && raw.remainingLots() == 0
+              && raw.cancelledLots() == 0;
+      case 2, 3 -> raw.remainingLots() == 0;
+      case 4 -> raw.executedLots() == 0 && raw.cancelledLots() == 0;
+      case 5 -> raw.executedLots() > 0 && raw.executedLots() < i.requestedLots;
+      default -> true; // An unrecognised status remains UNKNOWN; cause never supplies an outcome.
+    };
+  }
+
+  private void contradiction(CopyIntent i, String detail) {
+    control.pauseInstrument(i.instrumentId, detail);
+    i.acceptanceOrderReconciled = false;
+    i.acceptanceReconciled = false;
+    if (!"FINAL".equals(i.status)) {
+      i.status = "UNKNOWN";
+      i.acceptanceOrderReconciled = false;
+      i.acceptanceReconciled = false;
+      if (i.unknownNotification == null)
+        i.unknownNotification =
+            notifications.publish("ORDER_UNKNOWN", i.instrumentId, clock.instant(), detail);
+    }
+    em.persist(
+        new JournalEntry(
+            clock.instant(), "ORDER_EVIDENCE_CONTRADICTION", i.instrumentId, i.id + ": " + detail));
+    em.persist(
+        new JournalEntry(
+            clock.instant(), "ORDER_EVIDENCE_RECHECK", i.instrumentId, i.id.toString()));
   }
 
   public void reconcileCommission(

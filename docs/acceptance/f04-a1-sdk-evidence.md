@@ -144,6 +144,24 @@ SDK, неизвестные коды и исходы, сохранение ис�
 имитаторы; тестовые HTTP-контексты не являлись запуском рабочего приложения.
 Python-набор повторно не запускался: Python-инструменты не менялись.
 
-Работа сохранена в локальной ветке. Push/merge и GitHub CI — **NOT_RUN**;
-статусы GitHub Issues в этом этапе не изменялись. #36 не начата.
+При завершении локальной реализации push/merge и GitHub CI ещё не выполнялись.
+Последующая публикация и закрытие A1 подтверждены ниже; локальные результаты
+этого отчёта не подменяют результаты remote CI.
+
+## Публикация и завершение #35
+
+[PR #42](https://github.com/prmAim/orbita/pull/42) слит в `main`, merge-коммит
+`9451ae2dedfbbb88132043497d97982d4736213a`.
+
+- [Java/TypeScript CI main](https://github.com/prmAim/orbita/actions/runs/44134963679):
+  SUCCESS, 129 unit + 157 integration = **286**, failures/errors/skipped = 0;
+  frontend и ранняя проверка схемы также прошли.
+- [Python CI main](https://github.com/prmAim/orbita/actions/runs/44134963940):
+  SUCCESS, 43 теста с одним Windows-specific пропуском на Linux runner;
+  lint/format — PASS.
+- Дополнительное pre-merge ревью GPT-6 Astra: Security — 0,
+  Business Logic — 0, Duplication/Dead Code — 0 замечаний.
+- [#35 закрыта с подтверждением результата](https://github.com/prmAim/orbita/issues/35#issuecomment-6956157143).
+  Её зависимость для #36 выполнена. Ф-04, #20 и #34 целиком не закрываются.
+
 Живая приёмка и отправка опросника владельцу API — **NOT_RUN**.

@@ -833,7 +833,16 @@ public final class TInvestBrokerGateway implements BrokerGateway {
   @Override
   public AutoCloseable observe(SourceFeedJournal journal) {
     verifyAccounts();
-    return new SourceExecutionFeed(factory, this, sourceAccount, clock, journal);
+    var source = new SourceExecutionFeed(factory, this, sourceAccount, clock, journal);
+    if (!journal.supportsMirrorOrders()) return source;
+    var mirror = new MirrorOrderFeed(factory, mirrorAccount, clock, journal);
+    return () -> {
+      try {
+        mirror.close();
+      } finally {
+        source.close();
+      }
+    };
   }
 
   public void verifyAccounts() {
@@ -885,7 +894,7 @@ public final class TInvestBrokerGateway implements BrokerGateway {
         : OrderDirection.ORDER_DIRECTION_SELL;
   }
 
-  private static OrderStatus status(OrderExecutionReportStatus status) {
+  static OrderStatus status(OrderExecutionReportStatus status) {
     return switch (status) {
       case EXECUTION_REPORT_STATUS_NEW -> OrderStatus.NEW;
       case EXECUTION_REPORT_STATUS_PARTIALLYFILL -> OrderStatus.PARTIALLY_FILLED;

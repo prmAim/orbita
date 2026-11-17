@@ -80,6 +80,10 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
   private final Map<String, Resources> resources = new LinkedHashMap<>();
   private final Map<String, BigDecimal> capitals = new HashMap<>();
   private final List<StreamObserver<TradesStreamResponse>> streams = new CopyOnWriteArrayList<>();
+  private final List<StreamObserver<TradesStreamResponse>> mirrorTrades =
+      new CopyOnWriteArrayList<>();
+  private final List<StreamObserver<OrderStateStreamResponse>> mirrorStates =
+      new CopyOnWriteArrayList<>();
   private final BlockingQueue<Boolean> subscriptions = new LinkedBlockingQueue<>();
   private final ScheduledExecutorService heartbeat =
       Executors.newSingleThreadScheduledExecutor(
@@ -143,6 +147,28 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
                         .build());
               } catch (RuntimeException disconnected) {
                 streams.remove(out);
+              }
+            for (var out : mirrorTrades)
+              try {
+                out.onNext(
+                    TradesStreamResponse.newBuilder()
+                        .setPing(
+                            Ping.newBuilder()
+                                .setTime(TInvestBrokerGateway.timestamp(Instant.now())))
+                        .build());
+              } catch (RuntimeException disconnected) {
+                mirrorTrades.remove(out);
+              }
+            for (var out : mirrorStates)
+              try {
+                out.onNext(
+                    OrderStateStreamResponse.newBuilder()
+                        .setPing(
+                            Ping.newBuilder()
+                                .setTime(TInvestBrokerGateway.timestamp(Instant.now())))
+                        .build());
+              } catch (RuntimeException disconnected) {
+                mirrorStates.remove(out);
               }
           }
         },
@@ -992,22 +1018,46 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
 
   private BindableService stream() {
     return new OrdersStreamServiceGrpc.OrdersStreamServiceImplBase() {
+      public void orderStateStream(
+          OrderStateStreamRequest request, StreamObserver<OrderStateStreamResponse> out) {
+        synchronized (WholeChainBrokerSimulator.this) {
+          if (!request.getAccountsList().equals(List.of(MIRROR))) {
+            out.onError(Status.PERMISSION_DENIED.asRuntimeException());
+            return;
+          }
+          mirrorStates.add(out);
+          if (out instanceof ServerCallStreamObserver<OrderStateStreamResponse> server)
+            server.setOnCancelHandler(() -> mirrorStates.remove(out));
+          out.onNext(
+              OrderStateStreamResponse.newBuilder()
+                  .setSubscription(
+                      SubscriptionResponse.newBuilder()
+                          .setStatus(ResultSubscriptionStatus.RESULT_SUBSCRIPTION_STATUS_OK)
+                          .addAccounts(MIRROR))
+                  .build());
+        }
+      }
+
       public void tradesStream(
           TradesStreamRequest request, StreamObserver<TradesStreamResponse> out) {
         synchronized (WholeChainBrokerSimulator.this) {
-          if (!request.getAccountsList().equals(List.of(SOURCE)))
-            throw Status.PERMISSION_DENIED.asRuntimeException();
-          streams.add(out);
+          boolean source = request.getAccountsList().equals(List.of(SOURCE));
+          if (!source && !request.getAccountsList().equals(List.of(MIRROR))) {
+            out.onError(Status.PERMISSION_DENIED.asRuntimeException());
+            return;
+          }
+          var recipients = source ? streams : mirrorTrades;
+          recipients.add(out);
           if (out instanceof ServerCallStreamObserver<TradesStreamResponse> server)
-            server.setOnCancelHandler(() -> streams.remove(out));
+            server.setOnCancelHandler(() -> recipients.remove(out));
           out.onNext(
               TradesStreamResponse.newBuilder()
                   .setSubscription(
                       SubscriptionResponse.newBuilder()
                           .setStatus(ResultSubscriptionStatus.RESULT_SUBSCRIPTION_STATUS_OK)
-                          .addAccounts(SOURCE))
+                          .addAccounts(source ? SOURCE : MIRROR))
                   .build());
-          subscriptions.add(true);
+          if (source) subscriptions.add(true);
         }
       }
     };
@@ -1023,6 +1073,18 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
       } catch (RuntimeException ignored) {
       }
     streams.clear();
+    for (var out : mirrorTrades)
+      try {
+        out.onCompleted();
+      } catch (RuntimeException ignored) {
+      }
+    mirrorTrades.clear();
+    for (var out : mirrorStates)
+      try {
+        out.onCompleted();
+      } catch (RuntimeException ignored) {
+      }
+    mirrorStates.clear();
     for (var out : cashStreams)
       try {
         out.onCompleted();

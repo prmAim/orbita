@@ -61,6 +61,7 @@ class BrokerConnectivityIT {
     db.update(
         "update control_state set mode='STOPPED',reconciled=false,feed_ready=false where id=1");
     readiness.brokerPersistenceRecovered();
+    readiness.mirrorPersistenceRecovered();
     clock.now = Instant.parse("2026-11-15T10:00:00Z");
     telegram.results.clear();
     telegram.messages.clear();
@@ -251,13 +252,17 @@ class BrokerConnectivityIT {
   void asyncPersistenceFailureActivelyReconnectsAndRecoversWithoutAnotherSourceTrade()
       throws Exception {
     var stream =
-        new OrdersStreamServiceGrpc.OrdersStreamServiceImplBase() {
+        new MirrorAcknowledgements() {
           final java.util.concurrent.atomic.AtomicInteger subscriptions =
               new java.util.concurrent.atomic.AtomicInteger();
 
           @Override
           public void tradesStream(
               TradesStreamRequest request, StreamObserver<TradesStreamResponse> out) {
+            if (request.getAccountsList().equals(List.of("mirror"))) {
+              super.tradesStream(request, out);
+              return;
+            }
             subscriptions.incrementAndGet();
             out.onNext(
                 TradesStreamResponse.newBuilder()
@@ -308,10 +313,14 @@ class BrokerConnectivityIT {
       String condition) throws Exception {
     var opened = new java.util.concurrent.CountDownLatch(1);
     var stream =
-        new OrdersStreamServiceGrpc.OrdersStreamServiceImplBase() {
+        new MirrorAcknowledgements() {
           @Override
           public void tradesStream(
               TradesStreamRequest request, StreamObserver<TradesStreamResponse> out) {
+            if (request.getAccountsList().equals(List.of("mirror"))) {
+              super.tradesStream(request, out);
+              return;
+            }
             if (condition.equals("unqualified-linkage"))
               out.onNext(
                   TradesStreamResponse.newBuilder()
@@ -397,6 +406,27 @@ class BrokerConnectivityIT {
       if (System.nanoTime() >= deadline)
         throw new AssertionError("Expected asynchronous broker boundary result not observed");
       Thread.sleep(10);
+    }
+  }
+
+  private static class MirrorAcknowledgements
+      extends OrdersStreamServiceGrpc.OrdersStreamServiceImplBase {
+    public void orderStateStream(
+        OrderStateStreamRequest request, StreamObserver<OrderStateStreamResponse> out) {
+      assertThat(request.getAccountsList()).containsExactly("mirror");
+      out.onNext(
+          OrderStateStreamResponse.newBuilder()
+              .setSubscription(MirrorOrderFeedTlsTest.ack("mirror"))
+              .build());
+    }
+
+    public void tradesStream(
+        TradesStreamRequest request, StreamObserver<TradesStreamResponse> out) {
+      assertThat(request.getAccountsList()).containsExactly("mirror");
+      out.onNext(
+          TradesStreamResponse.newBuilder()
+              .setSubscription(MirrorOrderFeedTlsTest.ack("mirror"))
+              .build());
     }
   }
 
