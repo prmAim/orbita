@@ -701,7 +701,17 @@ public class TradingService implements UnsentIntentStop {
             if (p.copiedLots < 0) throw new IllegalStateException("Negative copied holding");
           }
           i.executedLots = evidence.lotsExecuted();
-          if (wasFinal && delta > 0) i.skippedLots = i.lots - i.executedLots;
+          if (wasFinal && delta > 0) {
+            i.skippedLots = i.lots - i.executedLots;
+            i.acceptanceOrderReconciled = false;
+            i.acceptanceReconciled = false;
+            // The former final fee cannot qualify an acceptance attempt whose execution changed.
+            // The existing independent-fee pass will read it again before R125 can be cleared.
+            if (i.acceptanceAttempt) i.actualCommission = null;
+            em.persist(
+                new JournalEntry(
+                    clock.instant(), "ORDER_EVIDENCE_RECHECK", i.instrumentId, i.id.toString()));
+          }
           if (evidence.brokerOrderId() != null && !evidence.brokerOrderId().isBlank())
             i.brokerOrderId = evidence.brokerOrderId();
           for (Fill fill : evidence.fills()) {
@@ -724,7 +734,7 @@ public class TradingService implements UnsentIntentStop {
                   || evidence.status() == OrderStatus.REJECTED;
           if (terminal) {
             if (i.acceptanceAttempt && !postResponse && !stream) i.acceptanceOrderReconciled = true;
-            if (stream)
+            if (stream && !(wasFinal && delta > 0))
               em.persist(
                   new JournalEntry(
                       clock.instant(), "ORDER_EVIDENCE_RECHECK", i.instrumentId, i.id.toString()));
@@ -771,7 +781,10 @@ public class TradingService implements UnsentIntentStop {
               else notifications.publish("ORDER_FINAL_SKIP", i.instrumentId, clock.instant(), text);
             }
           } else {
-            if (wasFinal) return;
+            if (wasFinal) {
+              if (delta > 0) allocateRecovery(i);
+              return;
+            }
             i.acceptanceOrderReconciled = false;
             i.acceptanceReconciled = false;
             i.status = i.cancellationPending ? "CANCEL_STARTED" : "ACTIVE";

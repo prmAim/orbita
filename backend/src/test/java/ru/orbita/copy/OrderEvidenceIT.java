@@ -30,6 +30,152 @@ class OrderEvidenceIT {
   @Autowired JdbcTemplate db;
   @Autowired DurableSourceFeedJournal feed;
   @Autowired ru.orbita.runtime.ApplicationReadiness readiness;
+  @Autowired ReconciliationService reconciliation;
+  @Autowired PositionRecoveryService recovery;
+
+  @Test
+  void latePartialFillInvalidatesAcceptedAttemptUntilNewIndependentReconciliation() {
+    var request = send(3, 1);
+    trading.apply(state(request, OrderStatus.PARTIALLY_FILLED, 1, 0, 2, null), false);
+    var firstTerminal = broker.evidence(request, OrderStatus.CANCELLED, 1);
+    broker.orders.put(request.requestId(), firstTerminal);
+    trading.apply(firstTerminal, false);
+    trading.reconcileCommission(request.requestId(), BigDecimal.ONE, true);
+    broker.bankLots = 1;
+    source("evidence-trade", "evidence-order", Side.BUY, 3);
+    assertThat(reconciliation.reconcile()).isTrue();
+    control.issuePermit(new BigDecimal("1000"));
+    control.revokePermit();
+    trading.apply(trade(request, "fill-" + request.requestId() + "-1", 1), false);
+    assertThatThrownBy(() -> control.issuePermit(new BigDecimal("1000")))
+        .isInstanceOf(IllegalStateException.class);
+    int before = broker.orderReads;
+    broker.finalCommissionAvailable = false;
+    broker.orders.put(request.requestId(), broker.evidence(request, OrderStatus.CANCELLED, 2));
+    broker.bankLots = 2;
+    trading.reconcileOnly();
+    assertThat(broker.orderReads).isGreaterThan(before);
+    assertThat(reconciliation.reconcile()).isTrue();
+    assertThatThrownBy(() -> control.issuePermit(new BigDecimal("1000")))
+        .isInstanceOf(IllegalStateException.class);
+    broker.finalCommissionAvailable = true;
+    trading.reconcileOnly();
+    assertThat(reconciliation.reconcile()).isTrue();
+    assertThatCode(() -> control.issuePermit(new BigDecimal("1000"))).doesNotThrowAnyException();
+    assertThat(broker.posts).isEqualTo(1);
+  }
+
+  @Test
+  void latePartialCorrectionFillRefreshesRecoveryAllocationBeforeIndependentLookup() {
+    broker.individualLotFills = true;
+    broker.mirrorCapital = new BigDecimal("500000");
+    broker.fillEveryPost = true;
+    control.markReconciled();
+    control.start();
+    control.markFeedReady(true);
+    control.shadowChecked(algorithms.current(), "BUY", true);
+    control.shadowChecked(algorithms.current(), "SELL", true);
+    control.confirmLiveAcceptance();
+    control.enableAutomatic();
+    clock.now = clock.now.plusSeconds(1);
+    copies.accept(source("allocation-first", "allocation-first-order", Side.BUY, 10));
+    trading.tick();
+    broker.mirrorCapital = new BigDecimal("300000");
+    control.recalculate();
+    clock.now = clock.now.plusSeconds(1);
+    copies.accept(source("allocation-second", "allocation-second-order", Side.BUY, 10));
+    clock.now = clock.now.plusSeconds(1);
+    copies.accept(source("allocation-sale", "allocation-sale-order", Side.SELL, 10));
+    control.instrumentReconciled(
+        "instrument", true, false, "synthetic confirmed recovery sequence");
+    reconciliation.reconcile();
+    recovery.recover();
+    broker.partialNext = 6;
+    trading.dispatchReady();
+    var request = broker.sent;
+    assertThat(request.side()).isEqualTo(Side.SELL);
+    trading.apply(broker.evidence(request, OrderStatus.CANCELLED, 6), false);
+    assertThat(copies.holdingAllocations())
+        .extracting(HoldingAllocation.View::lots)
+        .containsExactly(29L, 15L);
+    trading.apply(state(request, OrderStatus.PARTIALLY_FILLED, 6, 0, 4, null), false);
+    var late = trade(request, "fill-" + request.requestId() + "-6", 1);
+    trading.apply(late, false);
+    trading.apply(late, false);
+    assertThat(copies.holdingAllocations())
+        .extracting(HoldingAllocation.View::lots)
+        .containsExactly(28L, 15L);
+    assertThat(copies.positions())
+        .singleElement()
+        .satisfies(p -> assertThat(p.copiedLots()).isEqualTo(43));
+    broker.orders.put(request.requestId(), broker.evidence(request, OrderStatus.CANCELLED, 7));
+    broker.bankLots = 43;
+    int before = broker.orderReads;
+    trading.reconcileOnly();
+    assertThat(broker.orderReads).isGreaterThan(before);
+    assertThat(broker.posts).isEqualTo(2);
+  }
+
+  private SourceExecution source(String trade, String order, Side side, long lots) {
+    var event =
+        new SourceExecution(
+            "source",
+            trade,
+            order,
+            "instrument",
+            side,
+            BigDecimal.valueOf(lots),
+            new BigDecimal("100"),
+            "RUB",
+            clock.instant(),
+            clock.instant());
+    broker.historyExecutions.add(event);
+    return event;
+  }
+
+  private OrderEvidence trade(OrderRequest request, String id, long pieces) {
+    var raw =
+        new OrderSdkEvidence(
+            OrderSdkEvidence.Source.TRADES_STREAM,
+            "1.51",
+            "f04-a2-v1",
+            null,
+            request.accountId(),
+            "exchange-id",
+            null,
+            request.instrumentId(),
+            request.side() == Side.BUY ? 1 : 2,
+            null,
+            false,
+            null,
+            null,
+            null,
+            null,
+            null,
+            List.of(),
+            clock.instant(),
+            null,
+            null,
+            null,
+            List.of(
+                new OrderSdkEvidence.TradeFact(id, pieces, request.limitPrice(), clock.instant())));
+    return new OrderEvidence(
+        null,
+        request.accountId(),
+        null,
+        request.instrumentId(),
+        request.side(),
+        0,
+        0,
+        OrderStatus.UNKNOWN,
+        List.of(),
+        clock.instant(),
+        "synthetic late trade",
+        RejectionReason.NONE,
+        null,
+        null,
+        raw);
+  }
 
   @BeforeEach
   void reset() {
@@ -407,7 +553,7 @@ class OrderEvidenceIT {
             clock.instant(),
             null,
             null,
-            10,
+            broker.instrumentLotSize,
             List.of());
     return new OrderEvidence(
         request.requestId(),
@@ -428,7 +574,11 @@ class OrderEvidenceIT {
   }
 
   private OrderRequest send(long lots) {
-    broker.instrumentLotSize = 10;
+    return send(lots, 10);
+  }
+
+  private OrderRequest send(long lots, int lotSize) {
+    broker.instrumentLotSize = lotSize;
     broker.individualLotFills = true;
     control.markReconciled();
     control.start();

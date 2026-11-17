@@ -82,6 +82,7 @@ class CopyLifecycleIT {
     broker.orders.clear();
     broker.currencyCash = false;
     broker.zeroFees = false;
+    broker.finalCommissionAvailable = true;
     broker.instrumentLotSize = 1;
     broker.individualLotFills = false;
     broker.sourceCash = new BigDecimal("100");
@@ -1494,6 +1495,7 @@ class CopyLifecycleIT {
   }
 
   static class Simulator implements BrokerGateway {
+    boolean finalCommissionAvailable = true;
     int instrumentLotSize = 1;
     boolean individualLotFills;
     final Clock clock;
@@ -1777,7 +1779,7 @@ class CopyLifecycleIT {
           r.requestId(),
           zeroFees ? BigDecimal.ZERO : BigDecimal.ONE,
           settlementCurrency,
-          finalState,
+          finalState && finalCommissionAvailable,
           clock.instant(),
           "independent qualified simulator charge");
     }
