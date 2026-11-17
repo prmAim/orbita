@@ -107,6 +107,7 @@ public final class TInvestBrokerGateway implements BrokerGateway {
             .setPriceType(PriceType.PRICE_TYPE_CURRENCY)
             .setConfirmMarginTrade(false)
             .build();
+    OrderSdkEvidence raw = null;
     try {
       var reply =
           factory
@@ -115,13 +116,16 @@ public final class TInvestBrokerGateway implements BrokerGateway {
                   stub -> stub.withDeadlineAfter(5, TimeUnit.SECONDS).postOrder(payload));
       long receivedNanos = BrokerReceiptClock.nanoTime();
       Instant receivedAt = clock.instant();
+      raw = OrderSdkEvidence.post(reply, receivedAt);
       if (reply.getOrderId().isBlank()
+          || !reply.getOrderRequestId().isEmpty()
+              && !reply.getOrderRequestId().equals(request.requestId().toString())
           || reply.getLotsRequested() != request.lots()
           || reply.getLotsExecuted() < 0
           || reply.getLotsExecuted() > request.lots()
           || reply.getDirection() != direction(request.side())
           || !reply.getInstrumentUid().equals(request.instrumentId()))
-        return unknown(request, "PostOrder response identity mismatch");
+        return unknown(request, "PostOrder response identity mismatch", raw);
       return new OrderEvidence(
           request.requestId(),
           request.accountId(),
@@ -134,24 +138,25 @@ public final class TInvestBrokerGateway implements BrokerGateway {
           List.of(),
           receivedAt,
           "PostOrder response",
-          status(reply.getExecutionReportStatus()) == OrderStatus.REJECTED
-              ? RejectionReason.OTHER
-              : RejectionReason.NONE,
+          reason(status(reply.getExecutionReportStatus())),
           receivedNanos,
-          receiptClockDomain);
+          receiptClockDomain,
+          raw);
     } catch (BrokerPersistenceFailure failure) {
       throw failure;
     } catch (RuntimeException failure) {
+      if (raw != null) return unknown(request, "PostOrder response requires reconciliation", raw);
+      var failed =
+          OrderSdkEvidence.failure(OrderSdkEvidence.Source.POST_ORDER, failure, clock.instant());
       recordTransportFailure(failure);
-      return unknown(
-          request,
-          "PostOrder outcome requires reconciliation: " + failure.getClass().getSimpleName());
+      return unknown(request, "PostOrder outcome requires reconciliation", failed);
     }
   }
 
   @Override
   public OrderEvidence reconcile(OrderRequest request) {
     validateMutation(request);
+    OrderSdkEvidence raw = null;
     try {
       var payload =
           GetOrderStateRequest.newBuilder()
@@ -169,6 +174,7 @@ public final class TInvestBrokerGateway implements BrokerGateway {
                           stub ->
                               stub.withDeadlineAfter(5, TimeUnit.SECONDS).getOrderState(payload)));
       var reply = receipt.payload();
+      raw = OrderSdkEvidence.state(reply, receipt.wallAt());
       if (!reply.getOrderRequestId().equals(request.requestId().toString())
           || reply.getOrderId().isBlank()
           || !reply.getInstrumentUid().equals(request.instrumentId())
@@ -176,7 +182,7 @@ public final class TInvestBrokerGateway implements BrokerGateway {
           || reply.getLotsRequested() != request.lots()
           || reply.getLotsExecuted() < 0
           || reply.getLotsExecuted() > request.lots())
-        return unknown(request, "GetOrderState identity/quantity mismatch");
+        return unknown(request, "GetOrderState identity/quantity mismatch", raw);
       var fills = new ArrayList<Fill>();
       var tradeIds = new java.util.HashSet<String>();
       for (var stage : reply.getStagesList()) {
@@ -184,7 +190,7 @@ public final class TInvestBrokerGateway implements BrokerGateway {
             || !tradeIds.add(stage.getTradeId())
             || stage.getQuantity() <= 0
             || !stage.hasPrice()
-            || !stage.hasExecutionTime()) return unknown(request, "Incomplete stage evidence");
+            || !stage.hasExecutionTime()) return unknown(request, "Incomplete stage evidence", raw);
         fills.add(
             new Fill(
                 stage.getTradeId(),
@@ -196,7 +202,7 @@ public final class TInvestBrokerGateway implements BrokerGateway {
       long stageLots =
           fills.stream().map(Fill::lots).reduce(BigDecimal.ZERO, BigDecimal::add).longValueExact();
       if (stageLots != reply.getLotsExecuted())
-        return unknown(request, "Stage quantity differs from executed lots");
+        return unknown(request, "Stage quantity differs from executed lots", raw);
       return new OrderEvidence(
           request.requestId(),
           request.accountId(),
@@ -209,15 +215,20 @@ public final class TInvestBrokerGateway implements BrokerGateway {
           fills,
           receipt.wallAt(),
           "GetOrderState by original UUID; stages in lots",
-          status(reply.getExecutionReportStatus()) == OrderStatus.REJECTED
-              ? RejectionReason.OTHER
-              : RejectionReason.NONE,
+          reason(status(reply.getExecutionReportStatus())),
           receipt.monotonicNanos(),
-          receiptClockDomain);
+          receiptClockDomain,
+          raw);
     } catch (BrokerPersistenceFailure failure) {
       throw failure;
     } catch (RuntimeException failure) {
-      return unknown(request, "Order lookup unresolved: " + failure.getClass().getSimpleName());
+      return unknown(
+          request,
+          "Order lookup unresolved",
+          raw != null
+              ? raw
+              : OrderSdkEvidence.failure(
+                  OrderSdkEvidence.Source.GET_ORDER_STATE, failure, clock.instant()));
     }
   }
 
@@ -238,8 +249,10 @@ public final class TInvestBrokerGateway implements BrokerGateway {
     } catch (BrokerPersistenceFailure failure) {
       throw failure;
     } catch (RuntimeException failure) {
+      var failed =
+          OrderSdkEvidence.failure(OrderSdkEvidence.Source.CANCEL_ORDER, failure, clock.instant());
       recordTransportFailure(failure);
-      return unknown(request, "Cancellation outcome requires reconciliation");
+      return unknown(request, "Cancellation outcome requires reconciliation", failed);
     }
     return reconcile(request);
   }
@@ -866,21 +879,6 @@ public final class TInvestBrokerGateway implements BrokerGateway {
       throw new IllegalArgumentException("Account outside configured pair");
   }
 
-  private OrderEvidence unknown(OrderRequest request, String detail) {
-    return new OrderEvidence(
-        request.requestId(),
-        request.accountId(),
-        null,
-        request.instrumentId(),
-        request.side(),
-        request.lots(),
-        0,
-        OrderStatus.UNKNOWN,
-        List.of(),
-        clock.instant(),
-        detail);
-  }
-
   private static OrderDirection direction(Side side) {
     return side == Side.BUY
         ? OrderDirection.ORDER_DIRECTION_BUY
@@ -896,6 +894,31 @@ public final class TInvestBrokerGateway implements BrokerGateway {
       case EXECUTION_REPORT_STATUS_REJECTED -> OrderStatus.REJECTED;
       default -> OrderStatus.UNKNOWN;
     };
+  }
+
+  private static RejectionReason reason(OrderStatus status) {
+    return status == OrderStatus.REJECTED || status == OrderStatus.CANCELLED
+        ? RejectionReason.OTHER
+        : RejectionReason.NONE;
+  }
+
+  private OrderEvidence unknown(OrderRequest request, String detail, OrderSdkEvidence raw) {
+    return new OrderEvidence(
+        request.requestId(),
+        request.accountId(),
+        null,
+        request.instrumentId(),
+        request.side(),
+        request.lots(),
+        0,
+        OrderStatus.UNKNOWN,
+        List.of(),
+        raw.receivedAt(),
+        detail,
+        RejectionReason.NONE,
+        null,
+        null,
+        raw);
   }
 
   static BigDecimal decimal(long units, int nanos) {

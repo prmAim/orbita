@@ -74,9 +74,43 @@ public interface BrokerGateway extends AutoCloseable {
       String detail,
       RejectionReason rejectionReason,
       Long receivedMonotonicNanos,
-      String receiptClockDomain) {
+      String receiptClockDomain,
+      OrderSdkEvidence sdkEvidence) {
     public OrderEvidence {
       fills = List.copyOf(fills);
+    }
+
+    public OrderEvidence(
+        UUID requestId,
+        String accountId,
+        String brokerOrderId,
+        String instrumentId,
+        Side side,
+        long lotsRequested,
+        long lotsExecuted,
+        OrderStatus status,
+        List<Fill> fills,
+        Instant observedAt,
+        String detail,
+        RejectionReason rejectionReason,
+        Long receivedMonotonicNanos,
+        String receiptClockDomain) {
+      this(
+          requestId,
+          accountId,
+          brokerOrderId,
+          instrumentId,
+          side,
+          lotsRequested,
+          lotsExecuted,
+          status,
+          fills,
+          observedAt,
+          detail,
+          rejectionReason,
+          receivedMonotonicNanos,
+          receiptClockDomain,
+          null);
     }
 
     public OrderEvidence(
