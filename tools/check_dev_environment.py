@@ -10,6 +10,7 @@ import shlex
 import shutil
 import sys
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -99,7 +100,27 @@ def quote(value):
     )
 
 
-def check(args):
+@dataclass
+class Environment:
+    java_home: Path
+    maven: Path
+    repository: Path
+    docker_version: str | None
+
+    def command(self, build):
+        return [
+            str(self.maven),
+            "--offline",
+            "--batch-mode",
+            "--no-transfer-progress",
+            "-f",
+            str(ROOT / "backend/pom.xml"),
+            f"-Dmaven.repo.local={self.repository}",
+            f"-Dorbita.build.directory={build}",
+        ]
+
+
+def inspect_environment(args, *, require_docker=True):
     failures = []
 
     def report(label, action):
@@ -188,27 +209,29 @@ def check(args):
             raise CheckFailure("ENGINE_UNAVAILABLE; missing Docker server version")
         print(f"PASS Docker Engine {version}; CLI: {binary}")
 
-    report("Docker", docker)
+        return version
+
+    version = report("Docker", docker) if require_docker else None
     if failures:
         print("FAIL preflight; no build command issued")
+        return None
+    return Environment(java_home, maven_binary, repository, version)
+
+
+def check(args):
+    env = inspect_environment(args)
+    if env is None:
         return 1
     arguments = [
-        str(maven_binary),
-        "--offline",
-        "--batch-mode",
-        "--no-transfer-progress",
-        "-f",
-        str(backend / "pom.xml"),
-        f"-Dmaven.repo.local={repository}",
-        f"-Dorbita.build.directory={build}",
+        *env.command(args.build_directory.expanduser().resolve()),
         "spotless:check",
         "verify",
     ]
     command = " ".join(quote(value) for value in arguments)
     prefix = (
-        f"$env:JAVA_HOME={quote(java_home)}; & "
+        f"$env:JAVA_HOME={quote(env.java_home)}; & "
         if os.name == "nt"
-        else f"JAVA_HOME={quote(java_home)} "
+        else f"JAVA_HOME={quote(env.java_home)} "
     )
     print(f"VERIFY (run separately; frontend must be built first):\n{prefix}{command}")
     print(
@@ -217,8 +240,7 @@ def check(args):
     return 0
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+def add_environment_arguments(parser):
     parser.add_argument("--java-home", type=Path, default=os.environ.get("JAVA_HOME"))
     parser.add_argument(
         "--maven-user-home",
@@ -238,12 +260,21 @@ def main():
         default=5,
         help="per-tool timeout in seconds (default: 5)",
     )
+
+
+def environment_arguments(parser):
     args = parser.parse_args()
     if not math.isfinite(args.timeout) or args.timeout <= 0 or args.timeout > 60:
         parser.error("--timeout must be greater than 0 and at most 60")
     if args.maven_repository is None:
         args.maven_repository = args.maven_user_home / "repository"
-    return check(args)
+    return args
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    add_environment_arguments(parser)
+    return check(environment_arguments(parser))
 
 
 if __name__ == "__main__":
