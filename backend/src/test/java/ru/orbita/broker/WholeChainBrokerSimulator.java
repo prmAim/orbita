@@ -568,6 +568,10 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
                     : 0)
             .setExecutionReportStatus(order.status);
     if (cause != null) state.setStatusInfoValue(cause);
+    emitOrderState(state.build());
+  }
+
+  public synchronized void emitOrderState(OrderStateStreamResponse.OrderState state) {
     var observation = OrderStateStreamResponse.newBuilder().setOrderState(state).build();
     for (var out : mirrorStates) out.onNext(observation);
   }
