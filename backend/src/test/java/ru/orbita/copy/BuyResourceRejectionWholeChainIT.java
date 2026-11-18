@@ -33,6 +33,7 @@ import ru.orbita.broker.OrderSdkEvidence;
 import ru.orbita.broker.WholeChainBrokerSimulator;
 import ru.orbita.control.*;
 import ru.tinkoff.piapi.contract.v1.OrderExecutionReportStatus;
+import ru.tinkoff.piapi.contract.v1.OrderStateStreamResponse;
 
 /** Full local TLS and PostgreSQL evidence path. No live broker or account is used. */
 @Testcontainers
@@ -326,6 +327,149 @@ class BuyResourceRejectionWholeChainIT {
     assertThat(bank.calls("PostOrder")).hasSize(1);
   }
 
+  @Test
+  void sellWithChangingStreamOrderIdBooksOneLotAcrossRestart() throws Exception {
+    prepare(true);
+    var price = new BigDecimal("100");
+    // Orbita sells owned lots. Two opening lots expose a second debit after replay.
+    UUID openingBuy = postSource("opening-trade", "opening-buy", 2, price, 2);
+    awaitFinal(openingBuy);
+    UUID sell = postSource("sale-trade", "sale-order", Side.SELL, 1, price, 0);
+    var attempt =
+        new OrderRequest(
+            WholeChainBrokerSimulator.MIRROR,
+            sell,
+            WholeChainBrokerSimulator.INSTRUMENT,
+            Side.SELL,
+            1,
+            price);
+    var newStatus = OrderExecutionReportStatus.EXECUTION_REPORT_STATUS_NEW;
+    var fillStatus = OrderExecutionReportStatus.EXECUTION_REPORT_STATUS_FILL;
+    String exchangeId = bank.brokerOrderId(sell);
+    String internalId = "internal-before-placement";
+    var firstNew =
+        OrderStateStreamResponse.OrderState.newBuilder()
+            .setAccountId(attempt.accountId())
+            .setOrderRequestId(sell.toString())
+            .setInstrumentUid(attempt.instrumentId())
+            .setDirection(ru.tinkoff.piapi.contract.v1.OrderDirection.ORDER_DIRECTION_SELL)
+            .setLotSize(1)
+            .setLotsRequested(1)
+            .setOrderId(internalId)
+            .setExecutionReportStatus(newStatus)
+            .build();
+    var secondNew = firstNew.toBuilder().setOrderId(exchangeId).setLotsLeft(1).build();
+    var fill =
+        secondNew.toBuilder()
+            .setExecutionReportStatus(fillStatus)
+            .setLotsLeft(0)
+            .setLotsExecuted(1)
+            .build();
+    assertThat(pausedFor(attempt)).as("before the first NEW").isEmpty();
+    bank.emitOrderState(firstNew);
+    await(() -> pausedFor(attempt).isPresent());
+    var pauseReason = pausedFor(attempt).orElseThrow();
+    assertThat(count("ORDER_EVIDENCE_CONTRADICTION")).isOne();
+    assertThat(persisted(sell).get("status")).isEqualTo("UNKNOWN");
+    bank.emitOrderState(secondNew);
+    await(() -> "ACTIVE".equals(persisted(sell).get("status")));
+    assertThat(count("ORDER_EVIDENCE_CONTRADICTION")).isOne();
+    bank.fillOrder(sell, 1, clock.instant());
+    bank.emitOrderState(fill);
+    awaitFinal(sell);
+    assertSingleSale(openingBuy, sell);
+    assertThat(pausedFor(attempt)).as("after stream FILL").contains(pauseReason);
+    reconcileFilledSaleByUuid(attempt);
+    assertThat(pausedFor(attempt)).as("after confirmed FILL by UUID").contains(pauseReason);
+    closeApplication();
+    app = start();
+
+    assertThat(pausedFor(attempt)).as("immediately after restart").contains(pauseReason);
+    assertSingleSale(openingBuy, sell);
+    assertThat(
+            evidenceHistory(attempt).stream()
+                .map(OrderEvidence::sdkEvidence)
+                .filter(e -> e.source() == OrderSdkEvidence.Source.ORDER_STATE_STREAM))
+        .extracting(
+            OrderSdkEvidence::responseRequestId,
+            OrderSdkEvidence::responseOrderId,
+            OrderSdkEvidence::executionStatusValue,
+            OrderSdkEvidence::executedLots,
+            OrderSdkEvidence::remainingLots)
+        .containsExactly(
+            tuple(sell.toString(), internalId, newStatus.getNumber(), 0L, 0L),
+            tuple(sell.toString(), exchangeId, newStatus.getNumber(), 0L, 1L),
+            tuple(sell.toString(), exchangeId, fillStatus.getNumber(), 1L, 0L));
+
+    attachFeed();
+    bank.emitOrderState(fill);
+    await(() -> countStreamEvidence(attempt) == 4);
+    var trading = app.getBean(TradingService.class);
+    trading.replayOrderEvidence();
+    reconcileFilledSaleByUuid(attempt);
+    assertThat(pausedFor(attempt)).as("after replay and reconciliation").contains(pauseReason);
+    assertSingleSale(openingBuy, sell);
+    assertThat(
+            app.getBean(JdbcTemplate.class)
+                .queryForList(
+                    "select lots from broker_fill where intent_id=?", BigDecimal.class, sell))
+        .singleElement()
+        .satisfies(lots -> assertThat(lots).isEqualByComparingTo(BigDecimal.ONE));
+    assertThat(bank.calls("PostOrder")).hasSize(2); // One opening BUY and one SELL.
+  }
+
+  private Optional<String> pausedFor(OrderRequest attempt) {
+    return app.getBean(ControlService.class).instruments().stream()
+        .filter(i -> i.instrumentId().equals(attempt.instrumentId()) && i.paused())
+        .map(ControlService.InstrumentStatus::reason)
+        .findFirst();
+  }
+
+  private void reconcileFilledSaleByUuid(OrderRequest attempt) {
+    var priorSequence = app.getBean(OrderEvidenceJournal.class).highWater();
+    int priorLookups = bank.calls("GetOrderState").size();
+    app.getBean(TradingService.class).reconcileOnly();
+    assertThat(bank.calls("GetOrderState").stream().skip(priorLookups))
+        .extracting(call -> (ru.tinkoff.piapi.contract.v1.GetOrderStateRequest) call.request())
+        .anyMatch(
+            r ->
+                r.getAccountId().equals(attempt.accountId())
+                    && r.getOrderId().equals(attempt.requestId().toString())
+                    && r.getOrderIdType()
+                        == ru.tinkoff.piapi.contract.v1.OrderIdType.ORDER_ID_TYPE_REQUEST);
+    assertThat(app.getBean(OrderEvidenceJournal.class).history(attempt))
+        .filteredOn(p -> p.sequence() > priorSequence)
+        .extracting(OrderEvidenceJournal.Pending::evidence)
+        .anySatisfy(
+            e -> {
+              assertThat(e.sdkEvidence().source())
+                  .isEqualTo(OrderSdkEvidence.Source.GET_ORDER_STATE);
+              assertThat(e.sdkEvidence().responseRequestId())
+                  .isEqualTo(attempt.requestId().toString());
+              assertThat(e.status()).isEqualTo(OrderStatus.FILLED);
+              assertThat(e.lotsExecuted()).isOne();
+            });
+  }
+
+  private void assertSingleSale(UUID openingBuy, UUID sell) {
+    var copies = app.getBean(CopyService.class);
+    assertThat(copies.intents())
+        .extracting(CopyIntent.View::id)
+        .containsExactlyInAnyOrder(openingBuy, sell);
+    assertThat(copies.intents())
+        .filteredOn(i -> i.side().equals("SELL"))
+        .extracting(
+            CopyIntent.View::id,
+            CopyIntent.View::status,
+            CopyIntent.View::lots,
+            CopyIntent.View::executedLots,
+            CopyIntent.View::skippedLots)
+        .containsExactly(tuple(sell, "FINAL", 1L, 1L, 0L));
+    assertThat(copies.positions())
+        .singleElement()
+        .satisfies(p -> assertThat(p.copiedLots()).isOne());
+  }
+
   private void prepare(boolean automatic) throws Exception {
     var control = app.getBean(ControlService.class);
     control.markReconciled();
@@ -342,6 +486,12 @@ class BuyResourceRejectionWholeChainIT {
   private UUID postSource(
       String tradeId, String sourceOrderId, long lots, BigDecimal price, long fill)
       throws Exception {
+    return postSource(tradeId, sourceOrderId, Side.BUY, lots, price, fill);
+  }
+
+  private UUID postSource(
+      String tradeId, String sourceOrderId, Side side, long lots, BigDecimal price, long fill)
+      throws Exception {
     int postsBefore = bank.calls("PostOrder").size();
     int intentsBefore = app.getBean(CopyService.class).intents().size();
     bank.setNextPostFill(fill);
@@ -350,7 +500,7 @@ class BuyResourceRejectionWholeChainIT {
         WholeChainBrokerSimulator.INSTRUMENT,
         tradeId,
         sourceOrderId,
-        Side.BUY,
+        side,
         lots,
         price,
         clock.instant());
