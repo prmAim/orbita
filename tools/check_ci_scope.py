@@ -16,7 +16,48 @@ def reports_only(paths):
     )
 
 
+def report_link_targets(content):
+    """Read local destinations from the Markdown forms used by acceptance reports."""
+    visible = []
+    fence_character = None
+    fence_size = 0
+    for line in content.splitlines():
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+        if fence_character:
+            if (
+                marker
+                and marker[1][0] == fence_character
+                and len(marker[1]) >= fence_size
+                and not line[marker.end() :].strip()
+            ):
+                fence_character = None
+            continue
+        if marker:
+            fence_character = marker[1][0]
+            fence_size = len(marker[1])
+            continue
+        line = re.sub(r"(?<!`)(`+)(?!`).*?(?<!`)\1(?!`)", "", line)
+        visible.append(line)
+    content = "\n".join(visible)
+
+    inline = re.compile(
+        r"""\]\(\s*(?:<(?P<angle>[^>\r\n]*)>|(?P<plain>[^\s()]+))
+            (?:[ \t]+(?:"[^"\r\n]*"|'[^'\r\n]*'|\([^()\r\n]*\)))?\s*\)""",
+        re.VERBOSE,
+    )
+    reference = re.compile(
+        r"""^[ \t]{0,3}\[[^\]\r\n]+\]:[ \t]*
+            (?:<(?P<angle>[^>\r\n]*)>|(?P<plain>\S+))
+            (?:[ \t]+(?:"[^"\r\n]*"|'[^'\r\n]*'|\([^()\r\n]*\)))?[ \t]*$""",
+        re.VERBOSE | re.MULTILINE,
+    )
+    for pattern in (inline, reference):
+        for match in pattern.finditer(content):
+            yield match.group("angle") or match.group("plain")
+
+
 def check_reports(root):
+    root = root.resolve()
     errors = []
     for path in sorted((root / "docs/acceptance").glob("*.md")):
         if path.is_symlink() or not path.resolve().is_relative_to(root):
@@ -25,7 +66,7 @@ def check_reports(root):
         content = path.read_text(encoding="utf-8")
         if not content.startswith("# "):
             errors.append(f"{path.name}: missing report title")
-        for target in re.findall(r"\]\(([^()\s]+)\)", content):
+        for target in report_link_targets(content):
             url = urlsplit(target)
             if url.scheme or url.netloc or not url.path:
                 continue

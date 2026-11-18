@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import os
 import subprocess
 import sys
@@ -23,15 +24,17 @@ class TargetResultsTests(unittest.TestCase):
         self.env = Mock(java_home=self.run)
         self.env.command.return_value = ["mvn"]
 
-    def report(self, name, tests=1, skipped=0, failures=0):
+    def report(self, name, tests=1, skipped=0, failures=0, errors=0):
         directory = self.run / "targets/surefire-reports"
         directory.mkdir(parents=True, exist_ok=True)
+        outcomes = ["skipped"] * skipped + ["failure"] * failures + ["error"] * errors
         cases = "".join(
-            f'<testcase name="case{i}">{"<skipped/>" if i < skipped else ""}</testcase>'
+            f'<testcase name="case{i}">'
+            f"{f'<{outcomes[i]}/>' if i < len(outcomes) else ''}</testcase>"
             for i in range(tests)
         )
         (directory / f"TEST-{name}.xml").write_text(
-            f'<testsuite name="example.{name}" tests="{tests}" errors="0" failures="{failures}" skipped="{skipped}">{cases}</testsuite>',
+            f'<testsuite name="example.{name}" tests="{tests}" errors="{errors}" failures="{failures}" skipped="{skipped}">{cases}</testsuite>',
             encoding="utf-8",
         )
 
@@ -67,6 +70,17 @@ class TargetResultsTests(unittest.TestCase):
         )
         self.assertEqual("TEST_FAILURE_REVIEW", self.stage(["Fixture"], 1)["outcome"])
 
+    def test_failed_and_errored_cases_are_executed_and_listed(self):
+        self.report("Failed", tests=3, failures=1, errors=1)
+        result = self.stage(["Failed"])
+        self.assertEqual("TEST_FAILURE_REVIEW", result["outcome"])
+        self.assertEqual(
+            dict(executed=3, failures=1, errors=1, skipped=0), result["totals"]
+        )
+        self.assertEqual(
+            ["case0", "case1", "case2"], result["suites"]["example.Failed"]["cases"]
+        )
+
     def test_compilation_and_build_failures_remain_failures(self):
         for log, outcome in [
             (
@@ -84,6 +98,31 @@ class TargetResultsTests(unittest.TestCase):
         self.assertEqual("PASS", self.stage(["example.Good"])["outcome"])
         next((self.run / "targets/surefire-reports").glob("*.xml")).write_text("<")
         self.assertEqual("REPORT_ERROR", self.stage(["Good"])["outcome"])
+
+    def test_child_failure_and_error_cannot_hide_behind_green_suite_counts(self):
+        for name, node in (("Failure", "failure"), ("Error", "error")):
+            with self.subTest(node=node):
+                self.report(name)
+                report = self.run / "targets/surefire-reports" / f"TEST-{name}.xml"
+                report.write_text(
+                    report.read_text(encoding="utf-8").replace(
+                        "</testcase>", f"<{node}/></testcase>"
+                    ),
+                    encoding="utf-8",
+                )
+                self.assertEqual("REPORT_ERROR", self.stage([name])["outcome"])
+                report.unlink()
+
+    def test_conflicting_testcase_outcomes_are_rejected(self):
+        directory = self.run / "targets/surefire-reports"
+        directory.mkdir(parents=True)
+        (directory / "TEST-Conflict.xml").write_text(
+            '<testsuite name="example.Conflict" tests="2" errors="0" failures="1" skipped="1">'
+            '<testcase name="conflict"><failure/><skipped/></testcase>'
+            '<testcase name="clean"/></testsuite>',
+            encoding="utf-8",
+        )
+        self.assertEqual("REPORT_ERROR", self.stage(["Conflict"])["outcome"])
 
 
 class CiScopeTests(unittest.TestCase):
@@ -111,6 +150,37 @@ class CiScopeTests(unittest.TestCase):
             )
             self.assertEqual(
                 ["test.md: broken local link missing.md"],
+                check_ci_scope.check_reports(root),
+            )
+
+    def test_report_links_support_titles_references_and_angle_destinations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            reports = root / "docs/acceptance"
+            reports.mkdir(parents=True)
+            (reports / "existing file.md").write_text("# Linked\n", encoding="utf-8")
+            (reports / "test.md").write_text(
+                "# Report\n\n"
+                '[titled](missing-title.md "link title")\n'
+                "[angle](<missing with spaces.md>)\n"
+                "[existing](<existing file.md>)\n"
+                '[remote](https://example.invalid/missing.md "remote")\n'
+                "[fragment](#missing)\n"
+                "`[inline example](missing-inline.md)`\n"
+                "```markdown\n"
+                "[block example](missing-block.md)\n"
+                "[block reference]: missing-block-reference.md\n"
+                "```\n"
+                "[named][missing]\n"
+                '[missing]: missing-reference.md "reference title"\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                [
+                    "test.md: broken local link missing-title.md",
+                    "test.md: broken local link missing with spaces.md",
+                    "test.md: broken local link missing-reference.md",
+                ],
                 check_ci_scope.check_reports(root),
             )
 
@@ -163,6 +233,65 @@ class CiScopeTests(unittest.TestCase):
                     self.assertEqual(
                         f"full={str(full).lower()}", output.read_text().splitlines()[-1]
                     )
+
+
+class TargetRunnerContextTests(unittest.TestCase):
+    def run_cli(self, root, *, environment, capture_result):
+        root.mkdir(parents=True, exist_ok=True)
+        argv = [
+            "run_target_checks.py",
+            "--build-directory",
+            str(root / ".scratch"),
+            "--it",
+            "Example",
+        ]
+        with (
+            patch.object(runner, "ROOT", root),
+            patch.object(runner, "git", side_effect=["a" * 40, ""]),
+            patch.object(runner, "inspect_environment", return_value=environment),
+            patch.object(runner.shutil, "which", return_value="docker"),
+            patch.object(runner, "capture", capture_result) as probe,
+            patch.object(sys, "argv", argv),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            exit_code = runner.main()
+        summaries = list((root / ".scratch").glob("run-*/summary.json"))
+        self.assertEqual(1, len(summaries))
+        return exit_code, json.loads(summaries[0].read_text(encoding="utf-8")), probe
+
+    def test_docker_context_is_recorded_even_when_preflight_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exit_code, summary, probe = self.run_cli(
+                Path(tmp),
+                environment=None,
+                capture_result=Mock(return_value=(0, "selected-context\n", "")),
+            )
+        self.assertEqual(1, exit_code)
+        self.assertEqual("ENVIRONMENT", summary["outcome"])
+        self.assertEqual("selected-context", summary["docker_context"])
+        probe.assert_called_once_with(["docker", "context", "show"], 5)
+
+    def test_context_probe_failure_does_not_block_valid_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = Mock(java_home=Path(tmp), docker_version="27.0")
+            stage = {
+                "stage": "targets",
+                "outcome": "PASS",
+                "maven_exit": 0,
+                "missing": [],
+                "totals": {},
+            }
+            with patch.object(runner, "maven_stage", return_value=stage) as maven:
+                exit_code, summary, probe = self.run_cli(
+                    Path(tmp),
+                    environment=env,
+                    capture_result=Mock(side_effect=runner.ProbeFailure("TIMEOUT")),
+                )
+        self.assertEqual(0, exit_code)
+        self.assertEqual("PASS", summary["outcome"])
+        self.assertEqual("27.0", summary["docker_version"])
+        probe.assert_called_once_with(["docker", "context", "show"], 5)
+        maven.assert_called_once()
 
 
 class WatchCiTests(unittest.TestCase):

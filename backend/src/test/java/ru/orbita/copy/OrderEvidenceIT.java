@@ -58,8 +58,16 @@ class OrderEvidenceIT {
         false);
     assertThat(evidenceJournal.latestReason(request.requestId())).isEmpty();
     trading.replayOrderEvidence();
-    assertThat(copies.intents().getFirst().executedLots()).isEqualTo(1);
+    assertThat(copies.intents())
+        .singleElement()
+        .satisfies(
+            i -> {
+              assertThat(i.status()).isEqualTo("FINAL");
+              assertThat(i.executedLots()).isEqualTo(1);
+              assertThat(i.skippedLots()).isEqualTo(2);
+            });
     assertThat(count("ORDER_EVIDENCE_RECHECK")).isPositive();
+    assertThat(evidenceJournal.latestReason(request.requestId())).isEmpty();
     assertThat(broker.posts).isEqualTo(1);
   }
 
@@ -283,16 +291,21 @@ class OrderEvidenceIT {
     trading.apply(qualifiedUnary(request, OrderStatus.CANCELLED), false);
     assertThat(count("ORDER_REASON_QUALIFIED")).isEqualTo(1);
     trading.apply(trade(request, "late-resource-fill", 1, "bank-order"), false);
+    assertThat(count("ORDER_REASON_INVALIDATED")).isEqualTo(1);
+    assertThat(
+            evidenceJournal
+                .latestReason(request.requestId())
+                .map(OrderEvidenceJournal.ReasonEvidence::reason))
+        .isEqualTo(Optional.of(RejectionReason.OTHER));
+    assertThat(count("ORDER_EVIDENCE_RECHECK")).isPositive();
     assertThat(copies.intents())
         .singleElement()
         .satisfies(
             i -> {
+              assertThat(i.status()).isEqualTo("FINAL");
               assertThat(i.executedLots()).isEqualTo(1);
               assertThat(i.skippedLots()).isEqualTo(2);
-              assertThat(i.reason()).contains("OTHER", "требуется сверка");
             });
-    assertThat(count("ORDER_REASON_INVALIDATED")).isEqualTo(1);
-    assertThat(count("ORDER_EVIDENCE_RECHECK")).isPositive();
     assertThat(control.instruments())
         .singleElement()
         .satisfies(i -> assertThat(i.paused()).isTrue());
@@ -464,47 +477,7 @@ class OrderEvidenceIT {
   }
 
   private OrderEvidence trade(OrderRequest request, String id, long pieces, String exchangeId) {
-    var raw =
-        new OrderSdkEvidence(
-            OrderSdkEvidence.Source.TRADES_STREAM,
-            "1.51",
-            "f04-a2-v1",
-            null,
-            request.accountId(),
-            exchangeId,
-            null,
-            request.instrumentId(),
-            request.side() == Side.BUY ? 1 : 2,
-            null,
-            false,
-            null,
-            null,
-            null,
-            null,
-            null,
-            List.of(),
-            clock.instant(),
-            null,
-            null,
-            null,
-            List.of(
-                new OrderSdkEvidence.TradeFact(id, pieces, request.limitPrice(), clock.instant())));
-    return new OrderEvidence(
-        null,
-        request.accountId(),
-        null,
-        request.instrumentId(),
-        request.side(),
-        0,
-        0,
-        OrderStatus.UNKNOWN,
-        List.of(),
-        clock.instant(),
-        "synthetic late trade",
-        RejectionReason.NONE,
-        null,
-        null,
-        raw);
+    return OrderEvidenceFixtures.trade(request, id, pieces, exchangeId, clock.instant());
   }
 
   @BeforeEach

@@ -17,6 +17,7 @@ from check_dev_environment import (
     environment_arguments,
     inspect_environment,
 )
+from dev_probe_process import ProbeFailure, capture
 
 B1_UNIT = [
     "BuyResourceRejectionClassifierTest",
@@ -26,6 +27,18 @@ B1_UNIT = [
     "MirrorOrderFeedTlsTest",
 ]
 B1_IT = ["OrderEvidenceIT", "OrderEvidenceRestartIT"]
+
+
+def docker_context(docker_cli, timeout):
+    """Read the selected local context without letting this optional probe block a run."""
+    if not docker_cli:
+        return None
+    try:
+        code, stdout, _ = capture([docker_cli, "context", "show"], timeout)
+    except (ProbeFailure, OSError):
+        return None
+    context = stdout.strip()
+    return context if code == 0 and context else None
 
 
 def test_class(value):
@@ -53,14 +66,31 @@ def verify_reports(directory, selected):
         ):
             raise ValueError(f"invalid counts in {path.name}")
         cases = root.findall("testcase")
-        executed = [
-            case.attrib["name"] for case in cases if case.find("skipped") is None
-        ]
+        outcome_fields = {
+            "failure": "failures",
+            "error": "errors",
+            "skipped": "skipped",
+        }
+        outcomes = {field: 0 for field in outcome_fields.values()}
+        executed = []
+        for case in cases:
+            case_outcomes = [node.tag for node in case if node.tag in outcome_fields]
+            if len(case_outcomes) > 1:
+                raise ValueError(f"conflicting test outcomes in {path.name}")
+            if case_outcomes:
+                outcome = case_outcomes[0]
+                outcomes[outcome_fields[outcome]] += 1
+                if outcome != "skipped":
+                    executed.append(case.attrib["name"])
+            else:
+                executed.append(case.attrib["name"])
         if (
             len(cases) != counts["tests"]
             or len(executed) != counts["tests"] - counts["skipped"]
         ):
             raise ValueError(f"test cases differ from suite totals in {path.name}")
+        if any(outcomes[key] != counts[key] for key in outcomes):
+            raise ValueError(f"test outcomes differ from suite totals in {path.name}")
         counts["executed"] = len(executed)
         counts["cases"] = executed
         counts["report"] = str(path)
@@ -189,19 +219,14 @@ def main():
             contextlib.redirect_stdout(stream),
         ):
             env = inspect_environment(args, require_docker=bool(args.it))
+        if args.it:
+            context = docker_context(summary["docker_cli"], args.timeout)
+            if context:
+                summary["docker_context"] = context
         if env:
             summary.update(
                 java_home=str(env.java_home), docker_version=env.docker_version
             )
-            if args.it:
-                context = subprocess.run(
-                    [summary["docker_cli"], "context", "show"],
-                    capture_output=True,
-                    text=True,
-                    timeout=args.timeout,
-                )
-                if context.returncode == 0:
-                    summary["docker_context"] = context.stdout.strip()
             for label, unit, integration in [
                 ("fixtures", args.fixture, []),
                 ("targets", args.unit, args.it),

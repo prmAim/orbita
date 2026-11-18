@@ -25,7 +25,7 @@ class OrderEvidenceRestartIT {
   @org.junit.jupiter.params.provider.CsvSource({
     "unknown,false", "resource,false", "lot-size,false", "lot-size,true",
     "volume,false", "volume,true", "uuid-less,false", "uuid-less,true",
-    "metadata,false", "metadata,true"
+    "metadata,false", "metadata,true", "trade,false", "trade,true"
   })
   void lostResponseAndCommittedUnappliedEvidenceSurviveNewApplicationContextWithoutSecondPost(
       String scenario, boolean late) {
@@ -34,7 +34,9 @@ class OrderEvidenceRestartIT {
     boolean volume = scenario.equals("volume");
     boolean fill = scenario.equals("uuid-less");
     boolean metadata = scenario.equals("metadata");
-    boolean durableConflict = mismatch || volume || fill;
+    boolean trade = scenario.equals("trade");
+    boolean durableConflict = mismatch || volume || fill || trade;
+    long expectedExecutedLots = fill || trade ? 1 : 0;
     var clock = new CopyLifecycleIT.MutableClock();
     var broker = new CopyLifecycleIT.Simulator(clock);
     OrderRequest request;
@@ -84,6 +86,11 @@ class OrderEvidenceRestartIT {
                 assertThat(i.reservedMoney()).isPositive();
               });
       var db = first.getBean(JdbcTemplate.class);
+      if (trade && !late)
+        trading.apply(
+            OrderEvidenceFixtures.trade(
+                request, "restart-trade-fill", 1, "exchange-id", clock.instant()),
+            false);
       if (resourceReason && (!metadata || late))
         trading.apply(
             OrderEvidenceFixtures.unary(
@@ -93,6 +100,11 @@ class OrderEvidenceRestartIT {
         trading.apply(
             OrderEvidenceFixtures.terminalStream(
                 request, OrderStatus.CANCELLED, "exchange-id", 1, clock.instant()),
+            false);
+      if (trade && late)
+        trading.apply(
+            OrderEvidenceFixtures.trade(
+                request, "restart-trade-fill", 1, "exchange-id", clock.instant()),
             false);
       if (fill) {
         var unlinked =
@@ -121,11 +133,9 @@ class OrderEvidenceRestartIT {
             OrderEvidenceFixtures.stream(
                 request, OrderStatus.NEW, 0, 2, 1, null, "exchange-id", 1, clock.instant()),
             false);
-      db.execute(
-          "create function synthetic_restart_failure() returns trigger language plpgsql as $$ begin if new.category='ORDER_EVIDENCE_APPLIED' then raise exception 'synthetic crash before decision commit'; end if; return new; end $$");
-      db.execute(
-          "create trigger synthetic_restart_failure before insert on journal_entry for each row execute function synthetic_restart_failure()");
       var beforeCrash = copies.intents().getFirst().status();
+      String expectedBeforeCrash = scenario.equals("unknown") ? "UNKNOWN" : "FINAL";
+      assertThat(beforeCrash).isEqualTo(expectedBeforeCrash);
       OrderEvidence receipt;
       if (metadata) {
         receipt =
@@ -138,12 +148,20 @@ class OrderEvidenceRestartIT {
       } else {
         receipt = broker.evidence(request, OrderStatus.CANCELLED, 0);
       }
-      assertThatThrownBy(() -> trading.apply(receipt, false)).isInstanceOf(RuntimeException.class);
-      assertThat(copies.intents())
-          .singleElement()
-          .satisfies(i -> assertThat(i.status()).isEqualTo(beforeCrash));
-      db.execute("drop trigger synthetic_restart_failure on journal_entry");
-      db.execute("drop function synthetic_restart_failure()");
+      try {
+        db.execute(
+            "create function synthetic_restart_failure() returns trigger language plpgsql as $$ begin if new.category='ORDER_EVIDENCE_APPLIED' then raise exception 'synthetic crash before decision commit'; end if; return new; end $$");
+        db.execute(
+            "create trigger synthetic_restart_failure before insert on journal_entry for each row execute function synthetic_restart_failure()");
+        assertThatThrownBy(() -> trading.apply(receipt, false))
+            .isInstanceOf(RuntimeException.class);
+        assertThat(copies.intents())
+            .singleElement()
+            .satisfies(i -> assertThat(i.status()).isEqualTo(beforeCrash));
+      } finally {
+        db.execute("drop trigger if exists synthetic_restart_failure on journal_entry");
+        db.execute("drop function if exists synthetic_restart_failure()");
+      }
     }
     // Every application service, persistence context, readiness latch and clock authority is new.
     // Only the synthetic external broker and PostgreSQL remain alive.
@@ -169,11 +187,29 @@ class OrderEvidenceRestartIT {
       // A pending UUID-less receipt can precede the receipt that establishes its link.
       trading.tick();
       if (durableConflict || metadata) {
-        assertThat(copies.intents().getFirst().executedLots()).isEqualTo(fill ? 1 : 0);
+        assertThat(copies.intents().getFirst().executedLots()).isEqualTo(expectedExecutedLots);
         trading.apply(
             OrderEvidenceFixtures.unary(
                 request, OrderStatus.CANCELLED, "exchange-id", clock.instant()),
             false);
+        var expectedReason =
+            metadata
+                ? Optional.of(RejectionReason.INSUFFICIENT_RESOURCES)
+                : late ? Optional.of(RejectionReason.OTHER) : Optional.empty();
+        assertThat(
+                journal
+                    .latestReason(request.requestId())
+                    .map(OrderEvidenceJournal.ReasonEvidence::reason))
+            .isEqualTo(expectedReason);
+        assertThat(copies.intents())
+            .singleElement()
+            .satisfies(
+                i -> {
+                  assertThat(i.status()).isEqualTo("FINAL");
+                  assertThat(i.executedLots()).isEqualTo(expectedExecutedLots);
+                  assertThat(i.skippedLots()).isEqualTo(3 - expectedExecutedLots);
+                  assertThat(i.reservedMoney()).isPositive();
+                });
         trading.apply(
             OrderEvidenceFixtures.terminalStream(
                 request, OrderStatus.CANCELLED, "exchange-id", 1, clock.instant()),
@@ -186,8 +222,8 @@ class OrderEvidenceRestartIT {
               i -> {
                 assertThat(i.id()).isEqualTo(request.requestId());
                 assertThat(i.status()).isEqualTo("FINAL");
-                assertThat(i.executedLots()).isEqualTo(fill ? 1 : 0);
-                assertThat(i.skippedLots()).isEqualTo(fill ? 2 : 3);
+                assertThat(i.executedLots()).isEqualTo(expectedExecutedLots);
+                assertThat(i.skippedLots()).isEqualTo(3 - expectedExecutedLots);
                 assertThat(i.reservedMoney()).isPositive();
               });
       assertThat(
