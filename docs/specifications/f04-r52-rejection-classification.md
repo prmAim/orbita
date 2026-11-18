@@ -17,7 +17,9 @@ Astra Standards/Spec — 0/0, pre-merge — 0/0/0 открытых замеча�
 [отчёт B1 и ссылки CI](../acceptance/f04-b1-buy-resource-classifier.md), 402 теста,
 frontend, Spotless, Java/TypeScript и Python CI — PASS. Astra Standards/Spec — 0/0,
 pre-merge — 0/0/0 открытых замечаний после исправлений.
-B2 / #38 не начата; HALTED и SELL сохраняют блокировку. Живая приёмка не проводилась.
+Для B2 / #38 подготовлены сквозные проверки окончательного пропуска BUY.
+Их результаты и границы приведены в [отчёте B2](../acceptance/f04-b2-buy-skip-lifecycle.md).
+HALTED и SELL ожидают уточнений API в #39. Живая приёмка отложена.
 
 Нормативные требования остаются в [спецификации #10](https://github.com/prmAim/orbita/issues/10),
 работа относится к [адаптеру #20](https://github.com/prmAim/orbita/issues/20)
@@ -35,7 +37,7 @@ B2 / #38 не начата; HALTED и SELL сохраняют блокировк
 | A1 — доказательства SDK | [#35](https://github.com/prmAim/orbita/issues/35) | CLOSED, main / #42, CI PASS |
 | A2 — поток, долговечность и сверка | [#36](https://github.com/prmAim/orbita/issues/36) | CLOSED, main / #43, CI PASS |
 | B1 — строгий BUY-предикат | [#37](https://github.com/prmAim/orbita/issues/37) | CLOSED, main / #44, CI PASS |
-| B2 — пропуск, резервы и R125 | [#38](https://github.com/prmAim/orbita/issues/38) | #37 выполнена; не начата |
+| B2 — пропуск, резервы и R125 | [#38](https://github.com/prmAim/orbita/issues/38) | Сквозные тесты и [отчёт](../acceptance/f04-b2-buy-skip-lifecycle.md) |
 | Уточнения владельца API | [#39](https://github.com/prmAim/orbita/issues/39) | Внешние сведения, needs-info |
 | C — HALTED | [#40](https://github.com/prmAim/orbita/issues/40) | #39 и #36; needs-info |
 | D — собственные бумаги SELL | [#41](https://github.com/prmAim/orbita/issues/41) | #39 и #38; needs-info |

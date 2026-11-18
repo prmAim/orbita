@@ -284,12 +284,16 @@ class BuyResourceRejectionWholeChainIT {
     app.getBean(TradingService.class).reconcileOnly();
     assertQualifiedReason(requestId, OrderStatus.CANCELLED);
     assertFinalZeroFill(requestId);
+    assertThat(app.getBean(ReconciliationService.class).reconcile()).isTrue();
     var withoutFee = persisted(requestId);
     assertThat(withoutFee.get("broker_order_id")).isEqualTo(bank.brokerOrderId(requestId));
     assertThat(withoutFee.get("consumed_permit_id")).isEqualTo(permitId);
     assertThat(withoutFee.get("actual_commission")).isNull();
+    assertThat((Boolean) withoutFee.get("acceptance_order_reconciled")).isTrue();
+    assertThat((Boolean) withoutFee.get("acceptance_reconciled")).isFalse();
     assertThat((BigDecimal) withoutFee.get("reserved_money"))
         .isEqualByComparingTo(WholeChainBrokerSimulator.COMMISSION.multiply(BigDecimal.valueOf(2)));
+    assertThat(control.status().reconciled()).isTrue();
     assertThat(control.status().permitLimit()).isNull();
     assertThatThrownBy(() -> control.issuePermit(new BigDecimal("10000")))
         .isInstanceOf(IllegalStateException.class);
@@ -304,12 +308,16 @@ class BuyResourceRejectionWholeChainIT {
         () -> {
           var finalEvidence = persisted(requestId);
           return finalEvidence.get("actual_commission") != null
+              && ((BigDecimal) finalEvidence.get("actual_commission")).signum() == 0
               && ((BigDecimal) finalEvidence.get("reserved_money")).signum() == 0;
         });
+    assertThat(app.getBean(ReconciliationService.class).reconcile()).isTrue();
     var withFee = persisted(requestId);
     // The final explicit SDK report independently sets commission to zero after missing data.
     assertThat((BigDecimal) withFee.get("actual_commission")).isEqualByComparingTo(BigDecimal.ZERO);
     assertThat((BigDecimal) withFee.get("reserved_money")).isEqualByComparingTo(BigDecimal.ZERO);
+    assertThat((Boolean) withFee.get("acceptance_order_reconciled")).isTrue();
+    assertThat((Boolean) withFee.get("acceptance_reconciled")).isTrue();
     assertThat(withFee.get("consumed_permit_id")).isEqualTo(permitId);
     assertThat(control.status().permitLimit()).isNull();
     assertThat(control.instruments())
@@ -477,7 +485,7 @@ class BuyResourceRejectionWholeChainIT {
   private java.util.Map<String, Object> persisted(UUID requestId) {
     return app.getBean(JdbcTemplate.class)
         .queryForMap(
-            "select status, executed_lots, skipped_lots, reserved_money, broker_order_id, actual_commission, consumed_permit_id, first_best_opposite from copy_intent where id=?",
+            "select status, executed_lots, skipped_lots, reserved_money, broker_order_id, actual_commission, acceptance_order_reconciled, acceptance_reconciled, consumed_permit_id, first_best_opposite from copy_intent where id=?",
             requestId);
   }
 
