@@ -1,0 +1,4 @@
+[mcp_servers.context7]
+enabled = true
+url = "https://mcp.context7.com/mcp"
+bearer_token_env_var = "KeyToMcpContext7"
