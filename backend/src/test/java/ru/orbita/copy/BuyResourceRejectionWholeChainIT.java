@@ -37,7 +37,12 @@ import ru.tinkoff.piapi.contract.v1.OrderExecutionReportStatus;
 /** Full local TLS and PostgreSQL evidence path. No live broker or account is used. */
 @Testcontainers
 class BuyResourceRejectionWholeChainIT {
-  @Container static final PostgreSQLContainer POSTGRES = new PostgreSQLContainer("postgres:17.11");
+  @Container final PostgreSQLContainer POSTGRES = new PostgreSQLContainer("postgres:17.11");
+
+  private enum PauseScenario {
+    MANUAL,
+    PROTECTED_POSITION_MISMATCH
+  }
 
   private static final BrokerConnectivityEvents NO_EVENTS =
       new BrokerConnectivityEvents() {
@@ -58,7 +63,6 @@ class BuyResourceRejectionWholeChainIT {
     bank = WholeChainBrokerSimulator.open(directory.resolve(UUID.randomUUID().toString()));
     clock = new CopyLifecycleIT.MutableClock();
     app = start();
-    CopyLifecycleIT.reset(app.getBean(JdbcTemplate.class), clock);
   }
 
   @AfterEach
@@ -85,7 +89,7 @@ class BuyResourceRejectionWholeChainIT {
 
     assertFinalZeroFill(requestId);
     var attempt = orderRequest(requestId, 10, new BigDecimal("100"));
-    assertPersistedSdkSources(attempt, expectedStatus, true);
+    assertPersistedSdkSources(attempt, expectedStatus);
     assertQualifiedReason(requestId, expectedStatus);
     assertThat(count("ORDER_REASON_QUALIFIED")).isEqualTo(1);
     assertThat(count("NOTIFICATION_ORDER_FINAL_SKIP")).isEqualTo(1);
@@ -109,26 +113,40 @@ class BuyResourceRejectionWholeChainIT {
     app.getBean(TradingService.class).reconcileOnly();
     assertFinalZeroFill(first);
     var firstAttempt = orderRequest(first, 10, new BigDecimal("100"));
-    assertPersistedSdkSources(firstAttempt, OrderStatus.CANCELLED, true);
+    assertPersistedSdkSources(firstAttempt, OrderStatus.CANCELLED);
     assertQualifiedReason(first, OrderStatus.CANCELLED);
     assertThat(app.getBean(ControlService.class).status().coefficient())
         .isEqualByComparingTo(BigDecimal.ONE);
+    assertThat(app.getBean(BrokerGateway.class).resources(firstAttempt).ownMoney())
+        .isEqualByComparingTo("10000");
+    assertThat((BigDecimal) persisted(first).get("first_best_opposite"))
+        .isEqualByComparingTo("100");
 
-    // Top up the broker resources and change the quote returned by getOrderBook.
+    // Top up the synthetic cash available to the empty mirror account.
     bank.setCapitals(new BigDecimal("10000"), new BigDecimal("20000"));
     bank.setResources(WholeChainBrokerSimulator.INSTRUMENT, new BigDecimal("20000"), 100, 100);
     bank.setQuote(WholeChainBrokerSimulator.INSTRUMENT, new BigDecimal("105"));
+    assertThat(app.getBean(BrokerGateway.class).resources(firstAttempt).ownMoney())
+        .isEqualByComparingTo("20000");
     closeApplication();
-    app = start(); // The static PostgreSQL container and TLS broker survive this context restart.
-    attachFeed();
+    app = start();
+    assertFinalZeroFill(first);
+    assertQualifiedReason(first, OrderStatus.CANCELLED);
     var control = app.getBean(ControlService.class);
-    assertThat(control.status().mode().toString()).isNotEqualTo("AUTOMATIC");
+    assertThat(control.status().mode().toString()).isEqualTo("SHADOW");
     assertThat(control.status().coefficient()).isEqualByComparingTo(BigDecimal.ONE);
+    attachFeed();
     control.issuePermit(new BigDecimal("10000"));
 
     // Replayed source and state events cannot reopen or repost the qualified first attempt.
     bank.emitOrderState(first, 2);
-    bank.replaySource("b03-first-trade");
+    var copies = app.getBean(CopyService.class);
+    var original =
+        copies.remembered(WholeChainBrokerSimulator.SOURCE, "b03-first-trade").orElseThrow();
+    var replayed = copies.accept(original);
+    assertThat(replayed.executionId())
+        .isEqualTo(CopyService.key(original.accountId(), original.tradeId()));
+    assertThat(copies.intents()).hasSize(1);
     await(() -> countStreamEvidence(firstAttempt) >= 2);
     var trading = app.getBean(TradingService.class);
     trading.dispatchReady();
@@ -136,11 +154,13 @@ class BuyResourceRejectionWholeChainIT {
     trading.dispatchReady();
     assertThat(bank.calls("PostOrder")).hasSize(1);
     assertFinalZeroFill(first);
-    assertPersistedSdkSources(firstAttempt, OrderStatus.CANCELLED, true);
+    assertPersistedSdkSources(firstAttempt, OrderStatus.CANCELLED);
     assertQualifiedReason(first, OrderStatus.CANCELLED);
 
     UUID second = postSource("b03-second-trade", "same-source-order", 2, new BigDecimal("110"), 2);
     awaitFinal(second);
+    assertThat((BigDecimal) persisted(second).get("first_best_opposite"))
+        .isEqualByComparingTo("105");
 
     var intents = app.getBean(CopyService.class).intents();
     assertThat(intents).hasSize(2);
@@ -157,15 +177,18 @@ class BuyResourceRejectionWholeChainIT {
               assertThat(intent.executedLots()).isZero();
               assertThat(intent.skippedLots()).isEqualTo(10);
             });
+    assertThat(intents)
+        .anySatisfy(
+            intent -> {
+              assertThat(intent.id()).isEqualTo(second);
+              assertThat(intent.status()).isEqualTo("FINAL");
+              assertThat(intent.executedLots()).isEqualTo(2);
+              assertThat(intent.skippedLots()).isZero();
+            });
     assertThat(bank.calls("PostOrder"))
         .extracting(call -> ((ru.tinkoff.piapi.contract.v1.PostOrderRequest) call.request()))
         .extracting(ru.tinkoff.piapi.contract.v1.PostOrderRequest::getQuantity)
         .containsExactly(10L, 2L);
-    var posted =
-        bank.calls("PostOrder").stream()
-            .map(call -> (ru.tinkoff.piapi.contract.v1.PostOrderRequest) call.request())
-            .toList();
-    assertThat(price(posted.get(0))).isNotEqualByComparingTo(price(posted.get(1)));
     assertThat(count("NOTIFICATION_ORDER_FINAL_SKIP")).isEqualTo(1);
   }
 
@@ -182,14 +205,19 @@ class BuyResourceRejectionWholeChainIT {
     assertThat(app.getBean(OrderEvidenceJournal.class).latestReason(requestId)).isEmpty();
     assertThat(count("NOTIFICATION_ORDER_FINAL_SKIP")).isEqualTo(1);
     var attempt = orderRequest(requestId, 10, new BigDecimal("100"));
-    assertThat(evidenceHistory(attempt))
-        .anySatisfy(
-            evidence -> {
-              assertThat(evidence.sdkEvidence().source())
-                  .isEqualTo(OrderSdkEvidence.Source.GET_ORDER_STATE);
-              assertThat(evidence.status()).isEqualTo(OrderStatus.CANCELLED);
-              assertThat(evidence.rejectionReason()).isEqualTo(RejectionReason.OTHER);
-            });
+    var journal = app.getBean(OrderEvidenceJournal.class);
+    long originalUnarySequence =
+        journal.history(attempt).stream()
+            .filter(
+                pending -> {
+                  var evidence = pending.evidence();
+                  return evidence.sdkEvidence().source() == OrderSdkEvidence.Source.GET_ORDER_STATE
+                      && evidence.status() == OrderStatus.CANCELLED
+                      && evidence.rejectionReason() == RejectionReason.OTHER;
+                })
+            .findFirst()
+            .orElseThrow()
+            .sequence();
 
     bank.emitOrderState(requestId, 2);
     bank.emitOrderState(requestId, 2);
@@ -205,21 +233,40 @@ class BuyResourceRejectionWholeChainIT {
 
     assertFinalZeroFill(requestId);
     assertQualifiedReason(requestId, OrderStatus.CANCELLED);
+    var retainedUnary =
+        journal.history(attempt).stream()
+            .filter(pending -> pending.sequence() == originalUnarySequence)
+            .findFirst()
+            .orElseThrow()
+            .evidence();
+    assertThat(retainedUnary.sdkEvidence().source())
+        .isEqualTo(OrderSdkEvidence.Source.GET_ORDER_STATE);
+    assertThat(retainedUnary.status()).isEqualTo(OrderStatus.CANCELLED);
+    assertThat(retainedUnary.rejectionReason()).isEqualTo(RejectionReason.OTHER);
+    assertThat(journal.latestReason(requestId).orElseThrow().receipts())
+        .contains(originalUnarySequence);
     assertThat(count("ORDER_REASON_QUALIFIED")).isEqualTo(1);
     assertThat(count("ORDER_REASON_INVALIDATED")).isZero();
     assertThat(count("NOTIFICATION_ORDER_FINAL_SKIP")).isEqualTo(1);
     assertThat(bank.calls("PostOrder")).hasSize(1);
   }
 
-  @Test
-  void b05HoldsFeeReserveAndConsumedPermitUntilIndependentFeeEvidence() throws Exception {
+  @ParameterizedTest
+  @EnumSource(PauseScenario.class)
+  void b05HoldsFeeReserveAndConsumedPermitUntilIndependentFeeEvidence(PauseScenario scenario)
+      throws Exception {
     prepare(false);
     var control = app.getBean(ControlService.class);
     UUID permitId = control.gate().permitId();
     assertThat(permitId).isNotNull();
     bank.setFinalCommissionAvailable(false);
     UUID requestId = postSource("b05-trade", "b05-order", 10, new BigDecimal("100"), 0);
-    control.pauseInstrument(WholeChainBrokerSimulator.INSTRUMENT, "owner manual protection");
+    if (scenario == PauseScenario.MANUAL) {
+      control.pauseInstrument(WholeChainBrokerSimulator.INSTRUMENT, "owner manual protection");
+    } else {
+      control.instrumentReconciled(
+          WholeChainBrokerSimulator.INSTRUMENT, false, false, "protected position mismatch");
+    }
 
     bank.cancelWithoutStream(requestId);
     bank.emitOrderState(requestId, 2);
@@ -235,6 +282,8 @@ class BuyResourceRejectionWholeChainIT {
         .isEqualByComparingTo("2"); // Principal released; fee and additional reserve remain.
 
     app.getBean(TradingService.class).reconcileOnly();
+    assertQualifiedReason(requestId, OrderStatus.CANCELLED);
+    assertFinalZeroFill(requestId);
     var withoutFee = persisted(requestId);
     assertThat(withoutFee.get("broker_order_id")).isEqualTo(bank.brokerOrderId(requestId));
     assertThat(withoutFee.get("consumed_permit_id")).isEqualTo(permitId);
@@ -326,8 +375,7 @@ class BuyResourceRejectionWholeChainIT {
     assertThat(((Number) persisted(requestId).get("skipped_lots")).longValue()).isEqualTo(10);
   }
 
-  private void assertPersistedSdkSources(
-      OrderRequest attempt, OrderStatus expectedStatus, boolean requireUnary) {
+  private void assertPersistedSdkSources(OrderRequest attempt, OrderStatus expectedStatus) {
     var history = evidenceHistory(attempt);
     assertThat(history)
         .anySatisfy(
@@ -349,37 +397,33 @@ class BuyResourceRejectionWholeChainIT {
               assertThat(sdk.remainingLots()).isZero();
               assertThat(sdk.cancelledLots()).isEqualTo(attempt.lots());
             });
-    if (requireUnary)
-      assertThat(history)
-          .anySatisfy(
-              evidence -> {
-                var sdk = evidence.sdkEvidence();
-                assertThat(sdk.source()).isEqualTo(OrderSdkEvidence.Source.GET_ORDER_STATE);
-                assertThat(evidence.status()).isEqualTo(expectedStatus);
-                assertThat(evidence.rejectionReason()).isEqualTo(RejectionReason.OTHER);
-                assertThat(sdk.responseRequestId()).isEqualTo(attempt.requestId().toString());
-                assertThat(sdk.responseOrderId())
-                    .isEqualTo(bank.brokerOrderId(attempt.requestId()));
-                assertThat(sdk.executionStatusValue())
-                    .isEqualTo(expectedStatusValue(expectedStatus));
-                assertThat(sdk.requestedLots()).isEqualTo(attempt.lots());
-                assertThat(sdk.executedLots()).isZero();
-              });
+    assertThat(history)
+        .anySatisfy(
+            evidence -> {
+              var sdk = evidence.sdkEvidence();
+              assertThat(sdk.source()).isEqualTo(OrderSdkEvidence.Source.GET_ORDER_STATE);
+              assertThat(evidence.status()).isEqualTo(expectedStatus);
+              assertThat(evidence.rejectionReason()).isEqualTo(RejectionReason.OTHER);
+              assertThat(sdk.responseRequestId()).isEqualTo(attempt.requestId().toString());
+              assertThat(sdk.responseOrderId()).isEqualTo(bank.brokerOrderId(attempt.requestId()));
+              assertThat(sdk.executionStatusValue()).isEqualTo(expectedStatusValue(expectedStatus));
+              assertThat(sdk.requestedLots()).isEqualTo(attempt.lots());
+              assertThat(sdk.executedLots()).isZero();
+            });
     assertThat(bank.calls("PostOrder"))
         .anySatisfy(
             call -> {
               var post = (ru.tinkoff.piapi.contract.v1.PostOrderRequest) call.request();
               assertThat(post.getOrderId()).isEqualTo(attempt.requestId().toString());
             });
-    if (requireUnary)
-      assertThat(bank.calls("GetOrderState"))
-          .anySatisfy(
-              call -> {
-                var lookup = (ru.tinkoff.piapi.contract.v1.GetOrderStateRequest) call.request();
-                assertThat(lookup.getOrderId()).isEqualTo(attempt.requestId().toString());
-                assertThat(lookup.getOrderIdType())
-                    .isEqualTo(ru.tinkoff.piapi.contract.v1.OrderIdType.ORDER_ID_TYPE_REQUEST);
-              });
+    assertThat(bank.calls("GetOrderState"))
+        .anySatisfy(
+            call -> {
+              var lookup = (ru.tinkoff.piapi.contract.v1.GetOrderStateRequest) call.request();
+              assertThat(lookup.getOrderId()).isEqualTo(attempt.requestId().toString());
+              assertThat(lookup.getOrderIdType())
+                  .isEqualTo(ru.tinkoff.piapi.contract.v1.OrderIdType.ORDER_ID_TYPE_REQUEST);
+            });
   }
 
   private List<OrderEvidence> evidenceHistory(OrderRequest attempt) {
@@ -433,7 +477,7 @@ class BuyResourceRejectionWholeChainIT {
   private java.util.Map<String, Object> persisted(UUID requestId) {
     return app.getBean(JdbcTemplate.class)
         .queryForMap(
-            "select status, executed_lots, skipped_lots, reserved_money, broker_order_id, actual_commission, consumed_permit_id from copy_intent where id=?",
+            "select status, executed_lots, skipped_lots, reserved_money, broker_order_id, actual_commission, consumed_permit_id, first_best_opposite from copy_intent where id=?",
             requestId);
   }
 
@@ -517,10 +561,5 @@ class BuyResourceRejectionWholeChainIT {
     long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
     while (!condition.getAsBoolean() && System.nanoTime() < deadline) Thread.sleep(10);
     assertThat(condition.getAsBoolean()).isTrue();
-  }
-
-  private static BigDecimal price(ru.tinkoff.piapi.contract.v1.PostOrderRequest request) {
-    var quotation = request.getPrice();
-    return BigDecimal.valueOf(quotation.getUnits()).add(BigDecimal.valueOf(quotation.getNano(), 9));
   }
 }
