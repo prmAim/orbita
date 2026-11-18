@@ -48,20 +48,13 @@ class CopyLifecycleIT {
 
   static void reset(
       org.springframework.jdbc.core.JdbcTemplate db, Simulator broker, MutableClock clock) {
-    db.execute(
-        "truncate broker_fill,copy_intent,source_execution,incoming_receipt,mirror_position,mirror_trade_receipt,instrument_state,journal_entry,notification_attempt,notification restart identity cascade");
-    db.update(
-        "update control_state set mode='NOT_STARTED',coefficient=null,ratio_numerator=null,ratio_denominator=null,active_capital_candidate_id=null,observation_boundary=null,resume_boundary=null,observation_boundary_trusted=false,resume_boundary_trusted=false,observation_activated=false,automatic_boundary=null,permit_limit=null,permit_issued_at=null,permit_id=null,permit_epoch=0,first_acceptance=true,live_accepted=false,reconciled=false,feed_ready=false,shadow_version=null,shadow_buy_checked=false,shadow_sell_checked=false,recalculation_paused=false,attempt_id=null,attempt_kind=null,generation=0,completed_due=null,retry_at=null,last_error=null,pause_started_at=null,failed_attempts=0 where id=1");
-    clock.now = Instant.parse("2026-11-15T10:00:00Z");
-    clock.evidenceAvailable = true;
-    clock.nextEvidence = null;
+    reset(db, clock);
     broker.posts = 0;
     broker.capitalCalls = 0;
     broker.capitalHook = null;
     broker.capitalResponse = null;
     broker.afterPostHook = null;
     broker.afterReconcileHook = null;
-    clock.receiptInstants.clear();
     broker.resourcesHook = null;
     broker.blockPurchases = false;
     broker.settlementCurrency = "RUB";
@@ -88,6 +81,19 @@ class CopyLifecycleIT {
     broker.individualLotFills = false;
     broker.sourceCash = new BigDecimal("100");
     broker.mirrorCash = new BigDecimal("100");
+  }
+
+  static void reset(org.springframework.jdbc.core.JdbcTemplate db, MutableClock clock) {
+    db.execute(
+        "truncate broker_fill,copy_intent,source_execution,incoming_receipt,mirror_position,mirror_trade_receipt,instrument_state,journal_entry,notification_attempt,notification restart identity cascade");
+    // Restore the singleton removed by the notification cascade.
+    db.update("insert into broker_connectivity(singleton) values(true) on conflict do nothing");
+    db.update(
+        "update control_state set mode='NOT_STARTED',coefficient=null,ratio_numerator=null,ratio_denominator=null,active_capital_candidate_id=null,observation_boundary=null,resume_boundary=null,observation_boundary_trusted=false,resume_boundary_trusted=false,observation_activated=false,automatic_boundary=null,permit_limit=null,permit_issued_at=null,permit_id=null,permit_epoch=0,first_acceptance=true,live_accepted=false,reconciled=false,feed_ready=false,shadow_version=null,shadow_buy_checked=false,shadow_sell_checked=false,recalculation_paused=false,attempt_id=null,attempt_kind=null,generation=0,completed_due=null,retry_at=null,last_error=null,pause_started_at=null,failed_attempts=0 where id=1");
+    clock.now = Instant.parse("2026-11-15T10:00:00Z");
+    clock.evidenceAvailable = true;
+    clock.nextEvidence = null;
+    clock.receiptInstants.clear();
   }
 
   @Test

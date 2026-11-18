@@ -72,6 +72,31 @@ class CopyCalculationTest {
   }
 
   @Test
+  void skippedTenLotsRemainInSameSourceOrderTargetWhenTwoMoreLotsArrive() {
+    var calculation = new CopyCalculation();
+    var first =
+        calculation.accept(
+            "first-trade",
+            "same-source-order",
+            BigDecimal.TEN,
+            BigDecimal.ONE,
+            new BigDecimal("100"),
+            Instant.EPOCH);
+    var next =
+        calculation.accept(
+            "next-trade",
+            "same-source-order",
+            BigDecimal.valueOf(2),
+            BigDecimal.ONE,
+            new BigDecimal("110"),
+            Instant.EPOCH.plusSeconds(1));
+
+    assertThat(first.newLots()).isEqualTo(10);
+    assertThat(next.newLots()).isEqualTo(2);
+    assertThat(next.targetLots()).isEqualTo(12);
+  }
+
+  @Test
   void twoPointSevenTwiceMakesTwoThenThreeAndRevaluationDoesNotChangeOldContributions() {
     var fractional = new CopyCalculation();
     assertThat(

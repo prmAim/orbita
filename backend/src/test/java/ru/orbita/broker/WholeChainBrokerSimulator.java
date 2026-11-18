@@ -65,7 +65,7 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
   private final Map<String, ExternalOrder> externalOrders = new LinkedHashMap<>();
   private final Set<UUID> unavailableRequestLookups = new HashSet<>(),
       lostCancelResponses = new HashSet<>();
-  private boolean cashEnabled, loseNextPost;
+  private boolean cashEnabled, loseNextPost, finalCommissionAvailable = true;
   private final List<StreamObserver<PositionsStreamResponse>> cashStreams =
       new CopyOnWriteArrayList<>();
 
@@ -79,11 +79,13 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
   private final Map<PositionKey, Long> positions = new HashMap<>();
   private final Map<String, Resources> resources = new LinkedHashMap<>();
   private final Map<String, BigDecimal> capitals = new HashMap<>();
+  private final Map<String, BigDecimal> quoteOverrides = new ConcurrentHashMap<>();
   private final List<StreamObserver<TradesStreamResponse>> streams = new CopyOnWriteArrayList<>();
   private final List<StreamObserver<TradesStreamResponse>> mirrorTrades =
       new CopyOnWriteArrayList<>();
   private final List<StreamObserver<OrderStateStreamResponse>> mirrorStates =
       new CopyOnWriteArrayList<>();
+  private final BlockingQueue<Boolean> mirrorStateSubscriptions = new LinkedBlockingQueue<>();
   private final BlockingQueue<Boolean> subscriptions = new LinkedBlockingQueue<>();
   private final ScheduledExecutorService heartbeat =
       Executors.newSingleThreadScheduledExecutor(
@@ -221,6 +223,10 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
     return subscriptions.poll(timeout.toMillis(), TimeUnit.MILLISECONDS) != null;
   }
 
+  public boolean awaitMirrorOrderSubscription(Duration timeout) throws InterruptedException {
+    return mirrorStateSubscriptions.poll(timeout.toMillis(), TimeUnit.MILLISECONDS) != null;
+  }
+
   public synchronized void setCapitals(BigDecimal source, BigDecimal mirror) {
     positive(source);
     positive(mirror);
@@ -251,6 +257,10 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
     checkInstrument(instrument);
     if (lots < 0) throw new IllegalArgumentException("Nonnegative fill required");
     resources.get(instrument).nextFill = lots;
+  }
+
+  public synchronized void setFinalCommissionAvailable(boolean available) {
+    finalCommissionAvailable = available;
   }
 
   public synchronized void enableCashCurrencies() {
@@ -513,6 +523,55 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
     fill(requireOrder(requestId), additionalLots, at);
   }
 
+  private static boolean terminalWithoutFill(OrderExecutionReportStatus status) {
+    return status == OrderExecutionReportStatus.EXECUTION_REPORT_STATUS_CANCELLED
+        || status == OrderExecutionReportStatus.EXECUTION_REPORT_STATUS_REJECTED;
+  }
+
+  public synchronized void cancelWithoutStream(UUID requestId) {
+    finishWithoutStream(requestId, OrderExecutionReportStatus.EXECUTION_REPORT_STATUS_CANCELLED);
+  }
+
+  public synchronized void finishWithoutStream(UUID requestId, OrderExecutionReportStatus status) {
+    if (status != OrderExecutionReportStatus.EXECUTION_REPORT_STATUS_CANCELLED
+        && status != OrderExecutionReportStatus.EXECUTION_REPORT_STATUS_REJECTED)
+      throw new IllegalArgumentException("A terminal cancel or reject status is required");
+    requireOrder(requestId).status = status;
+  }
+
+  public void setQuote(String instrument, BigDecimal price) {
+    checkInstrument(instrument);
+    positive(price);
+    quoteOverrides.put(instrument, price);
+  }
+
+  public synchronized void emitOrderState(UUID requestId, Integer cause) {
+    var order = requireOrder(requestId);
+    var state =
+        OrderStateStreamResponse.OrderState.newBuilder()
+            .setAccountId(MIRROR)
+            .setOrderRequestId(order.request.getOrderId())
+            .setOrderId("TEST-INTERNAL-" + order.request.getOrderId())
+            .setTradeOrderId(order.bankId)
+            .setInstrumentUid(order.request.getInstrumentId())
+            .setDirection(order.request.getDirection())
+            .setLotSize(1)
+            .setLotsRequested(order.request.getQuantity())
+            .setLotsExecuted(order.filled())
+            .setLotsLeft(
+                terminalWithoutFill(order.status)
+                    ? 0
+                    : order.request.getQuantity() - order.filled())
+            .setLotsCancelled(
+                terminalWithoutFill(order.status)
+                    ? order.request.getQuantity() - order.filled()
+                    : 0)
+            .setExecutionReportStatus(order.status);
+    if (cause != null) state.setStatusInfoValue(cause);
+    var observation = OrderStateStreamResponse.newBuilder().setOrderState(state).build();
+    for (var out : mirrorStates) out.onNext(observation);
+  }
+
   private void addExecution(Execution execution) {
     long delta = execution.side() == BrokerGateway.Side.BUY ? execution.lots() : -execution.lots();
     var key = new PositionKey(execution.account(), execution.instrument());
@@ -610,8 +669,9 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
               .setDirection(request.getDirection())
               .setLotsRequested(request.getQuantity())
               .setLotsExecuted(filled())
-              .setExecutionReportStatus(status)
-              .setExecutedCommission(money(filled() > 0 ? COMMISSION : BigDecimal.ZERO));
+              .setExecutionReportStatus(status);
+      if (finalCommissionAvailable)
+        state.setExecutedCommission(money(filled() > 0 ? COMMISSION : BigDecimal.ZERO));
       if (dateConfirmed) state.setOrderDate(TInvestBrokerGateway.timestamp(created));
       for (var fill : fills)
         state.addStages(
@@ -794,21 +854,20 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
       public void getOrderBook(
           GetOrderBookRequest request, StreamObserver<GetOrderBookResponse> out) {
         checkInstrument(request.getInstrumentId());
+        var quote =
+            quoteOverrides.getOrDefault(
+                request.getInstrumentId(), security(request.getInstrumentId()).price());
         reply(
             out,
             GetOrderBookResponse.newBuilder()
                 .setInstrumentUid(request.getInstrumentId())
                 .addAsks(
                     Order.newBuilder()
-                        .setPrice(
-                            TInvestBrokerGateway.quotation(
-                                security(request.getInstrumentId()).price()))
+                        .setPrice(TInvestBrokerGateway.quotation(quote))
                         .setQuantity(100))
                 .addBids(
                     Order.newBuilder()
-                        .setPrice(
-                            TInvestBrokerGateway.quotation(
-                                security(request.getInstrumentId()).price()))
+                        .setPrice(TInvestBrokerGateway.quotation(quote))
                         .setQuantity(100))
                 .build());
       }
@@ -1026,6 +1085,7 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
             return;
           }
           mirrorStates.add(out);
+          mirrorStateSubscriptions.add(true);
           if (out instanceof ServerCallStreamObserver<OrderStateStreamResponse> server)
             server.setOnCancelHandler(() -> mirrorStates.remove(out));
           out.onNext(
