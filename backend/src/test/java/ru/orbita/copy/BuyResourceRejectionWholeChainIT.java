@@ -370,10 +370,14 @@ class BuyResourceRejectionWholeChainIT {
     await(() -> pausedFor(attempt).isPresent());
     var pauseReason = pausedFor(attempt).orElseThrow();
     assertThat(count("ORDER_EVIDENCE_CONTRADICTION")).isOne();
+    assertThat(persisted(sell).get("status")).isEqualTo("UNKNOWN");
     bank.emitOrderState(secondNew);
+    await(() -> "ACTIVE".equals(persisted(sell).get("status")));
+    assertThat(count("ORDER_EVIDENCE_CONTRADICTION")).isOne();
     bank.fillOrder(sell, 1, clock.instant());
     bank.emitOrderState(fill);
     awaitFinal(sell);
+    assertSingleSale(openingBuy, sell);
     assertThat(pausedFor(attempt)).as("after stream FILL").contains(pauseReason);
     reconcileFilledSaleByUuid(attempt);
     assertThat(pausedFor(attempt)).as("after confirmed FILL by UUID").contains(pauseReason);
