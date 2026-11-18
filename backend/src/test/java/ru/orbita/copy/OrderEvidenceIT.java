@@ -21,6 +21,7 @@ import ru.orbita.control.*;
     })
 @Import(CopyLifecycleIT.Fixture.class)
 class OrderEvidenceIT {
+  @Autowired OrderEvidenceJournal evidenceJournal;
   @Autowired CopyService copies;
   @Autowired TradingService trading;
   @Autowired ControlService control;
@@ -39,13 +40,34 @@ class OrderEvidenceIT {
     var unlinked =
         new OrderRequest("mirror", null, request.instrumentId(), Side.BUY, 3, request.limitPrice());
     trading.apply(
-        state(unlinked, OrderStatus.PARTIALLY_FILLED, 1, 2, 0, null, "bank-order"), false);
+        OrderEvidenceFixtures.stream(
+            unlinked,
+            OrderStatus.PARTIALLY_FILLED,
+            1,
+            2,
+            0,
+            null,
+            "bank-order",
+            1,
+            clock.instant()),
+        false);
     trading.apply(qualifiedUnary(request, OrderStatus.CANCELLED), false);
-    trading.apply(state(request, OrderStatus.CANCELLED, 0, 0, 3, 2, "bank-order"), false);
-    assertThat(count("ORDER_REASON_QUALIFIED")).isZero();
+    trading.apply(
+        OrderEvidenceFixtures.terminalStream(
+            request, OrderStatus.CANCELLED, "bank-order", 1, clock.instant()),
+        false);
+    assertThat(evidenceJournal.latestReason(request.requestId())).isEmpty();
     trading.replayOrderEvidence();
-    assertThat(copies.intents().getFirst().executedLots()).isEqualTo(1);
+    assertThat(copies.intents())
+        .singleElement()
+        .satisfies(
+            i -> {
+              assertThat(i.status()).isEqualTo("FINAL");
+              assertThat(i.executedLots()).isEqualTo(1);
+              assertThat(i.skippedLots()).isEqualTo(2);
+            });
     assertThat(count("ORDER_EVIDENCE_RECHECK")).isPositive();
+    assertThat(evidenceJournal.latestReason(request.requestId())).isEmpty();
     assertThat(broker.posts).isEqualTo(1);
   }
 
@@ -54,7 +76,10 @@ class OrderEvidenceIT {
       strings = {"same-ids", "foreign-account", "other-exchange"})
   void lateStateWithoutUuidRevokesOnlyAfterExactOwnIdLink(String relation) {
     var request = send(3, 1);
-    trading.apply(state(request, OrderStatus.CANCELLED, 0, 0, 3, 2, "bank-order"), false);
+    trading.apply(
+        OrderEvidenceFixtures.terminalStream(
+            request, OrderStatus.CANCELLED, "bank-order", 1, clock.instant()),
+        false);
     trading.apply(qualifiedUnary(request, OrderStatus.CANCELLED), false);
     assertThat(count("ORDER_REASON_QUALIFIED")).isEqualTo(1);
     var unlinked =
@@ -66,14 +91,16 @@ class OrderEvidenceIT {
             3,
             request.limitPrice());
     trading.apply(
-        state(
+        OrderEvidenceFixtures.stream(
             unlinked,
             OrderStatus.PARTIALLY_FILLED,
             1,
             2,
             0,
             null,
-            relation.equals("other-exchange") ? "unrelated-order" : "bank-order"),
+            relation.equals("other-exchange") ? "unrelated-order" : "bank-order",
+            1,
+            clock.instant()),
         false);
     assertThat(count("ORDER_REASON_INVALIDATED")).isEqualTo(relation.equals("same-ids") ? 1 : 0);
     assertThat(copies.intents().getFirst().executedLots())
@@ -100,7 +127,7 @@ class OrderEvidenceIT {
     assertThat(count("ORDER_EVIDENCE_CONTRADICTION")).isPositive();
     trading.apply(qualifiedUnary(request, OrderStatus.REJECTED), false);
     trading.apply(state(request, OrderStatus.REJECTED, 0, 0, 3, 2, "bank-order"), false);
-    assertThat(count("ORDER_REASON_QUALIFIED")).isZero();
+    assertThat(evidenceJournal.latestReason(request.requestId())).isEmpty();
     assertThat(broker.posts).isEqualTo(1);
   }
 
@@ -111,7 +138,7 @@ class OrderEvidenceIT {
   void exactDurableBuyEvidenceRefinesReasonOnceWithoutChangingOutcome(OrderStatus status) {
     var request = send(3);
     trading.apply(qualifiedUnary(request, status), false);
-    assertThat(count("ORDER_REASON_QUALIFIED")).isZero();
+    assertThat(evidenceJournal.latestReason(request.requestId())).isEmpty();
     trading.apply(state(request, status, 0, 0, 3, 2, "bank-order"), false);
     trading.apply(state(request, status, 0, 0, 3, 2, "bank-order"), false);
     trading.apply(state(request, status, 0, 0, 3, null, "bank-order"), false);
@@ -150,9 +177,9 @@ class OrderEvidenceIT {
       trading.apply(state(request, OrderStatus.CANCELLED, 0, 0, 3, 2, "bank-order"), false);
       assertThat(count("ORDER_REASON_QUALIFIED")).isEqualTo(1);
     }
-    broker.instrumentLotSize = 20;
-    var mismatch = state(request, OrderStatus.CANCELLED, 0, 0, 3, 2, "bank-order");
-    broker.instrumentLotSize = 10;
+    var mismatch =
+        OrderEvidenceFixtures.terminalStream(
+            request, OrderStatus.CANCELLED, "bank-order", 20, clock.instant());
     trading.apply(mismatch, false);
     assertThat(count("ORDER_REASON_QUALIFIED")).isEqualTo(alreadyQualified ? 1 : 0);
     assertThat(count("ORDER_REASON_INVALIDATED")).isEqualTo(alreadyQualified ? 1 : 0);
@@ -168,12 +195,15 @@ class OrderEvidenceIT {
               assertThat(i.status()).isEqualTo("FINAL");
               assertThat(i.executedLots()).isZero();
               assertThat(i.skippedLots()).isEqualTo(3);
-              assertThat(i.reason())
-                  .isNotEqualTo("нехватка средств; подтверждена потоком состояний");
             });
     assertThat(control.instruments())
         .singleElement()
         .satisfies(i -> assertThat(i.paused()).isTrue());
+    assertThat(
+            evidenceJournal
+                .latestReason(request.requestId())
+                .map(OrderEvidenceJournal.ReasonEvidence::reason))
+        .isEqualTo(alreadyQualified ? Optional.of(RejectionReason.OTHER) : Optional.empty());
     assertThat(count("ORDER_EVIDENCE_CONTRADICTION")).isPositive();
     assertThat(count("NOTIFICATION_ORDER_FINAL_SKIP")).isEqualTo(1);
     assertThat(broker.posts).isEqualTo(1);
@@ -209,6 +239,11 @@ class OrderEvidenceIT {
             });
     assertThat(count("ORDER_REASON_QUALIFIED")).isEqualTo(qualified ? 1 : 0);
     assertThat(count("ORDER_REASON_INVALIDATED")).isEqualTo(qualified ? 1 : 0);
+    assertThat(
+            evidenceJournal
+                .latestReason(request.requestId())
+                .map(OrderEvidenceJournal.ReasonEvidence::reason))
+        .isEqualTo(qualified ? Optional.of(RejectionReason.OTHER) : Optional.empty());
     if (qualified)
       assertThat(copies.intents().getFirst().reason())
           .contains("OTHER", "независимый размер лота недоступен", "требуется сверка")
@@ -238,70 +273,39 @@ class OrderEvidenceIT {
               assertThat(i.executedLots()).isEqualTo(3);
               assertThat(i.skippedLots()).isZero();
             });
-    assertThat(count("ORDER_REASON_QUALIFIED")).isZero();
+    assertThat(evidenceJournal.latestReason(request.requestId())).isEmpty();
     assertThat(broker.posts).isEqualTo(1);
   }
 
   private OrderEvidence qualifiedUnary(OrderRequest request, OrderStatus status) {
-    var raw =
-        new OrderSdkEvidence(
-            OrderSdkEvidence.Source.GET_ORDER_STATE,
-            "1.51",
-            "f04-a1-v1",
-            request.requestId().toString(),
-            null,
-            "bank-order",
-            null,
-            request.instrumentId(),
-            request.side() == Side.BUY ? 1 : 2,
-            status == OrderStatus.REJECTED ? 2 : 3,
-            false,
-            null,
-            request.lots(),
-            0L,
-            null,
-            null,
-            List.of(),
-            clock.instant(),
-            null,
-            null,
-            null,
-            List.of());
-    return new OrderEvidence(
-        request.requestId(),
-        request.accountId(),
-        "bank-order",
-        request.instrumentId(),
-        request.side(),
-        request.lots(),
-        0,
-        status,
-        List.of(),
-        clock.instant(),
-        "independent REQUEST lookup",
-        RejectionReason.OTHER,
-        null,
-        null,
-        raw);
+    return OrderEvidenceFixtures.unary(request, status, "bank-order", clock.instant());
   }
 
   @Test
   void lateTradeInvalidatesQualifiedZeroAndKeepsItsExecutionForReconciliation() {
     var request = send(3, 1);
-    trading.apply(state(request, OrderStatus.CANCELLED, 0, 0, 3, 2, "bank-order"), false);
+    trading.apply(
+        OrderEvidenceFixtures.terminalStream(
+            request, OrderStatus.CANCELLED, "bank-order", 1, clock.instant()),
+        false);
     trading.apply(qualifiedUnary(request, OrderStatus.CANCELLED), false);
     assertThat(count("ORDER_REASON_QUALIFIED")).isEqualTo(1);
     trading.apply(trade(request, "late-resource-fill", 1, "bank-order"), false);
+    assertThat(count("ORDER_REASON_INVALIDATED")).isEqualTo(1);
+    assertThat(
+            evidenceJournal
+                .latestReason(request.requestId())
+                .map(OrderEvidenceJournal.ReasonEvidence::reason))
+        .isEqualTo(Optional.of(RejectionReason.OTHER));
+    assertThat(count("ORDER_EVIDENCE_RECHECK")).isPositive();
     assertThat(copies.intents())
         .singleElement()
         .satisfies(
             i -> {
+              assertThat(i.status()).isEqualTo("FINAL");
               assertThat(i.executedLots()).isEqualTo(1);
               assertThat(i.skippedLots()).isEqualTo(2);
-              assertThat(i.reason()).contains("OTHER", "требуется сверка");
             });
-    assertThat(count("ORDER_REASON_INVALIDATED")).isEqualTo(1);
-    assertThat(count("ORDER_EVIDENCE_RECHECK")).isPositive();
     assertThat(control.instruments())
         .singleElement()
         .satisfies(i -> assertThat(i.paused()).isTrue());
@@ -313,13 +317,16 @@ class OrderEvidenceIT {
     var request = send(3, 1);
     trading.apply(trade(request, "unlinked-resource-fill", 1, "bank-order"), false);
     trading.apply(qualifiedUnary(request, OrderStatus.CANCELLED), false);
-    trading.apply(state(request, OrderStatus.CANCELLED, 0, 0, 3, 2, "bank-order"), false);
-    assertThat(count("ORDER_REASON_QUALIFIED")).isZero();
+    trading.apply(
+        OrderEvidenceFixtures.terminalStream(
+            request, OrderStatus.CANCELLED, "bank-order", 1, clock.instant()),
+        false);
+    assertThat(evidenceJournal.latestReason(request.requestId())).isEmpty();
     trading.replayOrderEvidence();
     assertThat(copies.intents())
         .singleElement()
         .satisfies(i -> assertThat(i.executedLots()).isEqualTo(1));
-    assertThat(count("ORDER_REASON_QUALIFIED")).isZero();
+    assertThat(evidenceJournal.latestReason(request.requestId())).isEmpty();
     assertThat(broker.posts).isEqualTo(1);
   }
 
@@ -332,7 +339,7 @@ class OrderEvidenceIT {
     assertThat(count("CANCEL_STARTED")).isEqualTo(1);
     trading.apply(qualifiedUnary(request, OrderStatus.CANCELLED), false);
     trading.apply(state(request, OrderStatus.CANCELLED, 0, 0, 3, 2, "bank-order"), false);
-    assertThat(count("ORDER_REASON_QUALIFIED")).isZero();
+    assertThat(evidenceJournal.latestReason(request.requestId())).isEmpty();
     assertThat(copies.intents())
         .singleElement()
         .satisfies(
@@ -346,7 +353,18 @@ class OrderEvidenceIT {
   @Test
   void latePartialFillInvalidatesAcceptedAttemptUntilNewIndependentReconciliation() {
     var request = send(3, 1);
-    trading.apply(state(request, OrderStatus.PARTIALLY_FILLED, 1, 0, 2, null), false);
+    trading.apply(
+        OrderEvidenceFixtures.stream(
+            request,
+            OrderStatus.PARTIALLY_FILLED,
+            1,
+            0,
+            2,
+            null,
+            "exchange-id",
+            1,
+            clock.instant()),
+        false);
     var firstTerminal = broker.evidence(request, OrderStatus.CANCELLED, 1);
     broker.orders.put(request.requestId(), firstTerminal);
     trading.apply(firstTerminal, false);
@@ -408,7 +426,18 @@ class OrderEvidenceIT {
     assertThat(copies.holdingAllocations())
         .extracting(HoldingAllocation.View::lots)
         .containsExactly(29L, 15L);
-    trading.apply(state(request, OrderStatus.PARTIALLY_FILLED, 6, 0, 4, null), false);
+    trading.apply(
+        OrderEvidenceFixtures.stream(
+            request,
+            OrderStatus.PARTIALLY_FILLED,
+            6,
+            0,
+            4,
+            null,
+            "exchange-id",
+            1,
+            clock.instant()),
+        false);
     var late = trade(request, "fill-" + request.requestId() + "-6", 1);
     trading.apply(late, false);
     trading.apply(late, false);
@@ -448,47 +477,7 @@ class OrderEvidenceIT {
   }
 
   private OrderEvidence trade(OrderRequest request, String id, long pieces, String exchangeId) {
-    var raw =
-        new OrderSdkEvidence(
-            OrderSdkEvidence.Source.TRADES_STREAM,
-            "1.51",
-            "f04-a2-v1",
-            null,
-            request.accountId(),
-            exchangeId,
-            null,
-            request.instrumentId(),
-            request.side() == Side.BUY ? 1 : 2,
-            null,
-            false,
-            null,
-            null,
-            null,
-            null,
-            null,
-            List.of(),
-            clock.instant(),
-            null,
-            null,
-            null,
-            List.of(
-                new OrderSdkEvidence.TradeFact(id, pieces, request.limitPrice(), clock.instant())));
-    return new OrderEvidence(
-        null,
-        request.accountId(),
-        null,
-        request.instrumentId(),
-        request.side(),
-        0,
-        0,
-        OrderStatus.UNKNOWN,
-        List.of(),
-        clock.instant(),
-        "synthetic late trade",
-        RejectionReason.NONE,
-        null,
-        null,
-        raw);
+    return OrderEvidenceFixtures.trade(request, id, pieces, exchangeId, clock.instant());
   }
 
   @BeforeEach
@@ -847,55 +836,8 @@ class OrderEvidenceIT {
       long cancelled,
       Integer cause,
       String exchangeId) {
-    int statusValue =
-        switch (status) {
-          case NEW -> 4;
-          case PARTIALLY_FILLED -> 5;
-          case FILLED -> 1;
-          case CANCELLED -> 3;
-          case REJECTED -> 2;
-          default -> 0;
-        };
-    var raw =
-        new OrderSdkEvidence(
-            OrderSdkEvidence.Source.ORDER_STATE_STREAM,
-            "1.51",
-            "f04-a2-v1",
-            request.requestId() == null ? null : request.requestId().toString(),
-            request.accountId(),
-            "internal-id",
-            exchangeId,
-            request.instrumentId(),
-            request.side() == Side.BUY ? 1 : 2,
-            statusValue,
-            cause != null,
-            cause,
-            request.lots(),
-            executed,
-            left,
-            cancelled,
-            List.of(),
-            clock.instant(),
-            null,
-            null,
-            broker.instrumentLotSize,
-            List.of());
-    return new OrderEvidence(
-        request.requestId(),
-        request.accountId(),
-        null,
-        request.instrumentId(),
-        request.side(),
-        request.lots(),
-        executed,
-        status,
-        List.of(),
-        clock.instant(),
-        "raw stream state",
-        RejectionReason.OTHER,
-        null,
-        null,
-        raw);
+    return OrderEvidenceFixtures.stream(
+        request, status, executed, left, cancelled, cause, exchangeId, 10, clock.instant());
   }
 
   private OrderRequest send(long lots) {
