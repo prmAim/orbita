@@ -45,27 +45,62 @@ public final class TradePolicy {
     return Age.ALLOWED;
   }
 
+  /** Returns the most lots affordable when the commission quote covers the full request. */
   public static long affordable(
       long requested,
       int lotSize,
       BigDecimal limit,
       BigDecimal money,
-      BigDecimal commission,
+      BigDecimal totalCommission,
       BigDecimal additionalReserve) {
     if (requested < 0
         || lotSize <= 0
+        || limit == null
+        || limit.signum() <= 0
         || money == null
-        || commission == null
+        || totalCommission == null
         || additionalReserve == null
-        || commission.signum() < 0
+        || totalCommission.signum() < 0
         || additionalReserve.signum() < 0)
       throw new IllegalArgumentException("Unqualified resources");
-    BigDecimal available = money.subtract(commission).subtract(additionalReserve);
-    if (available.signum() <= 0) return 0;
-    return Math.min(
-        requested,
-        available
-            .divide(limit.multiply(BigDecimal.valueOf(lotSize)), 0, RoundingMode.FLOOR)
-            .longValueExact());
+    if (requested == 0) return 0;
+
+    BigDecimal principalPerLot = limit.multiply(BigDecimal.valueOf(lotSize));
+    BigDecimal principalBudget = money.subtract(additionalReserve);
+    if (principalBudget.signum() <= 0) return 0;
+    BigDecimal principalLotLimit = principalBudget.divide(principalPerLot, 0, RoundingMode.FLOOR);
+    long high =
+        principalLotLimit.compareTo(BigDecimal.valueOf(requested)) >= 0
+            ? requested
+            : principalLotLimit.longValueExact();
+    long low = 0;
+    while (low < high) {
+      long distance = high - low;
+      long candidate = low + distance / 2 + distance % 2;
+      BigDecimal candidateCost =
+          principalPerLot
+              .multiply(BigDecimal.valueOf(candidate))
+              .add(commissionForLots(requested, candidate, totalCommission))
+              .add(additionalReserve);
+      if (candidateCost.compareTo(money) <= 0) low = candidate;
+      else high = candidate - 1;
+    }
+    return low;
+  }
+
+  /** Scales a total quote to selected lots, rounding up to the supported 9 decimal places. */
+  public static BigDecimal commissionForLots(
+      long requested, long selected, BigDecimal totalCommission) {
+    if (requested <= 0
+        || selected < 0
+        || selected > requested
+        || totalCommission == null
+        || totalCommission.signum() < 0)
+      throw new IllegalArgumentException("Unqualified commission quote");
+    if (selected == 0) return BigDecimal.ZERO;
+    if (selected == requested) return totalCommission;
+    return totalCommission
+        .multiply(BigDecimal.valueOf(selected))
+        .divide(BigDecimal.valueOf(requested), 9, RoundingMode.CEILING);
   }
 }

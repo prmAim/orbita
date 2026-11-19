@@ -313,8 +313,19 @@ class InterfaceDemoIT {
                 "select id from notification where category='ORDER_FINAL_SKIP' and instrument=? order by occurred_at desc limit 1",
                 UUID.class,
                 WholeChainBrokerSimulator.INSTRUMENT);
-        assertThat(notifications.get(naturalNotice).text())
-            .contains("исполнено 3/4", "пропущено 1");
+        String naturalText = notifications.get(naturalNotice).text();
+        assertThat(naturalText)
+            .contains(
+                WholeChainBrokerSimulator.INSTRUMENT,
+                "Покупка",
+                "причина:",
+                "исполнено 3/4",
+                "пропущено 1 лот");
+        String apiText = null;
+        for (var notice : browser.json.readTree(browser.get("/api/notifications?limit=200").body()))
+          if (notice.get("id").asText().equals(naturalNotice.toString()))
+            apiText = notice.get("text").asText();
+        assertThat(apiText).isEqualTo(naturalText);
         telegram.failNext();
         notifications.deliverDue();
         assertThat(notifications.get(naturalNotice).status()).isEqualTo("PENDING");
@@ -1146,15 +1157,28 @@ class InterfaceDemoIT {
     assertThat(rows.toString())
         .contains("SOURCE_ACCEPTED", "ORDER_RECONCILED", "PREVIEW_TRADE", "[ТЕСТ]");
     assertNaturalNotice(
-        browser, db, rows, "[ТЕСТ] ROSN", "ORDER_FINAL_SKIP", "исполнено 2/4", "пропущено 2");
+        browser,
+        db,
+        rows,
+        "[ТЕСТ] ROSN",
+        "ORDER_FINAL_SKIP",
+        "[ТЕСТ] ROSN",
+        "Покупка",
+        "причина:",
+        "исполнено 2/4",
+        "пропущено 2 лота");
     assertNaturalNotice(
         browser,
         db,
         rows,
         "[ТЕСТ] NVTK",
         "COPY_SKIPPED",
+        "[ТЕСТ] NVTK",
+        "Покупка",
+        "причина:",
+        "исполнено 0/3",
         "Недостаточно собственных",
-        "пропущено 3 лотов");
+        "пропущено 3 лота");
   }
 
   private static void assertNaturalNotice(

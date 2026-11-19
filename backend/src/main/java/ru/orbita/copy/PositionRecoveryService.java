@@ -8,6 +8,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 import ru.orbita.control.ControlService;
 import ru.orbita.journal.JournalEntry;
+import ru.orbita.notifications.NotificationPublisher;
 
 /** Connects the confirmed recovery cases to the same durable intents used for ordinary trading. */
 @Service
@@ -17,18 +18,21 @@ public class PositionRecoveryService {
   private final ControlService control;
   private final Clock clock;
   private final ru.orbita.control.TimeAuthority time;
+  private final NotificationPublisher notifications;
 
   public PositionRecoveryService(
       EntityManager em,
       TransactionTemplate tx,
       ControlService control,
       Clock clock,
-      ru.orbita.control.TimeAuthority time) {
+      ru.orbita.control.TimeAuthority time,
+      NotificationPublisher notifications) {
     this.em = em;
     this.tx = tx;
     this.control = control;
     this.clock = clock;
     this.time = time;
+    this.notifications = notifications;
   }
 
   public void recover() {
@@ -265,7 +269,7 @@ public class PositionRecoveryService {
               : "Подтверждённая корректировка фактического остатка к исторической цели";
       for (var i : intents)
         if ("WAITING".equals(i.status) && i != correction)
-          finalSkip(i, "Объём учтён единой корректирующей продажей");
+          finalSkip(i, "Объём учтён единой корректирующей продажей", false);
     } else {
       for (int index = 0; index < buys.size(); index++) {
         SourceExecutionEntity buy = buys.get(index);
@@ -282,12 +286,12 @@ public class PositionRecoveryService {
             long remaining = Math.max(0, retainedQuantity - i.executedLots);
             i.skippedLots = Math.max(i.skippedLots, i.lots - remaining);
             if (remaining == 0)
-              finalSkip(i, "Подтверждённое закрытие или проданная доля исходной покупки");
+              finalSkip(i, "Подтверждённое закрытие или проданная доля исходной покупки", true);
           }
       }
       for (var i : intents)
         if ("SELL".equals(i.side) && "WAITING".equals(i.status))
-          finalSkip(i, "Проданная исходная доля уже учтена в уменьшенных покупках");
+          finalSkip(i, "Проданная исходная доля уже учтена в уменьшенных покупках", false);
     }
     events.forEach(e -> e.requiresRecovery = false);
     em.persist(
@@ -308,9 +312,16 @@ public class PositionRecoveryService {
     return true;
   }
 
-  private static void finalSkip(CopyIntent i, String reason) {
+  private void finalSkip(CopyIntent i, String reason, boolean notify) {
     i.skippedLots = i.lots - i.executedLots;
     i.status = "FINAL";
     i.reason = reason;
+    if (notify && i.skippedLots > 0)
+      notifications.publish(
+          "COPY_SKIPPED",
+          i.instrumentId,
+          clock.instant(),
+          TradeNotificationText.finalSkip(
+              i.instrumentId, i.side, i.executedLots, i.lots, i.skippedLots, reason));
   }
 }

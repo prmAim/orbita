@@ -20,6 +20,7 @@ import ru.orbita.notifications.NotificationService;
  */
 @Service
 public class TradingService implements UnsentIntentStop {
+  private static final int READY_INTENT_BATCH_SIZE = 100;
   private static final Set<String> LIVE =
       Set.of("SEND_STARTED", "ACTIVE", "UNKNOWN", "CANCEL_STARTED");
   private final EntityManager em;
@@ -128,16 +129,64 @@ public class TradingService implements UnsentIntentStop {
     replayOrderEvidence();
     BrokerGateway gateway = gateways.getIfAvailable();
     if (gateway == null) return;
-    List<UUID> waiting =
-        tx.execute(
-            _ ->
-                em.createQuery(
-                        "select i.id from CopyIntent i where i.status in ('WAITING','HALTED') order by i.prioritySequence,i.id",
-                        UUID.class)
-                    .setMaxResults(100)
-                    .getResultList());
-    for (UUID id : waiting) prepare(gateway, id);
+    // Keep this traversal bounded to the queue that existed when dispatch began.
+    QueuePosition highWater = waitingHighWater();
+    QueuePosition after = null;
+    Set<UUID> haltedParentsPrepared = new HashSet<>();
+    while (highWater != null) {
+      List<CopyIntent> waiting = waitingPage(after, highWater);
+      if (waiting.isEmpty()) return;
+      for (CopyIntent intent : waiting) {
+        if (intent.retryOf != null && haltedParentsPrepared.contains(intent.retryOf)) continue;
+        if ("HALTED".equals(intent.status)) haltedParentsPrepared.add(intent.id);
+        prepare(gateway, intent.id);
+      }
+      CopyIntent last = waiting.getLast();
+      after = new QueuePosition(last.prioritySequence, last.id);
+    }
   }
+
+  private QueuePosition waitingHighWater() {
+    return tx.execute(
+        _ -> {
+          List<CopyIntent> latest =
+              em.createQuery(
+                      "from CopyIntent i where i.status in ('WAITING','HALTED') order by i.prioritySequence desc,i.id desc",
+                      CopyIntent.class)
+                  .setMaxResults(1)
+                  .getResultList();
+          if (latest.isEmpty()) return null;
+          CopyIntent last = latest.getFirst();
+          return new QueuePosition(last.prioritySequence, last.id);
+        });
+  }
+
+  private List<CopyIntent> waitingPage(QueuePosition after, QueuePosition highWater) {
+    return tx.execute(
+        _ -> {
+          String query =
+              "from CopyIntent i where i.status in ('WAITING','HALTED') "
+                  + "and (i.prioritySequence < :highPriority or "
+                  + "(i.prioritySequence = :highPriority and i.id <= :highId)) ";
+          if (after != null)
+            query +=
+                "and (i.prioritySequence > :afterPriority or "
+                    + "(i.prioritySequence = :afterPriority and i.id > :afterId)) ";
+          query += "order by i.prioritySequence,i.id";
+          var selection =
+              em.createQuery(query, CopyIntent.class)
+                  .setParameter("highPriority", highWater.prioritySequence())
+                  .setParameter("highId", highWater.id());
+          if (after != null) {
+            selection
+                .setParameter("afterPriority", after.prioritySequence())
+                .setParameter("afterId", after.id());
+          }
+          return selection.setMaxResults(READY_INTENT_BATCH_SIZE).getResultList();
+        });
+  }
+
+  private record QueuePosition(long prioritySequence, UUID id) {}
 
   private OrderRequest request(CopyIntent i) {
     return new OrderRequest(
@@ -338,7 +387,11 @@ public class TradingService implements UnsentIntentStop {
                       .multiply(BigDecimal.valueOf(instrument.lotSize()))
                       .multiply(BigDecimal.valueOf(allowed));
               BigDecimal fees =
-                  resources.preliminaryCommission().add(resources.additionalCommissionReserve());
+                  ("BUY".equals(i.side)
+                          ? TradePolicy.commissionForLots(
+                              requested, allowed, resources.preliminaryCommission())
+                          : resources.preliminaryCommission())
+                      .add(resources.additionalCommissionReserve());
               var totalCurrency = ru.orbita.valuation.ExactRub.of(principal.add(fees));
               var converted =
                   new ru.orbita.valuation.RubValuation.Result(
@@ -391,12 +444,13 @@ public class TradingService implements UnsentIntentStop {
                     "RESOURCE_SKIP",
                     i.instrumentId,
                     clock.instant(),
-                    i.side
-                        + ": окончательно пропущено "
-                        + i.skippedLots
-                        + " из "
-                        + i.lots
-                        + " лотов из-за ресурсов");
+                    TradeNotificationText.finalSkip(
+                        i.instrumentId,
+                        i.side,
+                        i.executedLots,
+                        i.lots,
+                        i.skippedLots,
+                        "Объём ограничен доступными ресурсами"));
               i.reservedMoney = "BUY".equals(i.side) ? principal.add(fees) : fees;
               i.commissionReserve = fees;
               i.reservedLots = "SELL".equals(i.side) ? allowed : 0;
@@ -657,7 +711,12 @@ public class TradingService implements UnsentIntentStop {
             i.reason = "Неопределённый результат заявки; резерв сохранён";
             if (i.unknownNotification == null)
               i.unknownNotification =
-                  notifications.publish("ORDER_UNKNOWN", i.instrumentId, clock.instant(), i.reason);
+                  notifications.publish(
+                      "ORDER_UNKNOWN",
+                      i.instrumentId,
+                      clock.instant(),
+                      TradeNotificationText.unknown(
+                          i.instrumentId, i.side, i.executedLots, i.lots, i.skippedLots, i.reason));
             return;
           }
           if (evidence.lotsExecuted() < i.executedLots) {
@@ -767,15 +826,13 @@ public class TradingService implements UnsentIntentStop {
             allocateRecovery(i);
             if (i.skippedLots > 0 && !wasFinal) {
               String text =
-                  i.side
-                      + ": исполнено "
-                      + i.executedLots
-                      + "/"
-                      + i.lots
-                      + ", пропущено "
-                      + i.skippedLots
-                      + "; "
-                      + evidence.detail();
+                  TradeNotificationText.finalSkip(
+                      i.instrumentId,
+                      i.side,
+                      i.executedLots,
+                      i.lots,
+                      i.skippedLots,
+                      evidence.detail());
               if (i.fullClose)
                 control.pauseInstrument(
                     i.instrumentId,
@@ -1008,7 +1065,12 @@ public class TradingService implements UnsentIntentStop {
       i.acceptanceReconciled = false;
       if (i.unknownNotification == null)
         i.unknownNotification =
-            notifications.publish("ORDER_UNKNOWN", i.instrumentId, clock.instant(), detail);
+            notifications.publish(
+                "ORDER_UNKNOWN",
+                i.instrumentId,
+                clock.instant(),
+                TradeNotificationText.unknown(
+                    i.instrumentId, i.side, i.executedLots, i.lots, i.skippedLots, detail));
     }
     em.persist(
         new JournalEntry(
@@ -1061,10 +1123,12 @@ public class TradingService implements UnsentIntentStop {
 
   private void skipInside(CopyIntent i, String reason) {
     i.status = "FINAL";
-    i.skippedLots = i.lots;
+    i.skippedLots = i.lots - i.executedLots;
     i.reason = reason;
     allocateRecovery(i);
-    String text = i.side + ": " + reason + "; пропущено " + i.lots + " лотов";
+    String text =
+        TradeNotificationText.finalSkip(
+            i.instrumentId, i.side, i.executedLots, i.lots, i.skippedLots, reason);
     if (i.fullClose) control.pauseInstrument(i.instrumentId, text + "; остались бумаги повторения");
     else notifications.publish("COPY_SKIPPED", i.instrumentId, clock.instant(), text);
   }

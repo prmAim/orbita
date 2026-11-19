@@ -12,6 +12,7 @@ type Status = {
   permitIssuedAt: string | null;
   recalculationRunning: boolean;
   recalculationPaused: boolean;
+  failedAttempts: number;
   lastError: string | null;
 };
 type Notification = {
@@ -328,6 +329,7 @@ async function run(button: HTMLButtonElement, callback: () => Promise<void>) {
 }
 function renderStatus(status: Status) {
   byId("mode").textContent = modes[status.mode] ?? status.mode;
+  byId("failed-attempts").textContent = String(status.failedAttempts);
   byId("coefficient").textContent = status.ratioNumerator && status.ratioDenominator
     ? status.ratioDenominator === "1" ? status.ratioNumerator : `${status.ratioNumerator}/${status.ratioDenominator}`
     : status.coefficient ?? "Не установлен";

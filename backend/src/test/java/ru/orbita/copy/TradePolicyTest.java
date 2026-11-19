@@ -37,4 +37,20 @@ class TradePolicyTest {
                 new BigDecimal("100")))
         .isEqualTo(2);
   }
+
+  @Test
+  void buyAffordabilityUsesCommissionForTheVolumeThatFits() {
+    long affordable =
+        TradePolicy.affordable(
+            1000,
+            1,
+            new BigDecimal("100"),
+            new BigDecimal("150"),
+            new BigDecimal("100"),
+            BigDecimal.ZERO);
+
+    assertThat(affordable).isEqualTo(1);
+    assertThat(TradePolicy.commissionForLots(1000, affordable, new BigDecimal("100")))
+        .isEqualByComparingTo("0.10");
+  }
 }

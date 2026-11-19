@@ -89,7 +89,8 @@ public class ControlService {
           java.math.BigInteger ratioNumerator,
       @com.fasterxml.jackson.annotation.JsonFormat(
               shape = com.fasterxml.jackson.annotation.JsonFormat.Shape.STRING)
-          java.math.BigInteger ratioDenominator) {}
+          java.math.BigInteger ratioDenominator,
+      int failedAttempts) {}
 
   public record Attempt(
       UUID id,
@@ -142,7 +143,8 @@ public class ControlService {
         s.reconciled,
         s.lastError,
         values.numerator(),
-        values.denominator());
+        values.denominator(),
+        s.failedAttempts);
   }
 
   public Status status() {
@@ -846,7 +848,8 @@ public class ControlService {
           s.paused = true;
           s.reconciled = false;
           s.reason = reason;
-          notifications.publish("INSTRUMENT_PAUSED", instrument, clock.instant(), reason);
+          notifications.publish(
+              "INSTRUMENT_PAUSED", instrument, clock.instant(), instrument + ": " + reason);
           em.persist(new JournalEntry(clock.instant(), "INSTRUMENT_PAUSED", instrument, reason));
         });
   }
@@ -874,7 +877,8 @@ public class ControlService {
           if (!matches) {
             s.paused = true;
             s.reason = reason;
-            notifications.publish("POSITION_MISMATCH", instrument, clock.instant(), reason);
+            notifications.publish(
+                "POSITION_MISMATCH", instrument, clock.instant(), instrument + ": " + reason);
           } else if (!s.paused) s.reason = s.waiting ? reason : null;
         });
   }

@@ -203,7 +203,10 @@ public interface BrokerGateway extends AutoCloseable {
     }
   }
 
-  /** Raw own-resource limits remain separately qualified; commission is never inferred as zero. */
+  /**
+   * Raw own-resource limits remain separately qualified. Preliminary commission covers the quantity
+   * in the resource request and is never inferred as zero.
+   */
   record ResourceEvidence(
       String accountId,
       Instrument instrument,

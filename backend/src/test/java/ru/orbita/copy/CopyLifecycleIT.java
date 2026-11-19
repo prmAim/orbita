@@ -2,8 +2,13 @@ package ru.orbita.copy;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestBuilders.formLogin;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
 import java.time.*;
 import java.util.*;
 import org.junit.jupiter.api.Test;
@@ -11,11 +16,16 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.context.annotation.*;
+import org.springframework.mock.web.MockHttpSession;
+import org.springframework.test.web.servlet.MockMvc;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import ru.orbita.broker.BrokerGateway;
 import ru.orbita.broker.BrokerGateway.*;
 import ru.orbita.control.ControlService;
+import ru.orbita.notifications.TelegramTransport;
+import ru.orbita.web.OwnerCredentials;
 
 @SpringBootTest(
     properties = {
@@ -25,6 +35,7 @@ import ru.orbita.control.ControlService;
       "orbita.margin-disabled-confirmed=true",
       "orbita.worker.enabled=false"
     })
+@AutoConfigureMockMvc
 @Import(CopyLifecycleIT.Fixture.class)
 class CopyLifecycleIT {
   @Autowired CopyService copies;
@@ -39,11 +50,16 @@ class CopyLifecycleIT {
   @Autowired PositionRecoveryService recovery;
   @Autowired ManualReconciliationService manual;
   @Autowired ReconciliationService reconciliation;
+  @Autowired ru.orbita.notifications.NotificationService notifications;
   @Autowired ru.orbita.runtime.ApplicationReadiness readiness;
+  @Autowired MockMvc mvc;
+  @Autowired OwnerCredentials ownerCredentials;
+  @Autowired TelegramSimulator telegram;
 
   @org.junit.jupiter.api.BeforeEach
   void clean() {
     reset(db, broker, clock);
+    telegram.messages.clear();
   }
 
   static void reset(
@@ -78,6 +94,10 @@ class CopyLifecycleIT {
     broker.oppositePrice = new BigDecimal("100");
     broker.bankLots = 0;
     broker.extraBankLots = 0;
+    broker.availableMoney = new BigDecimal("10000");
+    broker.buyMaxLots = 100;
+    broker.preliminaryCommission = BigDecimal.ONE;
+    broker.additionalCommissionReserve = BigDecimal.ONE;
     broker.partialNext = -1;
     broker.orders.clear();
     broker.currencyCash = false;
@@ -408,6 +428,53 @@ class CopyLifecycleIT {
   }
 
   @Test
+  void statusApiExposesMandatoryRecalculationFailuresSeparatelyFromTelegramFailures()
+      throws Exception {
+    runningAtFive();
+    broker.failCapital = true;
+
+    control.mandatoryRecalculation();
+    clock.now = clock.now.plusSeconds(61);
+    control.mandatoryRecalculation();
+
+    assertThat(control.status().recalculationPaused()).isTrue();
+    assertThat(
+            db.queryForObject(
+                "select failed_attempts from control_state where id=1", Integer.class))
+        .isEqualTo(2);
+    assertThat(notifications.list(100))
+        .filteredOn(event -> event.category().equals("RECALCULATION_ERROR"))
+        .singleElement()
+        .satisfies(
+            event -> {
+              assertThat(event.status()).isEqualTo("PENDING");
+              assertThat(event.automaticFailures()).isZero();
+            });
+    var homeResponse =
+        mvc.perform(get("/index.html")).andExpect(status().isOk()).andReturn().getResponse();
+    var home = new String(homeResponse.getContentAsByteArray(), StandardCharsets.UTF_8);
+    assertThat(home).contains("Ошибок обязательного пересчёта");
+    var appResponse =
+        mvc.perform(get("/app.js")).andExpect(status().isOk()).andReturn().getResponse();
+    var app = new String(appResponse.getContentAsByteArray(), StandardCharsets.UTF_8);
+    assertThat(app).contains("failed-attempts", "status.failedAttempts");
+
+    ownerCredentials.replace("synthetic-only-passphrase".toCharArray());
+    try {
+      var login =
+          mvc.perform(formLogin("/api/login").user("owner").password("synthetic-only-passphrase"))
+              .andExpect(status().isNoContent())
+              .andReturn();
+      var session = (MockHttpSession) login.getRequest().getSession(false);
+      mvc.perform(get("/api/status").session(session))
+          .andExpect(status().isOk())
+          .andExpect(jsonPath("$.failedAttempts").value(2));
+    } finally {
+      ownerCredentials.lock();
+    }
+  }
+
+  @Test
   void savedNaturalBuyAndSellAreIndependentlyRecheckedForCurrentCalculationArtifact() {
     control.markReconciled();
     control.start();
@@ -575,6 +642,125 @@ class CopyLifecycleIT {
               assertThat(i.executedLots()).isEqualTo(30);
               assertThat(i.skippedLots()).isEqualTo(20);
             });
+  }
+
+  @Test
+  void recoveryPublishesNoticeForTheBuyVolumeActuallySkippedAfterAConfirmedClose()
+      throws Exception {
+    runningAtFive();
+    clock.now = clock.now.plusSeconds(2);
+    Instant saleAt = clock.instant();
+    copies.accept(source("recovery-close", Side.SELL, 10, saleAt));
+    clock.now = clock.now.plusSeconds(1);
+    copies.accept(source("recovery-buy", Side.BUY, 10, saleAt.minusSeconds(1)));
+
+    reconciliation.reconcile();
+    recovery.recover();
+
+    assertThat(copies.intents())
+        .filteredOn(intent -> intent.sourceOrderId().equals("order-recovery-buy"))
+        .singleElement()
+        .satisfies(
+            intent -> {
+              assertThat(intent.status()).isEqualTo("FINAL");
+              assertThat(intent.executedLots()).isZero();
+              assertThat(intent.lots()).isEqualTo(50);
+              assertThat(intent.skippedLots()).isEqualTo(50);
+            });
+    var notices =
+        notifications.list(100).stream()
+            .filter(event -> event.category().equals("COPY_SKIPPED"))
+            .toList();
+    assertThat(notices).hasSize(1);
+    var notice = notices.getFirst();
+    assertThat(notice.instrument()).isEqualTo("instrument");
+    assertThat(notice.text())
+        .contains(
+            "instrument",
+            "Покупка",
+            "исполнено 0/50",
+            "пропущено 50 лотов",
+            "Подтверждённое закрытие");
+    assertThat(
+            db.queryForObject(
+                "select j.detail from notification n join journal_entry j on j.id=n.journal_id where n.id=?",
+                String.class,
+                notice.id()))
+        .isEqualTo(notice.text());
+
+    ownerCredentials.replace("synthetic-only-passphrase".toCharArray());
+    try {
+      var login =
+          mvc.perform(formLogin("/api/login").user("owner").password("synthetic-only-passphrase"))
+              .andExpect(status().isNoContent())
+              .andReturn();
+      var session = (MockHttpSession) login.getRequest().getSession(false);
+      mvc.perform(get("/api/notifications?limit=100").session(session))
+          .andExpect(status().isOk())
+          .andExpect(
+              jsonPath(
+                  "$[?(@.id=='" + notice.id() + "')].text",
+                  org.hamcrest.Matchers.hasItem(notice.text())));
+
+      notifications.deliverDue();
+      assertThat(telegram.messages).contains(notice.text());
+      assertThat(notifications.get(notice.id()).status()).isEqualTo("DELIVERED");
+    } finally {
+      ownerCredentials.lock();
+    }
+  }
+
+  @Test
+  void recoveryDoesNotNotifyForBuyVolumeFoldedIntoOneCorrectiveSale() {
+    runningAtFive();
+    clock.now = clock.now.plusSeconds(1);
+    copies.accept(source("recovery-first-buy", Side.BUY, 10, clock.instant()));
+    trading.tick();
+    broker.mirrorCapital = new BigDecimal("300000");
+    control.recalculate();
+    clock.now = clock.now.plusSeconds(1);
+    copies.accept(source("recovery-second-buy", Side.BUY, 10, clock.instant()));
+    broker.instrumentHook =
+        () -> {
+          throw new IllegalStateException("synthetic metadata wait");
+        };
+    try {
+      trading.tick();
+    } finally {
+      broker.instrumentHook = null;
+    }
+    clock.now = clock.now.plusSeconds(1);
+    copies.accept(source("recovery-net-sale", Side.SELL, 10, clock.instant()));
+
+    control.instrumentReconciled(
+        "instrument", true, false, "Восстановление подтверждённой последовательности");
+    trading.reconcileOnly();
+    reconciliation.reconcile();
+    recovery.recover();
+
+    assertThat(copies.intents())
+        .filteredOn(intent -> intent.sourceOrderId().equals("order-recovery-second-buy"))
+        .singleElement()
+        .satisfies(
+            intent -> {
+              assertThat(intent.status()).isEqualTo("FINAL");
+              assertThat(intent.skippedLots()).isEqualTo(30);
+              assertThat(intent.reason()).isEqualTo("Объём учтён единой корректирующей продажей");
+            });
+    assertThat(copies.intents())
+        .filteredOn(intent -> intent.sourceOrderId().equals("order-recovery-net-sale"))
+        .singleElement()
+        .satisfies(
+            intent -> {
+              assertThat(intent.status()).isEqualTo("WAITING");
+              assertThat(intent.lots()).isEqualTo(10);
+            });
+    assertThat(notifications.list(100))
+        .noneMatch(
+            event ->
+                event.category().equals("COPY_SKIPPED")
+                    && event.text().contains("recovery-second-buy"));
+    assertThat(broker.posts).isEqualTo(1);
   }
 
   @Test
@@ -760,6 +946,93 @@ class CopyLifecycleIT {
     assertThat(copies.positions())
         .singleElement()
         .satisfies(p -> assertThat(p.copiedLots()).isEqualTo(50));
+  }
+
+  @Test
+  void buyCommissionIsScaledToAffordableLotsBeforeTheOrderIsSent() {
+    runningAtFive();
+    broker.availableMoney = new BigDecimal("150");
+    broker.buyMaxLots = 1;
+    broker.preliminaryCommission = new BigDecimal("100");
+    broker.additionalCommissionReserve = BigDecimal.ZERO;
+    broker.fillEveryPost = false;
+    clock.now = clock.now.plusSeconds(1);
+    var execution =
+        new SourceExecution(
+            "source",
+            "buy-commission-volume",
+            "buy-commission-volume-order",
+            "instrument",
+            Side.BUY,
+            new BigDecimal("200"),
+            new BigDecimal("99.503"),
+            "RUB",
+            clock.instant(),
+            clock.instant());
+    broker.historyExecutions.add(execution);
+
+    assertThat(copies.accept(execution).newLots()).isEqualTo(1000);
+    trading.dispatchReady();
+
+    assertThat(broker.posts).isEqualTo(1);
+    assertThat(broker.sent.lots()).isEqualTo(1);
+    assertThat(broker.sent.limitPrice()).isEqualByComparingTo("100");
+    assertThat(copies.intents())
+        .singleElement()
+        .satisfies(intent -> assertThat(intent.reservedMoney()).isEqualByComparingTo("100.10"));
+    assertThat(copies.journal(0, 200))
+        .filteredOn(entry -> entry.category().equals("SEND_STARTED"))
+        .singleElement()
+        .satisfies(entry -> assertThat(entry.detail()).contains("lots=1 reserve=100.100000000"));
+  }
+
+  @Test
+  void readyIntentAfterTheFirstHundredWaitingForDataIsConsideredInOrderWithoutDoubleReservation() {
+    runningAtFive();
+    broker.availableMoney = new BigDecimal("150");
+    broker.buyMaxLots = 1;
+    broker.preliminaryCommission = new BigDecimal("0.5");
+    broker.additionalCommissionReserve = BigDecimal.ZERO;
+    broker.fillEveryPost = false;
+    clock.now = clock.now.plusSeconds(1);
+    var instrumentReads = new java.util.concurrent.atomic.AtomicInteger();
+    broker.instrumentHook =
+        () -> {
+          if (instrumentReads.incrementAndGet() <= 100)
+            throw new IllegalStateException("synthetic instrument metadata unavailable");
+        };
+    for (int index = 1; index <= 100; index++)
+      copies.accept(
+          source("waiting-" + index, "waiting-instrument-" + index, Side.BUY, 1, clock.instant()));
+    copies.accept(source("ready-101", "ready-101", Side.BUY, 1, clock.instant()));
+    copies.accept(source("ready-102", "ready-102", Side.BUY, 1, clock.instant()));
+
+    try {
+      trading.dispatchReady();
+    } finally {
+      broker.instrumentHook = null;
+    }
+
+    assertThat(instrumentReads.get()).isGreaterThan(100);
+    assertThat(copies.intents())
+        .filteredOn(intent -> intent.instrumentId().startsWith("waiting-instrument-"))
+        .hasSize(100)
+        .allSatisfy(intent -> assertThat(intent.status()).isEqualTo("WAITING"));
+    assertThat(broker.posts).isEqualTo(1);
+    assertThat(broker.sent.instrumentId()).isEqualTo("ready-101");
+    assertThat(broker.sent.lots()).isEqualTo(1);
+    assertThat(copies.intents())
+        .filteredOn(intent -> intent.sourceOrderId().equals("order-ready-101"))
+        .singleElement()
+        .satisfies(intent -> assertThat(intent.reservedMoney()).isEqualByComparingTo("100.60"));
+    assertThat(copies.intents())
+        .filteredOn(intent -> intent.sourceOrderId().equals("order-ready-102"))
+        .singleElement()
+        .satisfies(
+            intent -> {
+              assertThat(intent.status()).isEqualTo("FINAL");
+              assertThat(intent.skippedLots()).isEqualTo(5);
+            });
   }
 
   private void runningAtFive() {
@@ -1219,12 +1492,17 @@ class CopyLifecycleIT {
   }
 
   private SourceExecution source(String id, Side side, long lots, Instant executedAt) {
+    return source(id, "instrument", side, lots, executedAt);
+  }
+
+  private SourceExecution source(
+      String id, String instrumentId, Side side, long lots, Instant executedAt) {
     var result =
         new SourceExecution(
             "source",
             id,
             "order-" + id,
-            "instrument",
+            instrumentId,
             side,
             BigDecimal.valueOf(lots),
             new BigDecimal("100"),
@@ -1452,6 +1730,17 @@ class CopyLifecycleIT {
     }
 
     @Bean
+    TelegramSimulator telegramSimulator() {
+      return new TelegramSimulator();
+    }
+
+    @Bean
+    @Primary
+    TelegramTransport telegramTransport(TelegramSimulator telegram) {
+      return telegram;
+    }
+
+    @Bean
     ru.orbita.control.ClockEvidence clockEvidence(MutableClock clock) {
       return new ru.orbita.control.ClockEvidence() {
         public Optional<Bound> current() {
@@ -1473,6 +1762,16 @@ class CopyLifecycleIT {
               .map(at -> new Bound(at, at, "synthetic independently retained receipt"));
         }
       };
+    }
+  }
+
+  static class TelegramSimulator implements TelegramTransport {
+    final List<String> messages = new ArrayList<>();
+
+    @Override
+    public Result send(String text) {
+      messages.add(text);
+      return Result.success();
     }
   }
 
@@ -1517,6 +1816,10 @@ class CopyLifecycleIT {
     BigDecimal oppositePrice = new BigDecimal("100");
     long bankLots;
     long extraBankLots;
+    BigDecimal availableMoney = new BigDecimal("10000");
+    long buyMaxLots = 100;
+    BigDecimal preliminaryCommission = BigDecimal.ONE;
+    BigDecimal additionalCommissionReserve = BigDecimal.ONE;
     long partialNext = -1;
     final Map<UUID, OrderEvidence> orders = new HashMap<>();
     boolean currencyCash;
@@ -1564,11 +1867,11 @@ class CopyLifecycleIT {
       return new ResourceEvidence(
           "mirror",
           instrument(r.instrumentId()),
-          new BigDecimal("10000"),
+          availableMoney,
+          buyMaxLots,
           100,
-          100,
-          zeroFees ? BigDecimal.ZERO : BigDecimal.ONE,
-          zeroFees ? BigDecimal.ZERO : BigDecimal.ONE,
+          zeroFees ? BigDecimal.ZERO : preliminaryCommission,
+          zeroFees ? BigDecimal.ZERO : additionalCommissionReserve,
           clock.instant(),
           clock.instant(),
           !(blockPurchases && r.side() == Side.BUY),
