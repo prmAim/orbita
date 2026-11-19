@@ -379,9 +379,10 @@ public class TradingService implements UnsentIntentStop {
                     < 0) allowed = 0;
               }
               if (allowed <= 0) {
-                skipInside(i, "Недостаточно собственных средств или бумаг с комиссией");
+                skipInside(i, TradeNotificationText.RESOURCE_UNAVAILABLE_SKIP_REASON);
                 return null;
               }
+              long resourceSkipped = requested - allowed;
               BigDecimal principal =
                   i.limitPrice
                       .multiply(BigDecimal.valueOf(instrument.lotSize()))
@@ -439,18 +440,17 @@ public class TradingService implements UnsentIntentStop {
               i.skippedLots = i.lots - allowed;
               i.requestedLots = allowed;
               if (i.firstBestOpposite == null) i.firstBestOpposite = best;
-              if (i.skippedLots > 0)
+              if (resourceSkipped > 0) {
+                i.reason =
+                    TradeNotificationText.withRecoverySkipReason(
+                        i.reason, TradeNotificationText.RESOURCE_LIMIT_SKIP_REASON);
                 notifications.publish(
                     "RESOURCE_SKIP",
                     i.instrumentId,
                     clock.instant(),
                     TradeNotificationText.finalSkip(
-                        i.instrumentId,
-                        i.side,
-                        i.executedLots,
-                        i.lots,
-                        i.skippedLots,
-                        "Объём ограничен доступными ресурсами"));
+                        i.instrumentId, i.side, i.executedLots, i.lots, i.skippedLots, i.reason));
+              }
               i.reservedMoney = "BUY".equals(i.side) ? principal.add(fees) : fees;
               i.commissionReserve = fees;
               i.reservedLots = "SELL".equals(i.side) ? allowed : 0;
@@ -825,6 +825,7 @@ public class TradingService implements UnsentIntentStop {
             i.reservedMoney = i.commissionReserve;
             allocateRecovery(i);
             if (i.skippedLots > 0 && !wasFinal) {
+              long skippedBeforeSend = Math.max(0, i.lots - i.requestedLots);
               String text =
                   TradeNotificationText.finalSkip(
                       i.instrumentId,
@@ -832,7 +833,8 @@ public class TradingService implements UnsentIntentStop {
                       i.executedLots,
                       i.lots,
                       i.skippedLots,
-                      evidence.detail());
+                      TradeNotificationText.finalOrderSkipReason(
+                          i.reason, evidence.detail(), skippedBeforeSend, i.skippedLots));
               if (i.fullClose)
                 control.pauseInstrument(
                     i.instrumentId,
@@ -1124,11 +1126,11 @@ public class TradingService implements UnsentIntentStop {
   private void skipInside(CopyIntent i, String reason) {
     i.status = "FINAL";
     i.skippedLots = i.lots - i.executedLots;
-    i.reason = reason;
+    i.reason = TradeNotificationText.withRecoverySkipReason(i.reason, reason);
     allocateRecovery(i);
     String text =
         TradeNotificationText.finalSkip(
-            i.instrumentId, i.side, i.executedLots, i.lots, i.skippedLots, reason);
+            i.instrumentId, i.side, i.executedLots, i.lots, i.skippedLots, i.reason);
     if (i.fullClose) control.pauseInstrument(i.instrumentId, text + "; остались бумаги повторения");
     else notifications.publish("COPY_SKIPPED", i.instrumentId, clock.instant(), text);
   }

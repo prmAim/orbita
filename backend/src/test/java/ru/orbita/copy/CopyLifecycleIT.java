@@ -758,9 +758,77 @@ class CopyLifecycleIT {
     assertThat(notifications.list(100))
         .noneMatch(
             event ->
-                event.category().equals("COPY_SKIPPED")
-                    && event.text().contains("recovery-second-buy"));
+                event.category().equals("COPY_SKIPPED") && event.instrument().equals("instrument"));
     assertThat(broker.posts).isEqualTo(1);
+  }
+
+  @Test
+  void partialRecoverySkipKeepsItsReasonAndDoesNotReportItAsAResourceLimit() {
+    runningAtFive();
+    clock.now = clock.now.plusSeconds(1);
+    copies.accept(source("recovery-partial-buy", Side.BUY, 10, clock.instant()));
+    broker.instrumentHook =
+        () -> {
+          throw new IllegalStateException("synthetic metadata wait");
+        };
+    try {
+      trading.tick();
+    } finally {
+      broker.instrumentHook = null;
+    }
+
+    clock.now = clock.now.plusSeconds(1);
+    copies.accept(source("recovery-partial-sale", Side.SELL, 5, clock.instant()));
+    broker.instrumentHook =
+        () -> {
+          throw new IllegalStateException("synthetic metadata wait");
+        };
+    try {
+      trading.tick();
+    } finally {
+      broker.instrumentHook = null;
+    }
+    control.instrumentReconciled(
+        "instrument", true, false, "Восстановление подтверждённой последовательности");
+    trading.reconcileOnly();
+    reconciliation.reconcile();
+    recovery.recover();
+
+    assertThat(copies.intents())
+        .filteredOn(intent -> intent.sourceOrderId().equals("order-recovery-partial-buy"))
+        .singleElement()
+        .satisfies(
+            intent -> {
+              assertThat(intent.status()).isEqualTo("WAITING");
+              assertThat(intent.lots()).isEqualTo(50);
+              assertThat(intent.skippedLots()).isEqualTo(25);
+            });
+
+    trading.dispatchReady();
+
+    assertThat(broker.posts).isEqualTo(1);
+    assertThat(broker.sent.lots()).isEqualTo(25);
+    var notices =
+        notifications.list(100).stream()
+            .filter(
+                event ->
+                    event.instrument().equals("instrument")
+                        && Set.of("RESOURCE_SKIP", "ORDER_FINAL_SKIP", "COPY_SKIPPED")
+                            .contains(event.category()))
+            .toList();
+    assertThat(notices)
+        .singleElement()
+        .satisfies(
+            notice -> {
+              assertThat(notice.category()).isEqualTo("ORDER_FINAL_SKIP");
+              assertThat(notice.text())
+                  .contains(
+                      "instrument",
+                      "Покупка",
+                      "исполнено 25/50",
+                      "пропущено 25 лотов",
+                      "Проданная доля исходной покупки");
+            });
   }
 
   @Test

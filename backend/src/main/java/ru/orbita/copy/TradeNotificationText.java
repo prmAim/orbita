@@ -4,7 +4,37 @@ import java.math.BigDecimal;
 
 /** Builds owner-facing copy-trade notices from the same persisted trade facts as the journal. */
 public final class TradeNotificationText {
+  static final String PARTIAL_RECOVERY_SKIP_REASON =
+      "Проданная доля исходной покупки учтена при восстановлении";
+  static final String RESOURCE_LIMIT_SKIP_REASON = "Объём ограничен доступными ресурсами";
+  static final String RESOURCE_UNAVAILABLE_SKIP_REASON =
+      "Недостаточно собственных средств или бумаг с комиссией";
+
   private TradeNotificationText() {}
+
+  static String withRecoverySkipReason(String currentReason, String nextReason) {
+    if (currentReason != null && currentReason.contains(PARTIAL_RECOVERY_SKIP_REASON))
+      return appendReason(currentReason, nextReason);
+    return nextReason;
+  }
+
+  static String finalOrderSkipReason(
+      String persistedReason, String evidenceReason, long skippedBeforeSend, long skippedAtFinal) {
+    boolean hasPersistedSkipReason =
+        persistedReason != null
+            && (persistedReason.contains(PARTIAL_RECOVERY_SKIP_REASON)
+                || persistedReason.contains(RESOURCE_LIMIT_SKIP_REASON));
+    if (!hasPersistedSkipReason) return evidenceReason;
+    return skippedAtFinal > skippedBeforeSend
+        ? appendReason(persistedReason, evidenceReason)
+        : persistedReason;
+  }
+
+  private static String appendReason(String currentReason, String nextReason) {
+    if (nextReason == null || nextReason.isBlank() || currentReason.contains(nextReason))
+      return currentReason;
+    return currentReason + "; " + nextReason;
+  }
 
   public static String finalSkip(
       String instrument,
