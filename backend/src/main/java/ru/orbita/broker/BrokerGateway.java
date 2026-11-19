@@ -203,7 +203,10 @@ public interface BrokerGateway extends AutoCloseable {
     }
   }
 
-  /** Raw own-resource limits remain separately qualified; commission is never inferred as zero. */
+  /**
+   * Raw own-resource limits remain separately qualified. Preliminary commission covers the quantity
+   * in the resource request and is never inferred as zero.
+   */
   record ResourceEvidence(
       String accountId,
       Instrument instrument,
@@ -370,6 +373,12 @@ public interface BrokerGateway extends AutoCloseable {
   default History mirrorHistory(Instant fromInclusive, Instant throughInclusive) {
     return new History(
         List.of(), List.of("Mirror history unavailable"), fromInclusive, throughInclusive);
+  }
+
+  /** Explicit, scoped evidence for nondecreasing total BUY cost; adapters default to unknown. */
+  default boolean buyTotalCostNondecreasing(
+      String accountId, String instrumentId, String currency) {
+    return false;
   }
 
   default java.util.Optional<BigDecimal> bestOppositePrice(String instrumentId, Side side) {

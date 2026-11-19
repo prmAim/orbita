@@ -65,6 +65,7 @@ powershell -File deploy/start.ps1 -ComposeOverride C:/OrbitaPrivate/broker.compo
 | `reserve-currency` | Трёхбуквенный код подтверждённой валюты расчётов и резерва; обязателен для ресурсов и фактической комиссии |
 | `own-resource-interpretation-confirmed` | Подтверждены собственные деньги и доступность расчётов; по умолчанию `false` |
 | `commission-interpretation-confirmed` | Подтверждена трактовка предварительной комиссии по разности полной и исходной стоимости; по умолчанию `false` |
+| `total-buy-cost-nondecreasing-confirmed` | Отдельная операторская аттестация неубывания полной цены покупки по числу лотов в scope mirror account, `instrument-ids` и `reserve-currency` до `valid-until`; не подтверждает резервирование банка; по умолчанию `false` |
 | `margin-disabled-confirmed` | Подтверждено отключение маржи на счёте; по умолчанию `false` |
 | `additional-commission-reserve` | Явный неотрицательный дополнительный резерв в указанной валюте; нулевого значения по умолчанию нет; не более 28 знаков после точки и 36 до точки |
 | `own-money-basis` | Подтверждённая трактовка собственных средств, описанная ниже; по умолчанию `UNQUALIFIED` |

@@ -50,6 +50,12 @@ public final class TInvestBrokerGateway implements BrokerGateway {
   }
 
   @Override
+  public boolean buyTotalCostNondecreasing(String accountId, String instrumentId, String currency) {
+    return qualifications.buyTotalCostNondecreasingQualified(
+        accountId, instrumentId, currency, clock.instant());
+  }
+
+  @Override
   public AccountRead.Snapshot<AccountRead.Order> readOrderHistory(
       Instant from, Instant through, java.util.Collection<String> retainedBrokerOrderIds) {
     return new TInvestAccountReader(factory, mirrorAccount, clock)

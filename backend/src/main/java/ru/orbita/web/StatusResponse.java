@@ -17,7 +17,8 @@ record StatusResponse(
     boolean reconciled,
     String lastError,
     String ratioNumerator,
-    String ratioDenominator) {
+    String ratioDenominator,
+    int failedAttempts) {
   static StatusResponse from(ControlService.Status status) {
     return new StatusResponse(
         status.mode(),
@@ -31,7 +32,8 @@ record StatusResponse(
         status.reconciled(),
         status.lastError(),
         status.ratioNumerator() == null ? null : status.ratioNumerator().toString(),
-        status.ratioDenominator() == null ? null : status.ratioDenominator().toString());
+        status.ratioDenominator() == null ? null : status.ratioDenominator().toString(),
+        status.failedAttempts());
   }
 
   static String decimal(BigDecimal value) {

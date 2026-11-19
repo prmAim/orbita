@@ -224,7 +224,10 @@ public class CopyService {
         new JournalEntry(
             clock.instant(), "SOURCE_SKIPPED", event.instrumentId, event.id + " " + reason));
     notifications.publish(
-        "SOURCE_SKIPPED", event.instrumentId, clock.instant(), event.side + ": " + reason);
+        "SOURCE_SKIPPED",
+        event.instrumentId,
+        clock.instant(),
+        TradeNotificationText.sourceSkip(event.instrumentId, event.side, event.lots, reason));
   }
 
   public List<CopyIntent.View> intents() {

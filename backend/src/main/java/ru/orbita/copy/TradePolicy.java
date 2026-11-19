@@ -44,28 +44,4 @@ public final class TradePolicy {
     if (earliest.isBefore(executedAt)) return Age.WAIT_FOR_TIME;
     return Age.ALLOWED;
   }
-
-  public static long affordable(
-      long requested,
-      int lotSize,
-      BigDecimal limit,
-      BigDecimal money,
-      BigDecimal commission,
-      BigDecimal additionalReserve) {
-    if (requested < 0
-        || lotSize <= 0
-        || money == null
-        || commission == null
-        || additionalReserve == null
-        || commission.signum() < 0
-        || additionalReserve.signum() < 0)
-      throw new IllegalArgumentException("Unqualified resources");
-    BigDecimal available = money.subtract(commission).subtract(additionalReserve);
-    if (available.signum() <= 0) return 0;
-    return Math.min(
-        requested,
-        available
-            .divide(limit.multiply(BigDecimal.valueOf(lotSize)), 0, RoundingMode.FLOOR)
-            .longValueExact());
-  }
 }

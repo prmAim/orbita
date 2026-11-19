@@ -27,14 +27,5 @@ class TradePolicyTest {
         .isEqualByComparingTo("101.5");
     assertThat(TradePolicy.limit(SELL, new BigDecimal("101"), new BigDecimal("0.1")))
         .isEqualByComparingTo("100.5");
-    assertThat(
-            TradePolicy.affordable(
-                5,
-                10,
-                new BigDecimal("100"),
-                new BigDecimal("3100"),
-                new BigDecimal("50"),
-                new BigDecimal("100")))
-        .isEqualTo(2);
   }
 }

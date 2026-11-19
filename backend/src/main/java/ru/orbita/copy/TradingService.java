@@ -1,9 +1,12 @@
 package ru.orbita.copy;
 
+import jakarta.annotation.PreDestroy;
 import jakarta.persistence.*;
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.*;
 import java.util.*;
+import java.util.concurrent.*;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -20,6 +23,11 @@ import ru.orbita.notifications.NotificationService;
  */
 @Service
 public class TradingService implements UnsentIntentStop {
+  private static final int READY_INTENT_BATCH_SIZE = 100;
+  private static final int READINESS_CONCURRENCY = 16;
+  private static final int MAX_READINESS_PASS_INTENTS = 128;
+  private static final long READINESS_ITEM_BUDGET_NANOS = Duration.ofSeconds(5).toNanos();
+  private static final long READINESS_PASS_BUDGET_NANOS = Duration.ofSeconds(12).toNanos();
   private static final Set<String> LIVE =
       Set.of("SEND_STARTED", "ACTIVE", "UNKNOWN", "CANCEL_STARTED");
   private final EntityManager em;
@@ -33,6 +41,23 @@ public class TradingService implements UnsentIntentStop {
   private final NotificationService notificationService;
   private final ru.orbita.valuation.RubValuation rubValuation;
   private final OrderEvidenceJournal orderJournal;
+  // BrokerGateway calls are synchronous; cancellation still depends on transport-level deadlines.
+  volatile Runnable readinessTaskCompletedHook = () -> {};
+  volatile Runnable beforeReadinessCollectionHook = () -> {};
+  private final ExecutorService readinessExecutor =
+      new ThreadPoolExecutor(
+          READINESS_CONCURRENCY,
+          READINESS_CONCURRENCY,
+          0L,
+          TimeUnit.MILLISECONDS,
+          new ArrayBlockingQueue<>(READINESS_CONCURRENCY)) {
+        @Override
+        protected void afterExecute(Runnable task, Throwable failure) {
+          super.afterExecute(task, failure);
+          readinessTaskCompletedHook.run();
+        }
+      };
+  private QueuePosition readinessCursor;
 
   public TradingService(
       EntityManager em,
@@ -57,6 +82,11 @@ public class TradingService implements UnsentIntentStop {
     this.notificationService = notificationService;
     this.rubValuation = rubValuation;
     this.orderJournal = orderJournal;
+  }
+
+  @PreDestroy
+  public void stopReadinessExecutor() {
+    readinessExecutor.shutdownNow();
   }
 
   public void tick() {
@@ -124,20 +154,330 @@ public class TradingService implements UnsentIntentStop {
             == 0) control.stoppedAfterReconciliation();
   }
 
-  public void dispatchReady() {
+  public synchronized void dispatchReady() {
     replayOrderEvidence();
     BrokerGateway gateway = gateways.getIfAvailable();
     if (gateway == null) return;
-    List<UUID> waiting =
-        tx.execute(
-            _ ->
-                em.createQuery(
-                        "select i.id from CopyIntent i where i.status in ('WAITING','HALTED') order by i.prioritySequence,i.id",
-                        UUID.class)
-                    .setMaxResults(100)
-                    .getResultList());
-    for (UUID id : waiting) prepare(gateway, id);
+    QueuePosition snapshotStart = readinessCursor;
+    List<CopyIntent> waiting = waitingSnapshot();
+    if (waiting.isEmpty()) return;
+
+    // Keep HALTED retry handling serialized and dedupe children already present in this snapshot.
+    Set<UUID> haltedParentsPrepared = new HashSet<>();
+    for (CopyIntent intent : waiting) {
+      if (!"HALTED".equals(intent.status)) continue;
+      if (intent.retryOf != null && haltedParentsPrepared.contains(intent.retryOf)) continue;
+      haltedParentsPrepared.add(intent.id);
+      prepare(gateway, intent.id);
+    }
+    List<CopyIntent> waitingOnly =
+        waiting.stream()
+            .filter(intent -> "WAITING".equals(intent.status))
+            .filter(
+                intent -> intent.retryOf == null || !haltedParentsPrepared.contains(intent.retryOf))
+            .toList();
+    dispatchWaiting(gateway, waitingOnly, snapshotStart);
   }
+
+  private List<CopyIntent> waitingSnapshot() {
+    QueuePosition highWater = waitingHighWater();
+    if (highWater == null) {
+      readinessCursor = null;
+      return List.of();
+    }
+    QueuePosition cursor = readinessCursor;
+    boolean wrapped = cursor == null;
+    QueuePosition after = cursor;
+    QueuePosition lastScanned = null;
+    List<CopyIntent> snapshot = new ArrayList<>(MAX_READINESS_PASS_INTENTS);
+    while (snapshot.size() < MAX_READINESS_PASS_INTENTS) {
+      QueuePosition upper = wrapped && cursor != null ? cursor : highWater;
+      List<CopyIntent> page = waitingPage(after, upper);
+      if (page.isEmpty()) {
+        if (!wrapped && cursor != null) {
+          wrapped = true;
+          after = null;
+          continue;
+        }
+        break;
+      }
+      int count = Math.min(page.size(), MAX_READINESS_PASS_INTENTS - snapshot.size());
+      snapshot.addAll(page.subList(0, count));
+      CopyIntent last = page.get(count - 1);
+      lastScanned = new QueuePosition(last.prioritySequence, last.id);
+      after = lastScanned;
+      boolean reachedUpper =
+          lastScanned.prioritySequence() > upper.prioritySequence()
+              || (lastScanned.prioritySequence() == upper.prioritySequence()
+                  && lastScanned.id().equals(upper.id()));
+      if (reachedUpper) {
+        if (!wrapped && cursor != null) {
+          wrapped = true;
+          after = null;
+        } else {
+          break;
+        }
+      }
+    }
+    if (lastScanned != null) readinessCursor = lastScanned;
+    return List.copyOf(snapshot);
+  }
+
+  // Read-only broker preflight runs in bounded waves; reservations and PostOrder remain serialized.
+  private void dispatchWaiting(
+      BrokerGateway gateway, List<CopyIntent> waiting, QueuePosition snapshotStart) {
+    var gate = control.gate();
+    List<CopyIntent> eligible = new ArrayList<>();
+    for (CopyIntent intent : waiting) {
+      if (!"WAITING".equals(intent.status)) continue;
+      if (!gate.running()) {
+        skip(intent.id, "Общая ручная остановка");
+        continue;
+      }
+      if (gate.recalculationPaused() || !gate.reconciled()) continue;
+      AgeCheck age = age(intent.executedAt);
+      if (age.expired) {
+        skip(intent.id, TradeNotificationText.expiredReason(age.reason, intent.reason));
+        continue;
+      }
+      if (age.allowed) eligible.add(intent);
+    }
+
+    CompletionService<ReadinessResult> completed =
+        new ExecutorCompletionService<>(readinessExecutor);
+    Map<Future<ReadinessResult>, PendingReadiness> pending = new IdentityHashMap<>();
+    int next = 0;
+    QueuePosition lastSubmitted = null;
+    boolean stopSubmitting = false;
+    boolean collectionHookCalled = false;
+    long passDeadline = System.nanoTime() + READINESS_PASS_BUDGET_NANOS;
+    try {
+      while (next < eligible.size() || !pending.isEmpty()) {
+        if (readinessExecutor.isShutdown() || System.nanoTime() - passDeadline >= 0) break;
+
+        while (!stopSubmitting
+            && next < eligible.size()
+            && pending.size() < READINESS_CONCURRENCY) {
+          if (readinessExecutor.isShutdown()) {
+            stopSubmitting = true;
+            break;
+          }
+          CopyIntent intent = eligible.get(next);
+          Future<ReadinessResult> future;
+          try {
+            future = completed.submit(() -> inspect(gateway, intent));
+          } catch (RejectedExecutionException saturated) {
+            stopSubmitting = true;
+            break;
+          }
+          pending.put(
+              future, new PendingReadiness(System.nanoTime() + READINESS_ITEM_BUDGET_NANOS));
+          next++;
+          lastSubmitted = new QueuePosition(intent.prioritySequence, intent.id);
+        }
+        if (readinessExecutor.isShutdown() || pending.isEmpty()) break;
+        if (!collectionHookCalled) {
+          beforeReadinessCollectionHook.run();
+          collectionHookCalled = true;
+        }
+
+        long now = System.nanoTime();
+        long waitNanos = passDeadline - now;
+        for (PendingReadiness submission : pending.values())
+          waitNanos = Math.min(waitNanos, submission.deadlineNanos() - now);
+        Future<ReadinessResult> first =
+            completed.poll(Math.max(0L, waitNanos), TimeUnit.NANOSECONDS);
+
+        List<Future<ReadinessResult>> available = new ArrayList<>();
+        if (first != null) available.add(first);
+        Future<ReadinessResult> nextCompleted;
+        while ((nextCompleted = completed.poll()) != null) available.add(nextCompleted);
+
+        List<ReadinessResult> results = new ArrayList<>(available.size());
+        for (Future<ReadinessResult> future : available) {
+          PendingReadiness submission = pending.remove(future);
+          if (submission != null && !future.isCancelled()) results.add(completed(future));
+        }
+
+        now = System.nanoTime();
+        var iterator = pending.entrySet().iterator();
+        while (iterator.hasNext()) {
+          var entry = iterator.next();
+          if (now - entry.getValue().deadlineNanos() < 0) continue;
+          Future<ReadinessResult> future = entry.getKey();
+          iterator.remove();
+          if (future.isDone()) {
+            if (!future.isCancelled()) results.add(completed(future));
+          } else {
+            future.cancel(true);
+          }
+        }
+
+        results.sort(
+            Comparator.comparing(ReadinessResult::readyAt)
+                .thenComparingLong(result -> result.intent().prioritySequence)
+                .thenComparing(result -> result.intent().id, TradingService::compareQueueUuid));
+        for (ReadinessResult result : results)
+          prepare(gateway, result.intent().id, result.preflight());
+      }
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+      return;
+    } finally {
+      for (Future<ReadinessResult> future : pending.keySet()) future.cancel(true);
+      if (next < eligible.size())
+        readinessCursor = lastSubmitted == null ? snapshotStart : lastSubmitted;
+    }
+  }
+
+  private ReadinessResult completed(Future<ReadinessResult> future) {
+    try {
+      return future.get();
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+      throw new IllegalStateException("Interrupted while collecting readiness", interrupted);
+    } catch (ExecutionException failed) {
+      Throwable cause = failed.getCause();
+      if (cause instanceof RuntimeException runtime) throw runtime;
+      if (cause instanceof Error error) throw error;
+      throw new IllegalStateException("Readiness inspection failed", cause);
+    }
+  }
+
+  private ReadinessResult inspect(BrokerGateway gateway, CopyIntent intent) {
+    long startedNanos = System.nanoTime();
+    try {
+      Instrument requestedInstrument = gateway.instrument(intent.instrumentId);
+      if (requestedInstrument == null
+          || !requestedInstrument.apiAvailable()
+          || !("BUY".equals(intent.side)
+              ? requestedInstrument.buyAvailable()
+              : requestedInstrument.sellAvailable()))
+        return new ReadinessResult(intent, null, clock.instant());
+      BigDecimal queriedLimit =
+          TradePolicy.limit(
+              Side.valueOf(intent.side),
+              intent.referencePrice,
+              requestedInstrument.priceIncrement());
+      OrderRequest query =
+          new OrderRequest(
+              properties.mirrorAccount(),
+              intent.id,
+              intent.instrumentId,
+              Side.valueOf(intent.side),
+              intent.lots - intent.skippedLots,
+              queriedLimit);
+      if (!withinReadinessBudget(startedNanos))
+        return new ReadinessResult(intent, null, clock.instant());
+      ResourceEvidence resources = gateway.resources(query);
+      if (resources == null || !withinReadinessBudget(startedNanos))
+        return new ReadinessResult(intent, null, clock.instant());
+      BigDecimal best =
+          gateway.bestOppositePrice(intent.instrumentId, Side.valueOf(intent.side)).orElse(null);
+      if (!withinReadinessBudget(startedNanos))
+        return new ReadinessResult(intent, null, clock.instant());
+      return new ReadinessResult(
+          intent,
+          new Preflight(resources, best, queriedLimit, startedNanos, query, requestedInstrument),
+          clock.instant());
+    } catch (RuntimeException failure) {
+      PersistenceBoundary.rethrowBrokerPersistence(failure);
+      return new ReadinessResult(intent, null, clock.instant());
+    }
+  }
+
+  private record Preflight(
+      ResourceEvidence resources,
+      BigDecimal best,
+      BigDecimal queriedLimit,
+      long startedNanos,
+      OrderRequest request,
+      Instrument requestedInstrument) {}
+
+  private boolean withinReadinessBudget(long startedNanos) {
+    long elapsed = System.nanoTime() - startedNanos;
+    return elapsed >= 0 && elapsed <= READINESS_ITEM_BUDGET_NANOS;
+  }
+
+  private boolean preflightMatches(CopyIntent current, Preflight preflight) {
+    Instrument requested = preflight.requestedInstrument();
+    ResourceEvidence resources = preflight.resources();
+    if (requested == null
+        || resources == null
+        || resources.instrument() == null
+        || preflight.queriedLimit() == null
+        || !Objects.equals(current.instrumentId, requested.id())
+        || !requested.apiAvailable()
+        || !("BUY".equals(current.side) ? requested.buyAvailable() : requested.sellAvailable()))
+      return false;
+    BigDecimal currentLimit =
+        TradePolicy.limit(
+            Side.valueOf(current.side), current.referencePrice, requested.priceIncrement());
+    OrderRequest expected =
+        new OrderRequest(
+            properties.mirrorAccount(),
+            current.id,
+            current.instrumentId,
+            Side.valueOf(current.side),
+            current.lots - current.skippedLots,
+            currentLimit);
+    return expected.equals(preflight.request())
+        && currentLimit.compareTo(preflight.queriedLimit()) == 0
+        && Objects.equals(requested, resources.instrument());
+  }
+
+  private record PendingReadiness(long deadlineNanos) {}
+
+  private record ReadinessResult(CopyIntent intent, Preflight preflight, Instant readyAt) {}
+
+  private static int compareQueueUuid(UUID left, UUID right) {
+    int most = Long.compareUnsigned(left.getMostSignificantBits(), right.getMostSignificantBits());
+    return most != 0
+        ? most
+        : Long.compareUnsigned(left.getLeastSignificantBits(), right.getLeastSignificantBits());
+  }
+
+  private QueuePosition waitingHighWater() {
+    return tx.execute(
+        _ -> {
+          List<CopyIntent> latest =
+              em.createQuery(
+                      "from CopyIntent i where i.status in ('WAITING','HALTED') order by i.prioritySequence desc,i.id desc",
+                      CopyIntent.class)
+                  .setMaxResults(1)
+                  .getResultList();
+          if (latest.isEmpty()) return null;
+          CopyIntent last = latest.getFirst();
+          return new QueuePosition(last.prioritySequence, last.id);
+        });
+  }
+
+  private List<CopyIntent> waitingPage(QueuePosition after, QueuePosition highWater) {
+    return tx.execute(
+        _ -> {
+          String query =
+              "from CopyIntent i where i.status in ('WAITING','HALTED') "
+                  + "and (i.prioritySequence < :highPriority or "
+                  + "(i.prioritySequence = :highPriority and i.id <= :highId)) ";
+          if (after != null)
+            query +=
+                "and (i.prioritySequence > :afterPriority or "
+                    + "(i.prioritySequence = :afterPriority and i.id > :afterId)) ";
+          query += "order by i.prioritySequence,i.id";
+          var selection =
+              em.createQuery(query, CopyIntent.class)
+                  .setParameter("highPriority", highWater.prioritySequence())
+                  .setParameter("highId", highWater.id());
+          if (after != null) {
+            selection
+                .setParameter("afterPriority", after.prioritySequence())
+                .setParameter("afterId", after.id());
+          }
+          return selection.setMaxResults(READY_INTENT_BATCH_SIZE).getResultList();
+        });
+  }
+
+  private record QueuePosition(long prioritySequence, UUID id) {}
 
   private OrderRequest request(CopyIntent i) {
     return new OrderRequest(
@@ -149,7 +489,258 @@ public class TradingService implements UnsentIntentStop {
         i.limitPrice);
   }
 
+  private record ReservationSnapshot(BigDecimal total) {}
+
+  private record BuySelection(
+      long lots, ResourceEvidence quote, ReservationSnapshot reservations, boolean complete) {}
+
+  private ReservationSnapshot reservationSnapshot(String currency, ResourceEvidence resources) {
+    BigDecimal reserved = BigDecimal.ZERO;
+    for (var reservation :
+        em.createQuery(
+                "from CopyIntent i where i.currency=:currency and i.reservedMoney>0",
+                CopyIntent.class)
+            .setParameter("currency", currency)
+            .getResultList()) {
+      BigDecimal reflected =
+          resources.bankReflectedReservations().getOrDefault(reservation.id, BigDecimal.ZERO);
+      if (reflected.signum() < 0 || reflected.compareTo(reservation.reservedMoney) > 0)
+        throw new IllegalArgumentException("Unqualified bank reservation coverage");
+      reserved = reserved.add(reservation.reservedMoney.subtract(reflected));
+    }
+    return new ReservationSnapshot(reserved);
+  }
+
+  private boolean resourceEvidenceValid(
+      ResourceEvidence evidence,
+      Instrument expected,
+      String currency,
+      long inspectionStartedNanos) {
+    if (evidence == null
+        || !evidence.qualified()
+        || !properties.mirrorAccount().equals(evidence.accountId())
+        || !expected.equals(evidence.instrument())
+        || currency == null
+        || expected.currency() == null
+        || !expected.currency().equalsIgnoreCase(currency)
+        || evidence.ownMoney() == null
+        || evidence.ownMoney().signum() < 0
+        || evidence.buyMaxLots() < 0
+        || evidence.sellMaxLots() < 0
+        || evidence.preliminaryCommission() == null
+        || evidence.preliminaryCommission().signum() < 0
+        || evidence.additionalCommissionReserve() == null
+        || evidence.additionalCommissionReserve().signum() < 0
+        || evidence.requestStarted() == null
+        || evidence.receivedAt() == null) return false;
+    Instant now = clock.instant();
+    if (now.isBefore(evidence.requestStarted())
+        || now.isAfter(evidence.requestStarted().plusSeconds(5))
+        || evidence.receivedAt().isBefore(evidence.requestStarted())
+        || evidence.receivedAt().isAfter(now)) return false;
+    long elapsed = System.nanoTime() - inspectionStartedNanos;
+    return elapsed >= 0 && elapsed <= Duration.ofSeconds(5).toNanos();
+  }
+
+  private boolean sameAmounts(Map<UUID, BigDecimal> first, Map<UUID, BigDecimal> second) {
+    if (!first.keySet().equals(second.keySet())) return false;
+    for (UUID id : first.keySet()) if (first.get(id).compareTo(second.get(id)) != 0) return false;
+    return true;
+  }
+
+  private boolean sameBuySnapshot(ResourceEvidence full, ResourceEvidence candidate) {
+    return Objects.equals(full.accountId(), candidate.accountId())
+        && Objects.equals(full.instrument(), candidate.instrument())
+        && full.buyMaxLots() == candidate.buyMaxLots()
+        && full.sellMaxLots() == candidate.sellMaxLots()
+        && full.ownMoney().compareTo(candidate.ownMoney()) == 0
+        && full.additionalCommissionReserve().compareTo(candidate.additionalCommissionReserve())
+            == 0
+        && sameAmounts(full.bankReflectedReservations(), candidate.bankReflectedReservations());
+  }
+
+  private boolean buyAffordable(
+      long lots,
+      Instrument instrument,
+      BigDecimal limit,
+      ResourceEvidence quote,
+      BigDecimal reserved) {
+    if (lots == 0) return true;
+    BigDecimal principal =
+        limit.multiply(BigDecimal.valueOf(instrument.lotSize())).multiply(BigDecimal.valueOf(lots));
+    BigDecimal fees = quote.preliminaryCommission().add(quote.additionalCommissionReserve());
+    return principal.add(fees).compareTo(quote.ownMoney().subtract(reserved)) <= 0;
+  }
+
+  private BigDecimal buyTotalCost(
+      long lots, Instrument instrument, BigDecimal limit, ResourceEvidence quote) {
+    return limit
+        .multiply(BigDecimal.valueOf(instrument.lotSize()))
+        .multiply(BigDecimal.valueOf(lots))
+        .add(quote.preliminaryCommission())
+        .add(quote.additionalCommissionReserve());
+  }
+
+  private boolean recordNondecreasingBuyCost(
+      Map<Long, BigDecimal> observed, long lots, BigDecimal totalCost) {
+    for (var entry : observed.entrySet()) {
+      if ((entry.getKey() < lots && entry.getValue().compareTo(totalCost) > 0)
+          || (entry.getKey() > lots && entry.getValue().compareTo(totalCost) < 0)) return false;
+    }
+    observed.put(lots, totalCost);
+    return true;
+  }
+
+  private boolean withinBuyInspectionBudget(long inspectionStartedNanos) {
+    long elapsed = System.nanoTime() - inspectionStartedNanos;
+    return elapsed >= 0 && elapsed <= Duration.ofSeconds(5).toNanos();
+  }
+
+  private boolean consistentBuyQuote(
+      ResourceEvidence full,
+      ResourceEvidence quote,
+      long lots,
+      Instrument instrument,
+      String currency,
+      long inspectionStartedNanos) {
+    return resourceEvidenceValid(quote, instrument, currency, inspectionStartedNanos)
+        && sameBuySnapshot(full, quote)
+        && lots <= quote.buyMaxLots()
+        && (quote == full || !quote.requestStarted().isBefore(full.requestStarted()));
+  }
+
+  private BuySelection selectBuy(
+      BrokerGateway gateway,
+      CopyIntent intent,
+      Instrument instrument,
+      BigDecimal limit,
+      long requested,
+      ResourceEvidence full,
+      ReservationSnapshot reservations,
+      long inspectionStartedNanos) {
+    if (!resourceEvidenceValid(full, instrument, intent.currency, inspectionStartedNanos))
+      return new BuySelection(0, full, reservations, false);
+    if (requested <= 0) return new BuySelection(0, full, reservations, true);
+
+    BigDecimal principalPerLot = limit.multiply(BigDecimal.valueOf(instrument.lotSize()));
+    BigDecimal spendable = full.ownMoney().subtract(reservations.total());
+    BigDecimal principalBudget = spendable.subtract(full.additionalCommissionReserve());
+    if (principalBudget.signum() <= 0) return new BuySelection(0, full, reservations, true);
+    BigDecimal principalLotLimit = principalBudget.divide(principalPerLot, 0, RoundingMode.FLOOR);
+    long upper =
+        principalLotLimit.compareTo(BigDecimal.valueOf(requested)) >= 0
+            ? requested
+            : principalLotLimit.longValueExact();
+    upper = Math.min(upper, full.buyMaxLots());
+    if (upper <= 0) return new BuySelection(0, full, reservations, true);
+
+    ResourceEvidence upperQuote = full;
+    if (upper != requested) {
+      if (!withinBuyInspectionBudget(inspectionStartedNanos))
+        return new BuySelection(0, full, reservations, false);
+      upperQuote =
+          gateway.resources(
+              new OrderRequest(
+                  properties.mirrorAccount(),
+                  intent.id,
+                  intent.instrumentId,
+                  Side.BUY,
+                  upper,
+                  limit));
+    }
+    if (!consistentBuyQuote(
+        full, upperQuote, upper, instrument, intent.currency, inspectionStartedNanos))
+      return new BuySelection(0, full, reservations, false);
+    if (buyAffordable(upper, instrument, limit, upperQuote, reservations.total()))
+      return new BuySelection(upper, upperQuote, reservations, true);
+
+    boolean nondecreasing =
+        gateway.buyTotalCostNondecreasing(
+            properties.mirrorAccount(), intent.instrumentId, intent.currency);
+    Map<Long, BigDecimal> observedTotalCosts = nondecreasing ? new HashMap<>() : null;
+    if (nondecreasing) {
+      observedTotalCosts.put(requested, buyTotalCost(requested, instrument, limit, full));
+      if (!recordNondecreasingBuyCost(
+          observedTotalCosts, upper, buyTotalCost(upper, instrument, limit, upperQuote)))
+        return new BuySelection(0, full, reservations, false);
+    }
+    ResourceEvidence selectedQuote = null;
+    long low = 0;
+    long high = upper;
+    if (nondecreasing) {
+      while (high - low > 1) {
+        if (!withinBuyInspectionBudget(inspectionStartedNanos))
+          return new BuySelection(0, full, reservations, false);
+        long distance = high - low;
+        long candidate = low + distance / 2 + distance % 2;
+        ResourceEvidence quote =
+            gateway.resources(
+                new OrderRequest(
+                    properties.mirrorAccount(),
+                    intent.id,
+                    intent.instrumentId,
+                    Side.BUY,
+                    candidate,
+                    limit));
+        if (!consistentBuyQuote(
+                full, quote, candidate, instrument, intent.currency, inspectionStartedNanos)
+            || !recordNondecreasingBuyCost(
+                observedTotalCosts, candidate, buyTotalCost(candidate, instrument, limit, quote)))
+          return new BuySelection(0, full, reservations, false);
+        if (buyAffordable(candidate, instrument, limit, quote, reservations.total())) {
+          low = candidate;
+          selectedQuote = quote;
+        } else high = candidate;
+      }
+    } else {
+      for (long candidate = upper - 1; candidate > 0; candidate--) {
+        if (!withinBuyInspectionBudget(inspectionStartedNanos))
+          return new BuySelection(0, full, reservations, false);
+        ResourceEvidence quote =
+            gateway.resources(
+                new OrderRequest(
+                    properties.mirrorAccount(),
+                    intent.id,
+                    intent.instrumentId,
+                    Side.BUY,
+                    candidate,
+                    limit));
+        if (!consistentBuyQuote(
+            full, quote, candidate, instrument, intent.currency, inspectionStartedNanos))
+          return new BuySelection(0, full, reservations, false);
+        if (buyAffordable(candidate, instrument, limit, quote, reservations.total())) {
+          low = candidate;
+          selectedQuote = quote;
+          break;
+        }
+      }
+    }
+
+    if (low == 0) return new BuySelection(0, full, reservations, true);
+    if (!withinBuyInspectionBudget(inspectionStartedNanos))
+      return new BuySelection(0, full, reservations, false);
+    ResourceEvidence confirmed =
+        gateway.resources(
+            new OrderRequest(
+                properties.mirrorAccount(), intent.id, intent.instrumentId, Side.BUY, low, limit));
+    if (!consistentBuyQuote(
+            full, confirmed, low, instrument, intent.currency, inspectionStartedNanos)
+        || selectedQuote == null
+        || confirmed.preliminaryCommission().compareTo(selectedQuote.preliminaryCommission()) != 0
+        || !buyAffordable(low, instrument, limit, confirmed, reservations.total()))
+      return new BuySelection(0, full, reservations, false);
+    return new BuySelection(low, confirmed, reservations, true);
+  }
+
   private void prepare(BrokerGateway gateway, UUID id) {
+    prepare(gateway, id, null, false);
+  }
+
+  private void prepare(BrokerGateway gateway, UUID id, Preflight supplied) {
+    prepare(gateway, id, supplied, true);
+  }
+
+  private void prepare(BrokerGateway gateway, UUID id, Preflight supplied, boolean preflightDone) {
     CopyIntent detached = tx.execute(_ -> em.find(CopyIntent.class, id));
     if (detached != null && "HALTED".equals(detached.status)) {
       retryHalted(gateway, detached);
@@ -164,63 +755,100 @@ public class TradingService implements UnsentIntentStop {
     if (gate.recalculationPaused() || !gate.reconciled()) return;
     AgeCheck age = age(detached.executedAt);
     if (age.expired) {
-      skip(
-          id,
-          age.reason + (detached.reason == null ? "" : "; последнее ожидание: " + detached.reason));
+      skip(id, TradeNotificationText.expiredReason(age.reason, detached.reason));
       return;
     }
     if (!age.allowed) return;
-    Instrument requestedInstrument;
-    ResourceEvidence resources;
-    BigDecimal best;
-    BigDecimal queriedLimit;
-    long inspectionStartedNanos = System.nanoTime();
-    try {
-      requestedInstrument = gateway.instrument(detached.instrumentId);
-      if (!requestedInstrument.apiAvailable()
-          || !("BUY".equals(detached.side)
-              ? requestedInstrument.buyAvailable()
-              : requestedInstrument.sellAvailable())) return;
-      queriedLimit =
-          TradePolicy.limit(
-              Side.valueOf(detached.side),
-              detached.referencePrice,
-              requestedInstrument.priceIncrement());
-      resources =
-          gateway.resources(
-              new OrderRequest(
-                  properties.mirrorAccount(),
-                  id,
-                  detached.instrumentId,
-                  Side.valueOf(detached.side),
-                  detached.lots - detached.skippedLots,
-                  queriedLimit));
-      best =
-          gateway
-              .bestOppositePrice(detached.instrumentId, Side.valueOf(detached.side))
-              .orElse(null);
-    } catch (RuntimeException e) {
-      PersistenceBoundary.rethrowBrokerPersistence(e);
+    if (!preflightDone) supplied = inspect(gateway, detached).preflight();
+    if (supplied == null || supplied.resources() == null || !preflightMatches(detached, supplied))
       return;
+    ResourceEvidence previousResources = supplied.resources();
+    if (previousResources.qualified()) {
+      try {
+        ResourceEvidence refreshed = gateway.resources(supplied.request());
+        if (refreshed == null) return;
+        if (refreshed.qualified()
+            && (previousResources.preliminaryCommission() == null
+                || refreshed.preliminaryCommission() == null
+                || previousResources
+                        .preliminaryCommission()
+                        .compareTo(refreshed.preliminaryCommission())
+                    != 0
+                || previousResources.additionalCommissionReserve() == null
+                || refreshed.additionalCommissionReserve() == null
+                || previousResources
+                        .additionalCommissionReserve()
+                        .compareTo(refreshed.additionalCommissionReserve())
+                    != 0)) return;
+        supplied =
+            new Preflight(
+                refreshed,
+                supplied.best(),
+                supplied.queriedLimit(),
+                supplied.startedNanos(),
+                supplied.request(),
+                supplied.requestedInstrument());
+      } catch (RuntimeException failure) {
+        PersistenceBoundary.rethrowBrokerPersistence(failure);
+        return;
+      }
     }
-    Instrument instrument = resources.instrument();
+    if (!preflightMatches(detached, supplied)) return;
+    ResourceEvidence fullResources = supplied.resources();
+    BigDecimal best = supplied.best();
+    BigDecimal queriedLimit = supplied.queriedLimit();
+    long inspectionStartedNanos = supplied.startedNanos();
+    long queriedLots = detached.lots - detached.skippedLots;
+    Instrument requestedInstrument = supplied.requestedInstrument();
+    Instrument instrument = fullResources.instrument();
     if (instrument == null
         || !instrument.apiAvailable()
         || instrument.lotSize() <= 0
+        || !Objects.equals(requestedInstrument, instrument)
         || TradePolicy.limit(
                     Side.valueOf(detached.side),
                     detached.referencePrice,
                     instrument.priceIncrement())
                 .compareTo(queriedLimit)
             != 0) return;
-    if (!resources.qualified()) {
+    if (!fullResources.qualified()) {
       tx.executeWithoutResult(
           _ -> {
             control.gate();
             var i = em.find(CopyIntent.class, id);
-            if ("WAITING".equals(i.status)) i.reason = resources.detail();
+            if ("WAITING".equals(i.status))
+              i.reason =
+                  TradeNotificationText.preserveSkipReasons(i.reason, fullResources.detail());
           });
       return;
+    }
+    if (!resourceEvidenceValid(
+        fullResources, instrument, detached.currency, inspectionStartedNanos)) return;
+    BuySelection buySelection;
+    ResourceEvidence resources;
+    if ("BUY".equals(detached.side)) {
+      ReservationSnapshot searchReservations =
+          tx.execute(_ -> reservationSnapshot(detached.currency, fullResources));
+      try {
+        buySelection =
+            selectBuy(
+                gateway,
+                detached,
+                instrument,
+                queriedLimit,
+                queriedLots,
+                fullResources,
+                searchReservations,
+                inspectionStartedNanos);
+      } catch (RuntimeException e) {
+        PersistenceBoundary.rethrowBrokerPersistence(e);
+        return;
+      }
+      if (!buySelection.complete()) return;
+      resources = buySelection.quote();
+    } else {
+      buySelection = null;
+      resources = fullResources;
     }
     var unitRub =
         rubValuation.value(
@@ -236,6 +864,11 @@ public class TradingService implements UnsentIntentStop {
               var currentGate = control.gate();
               CopyIntent i = em.find(CopyIntent.class, id, LockModeType.PESSIMISTIC_WRITE);
               if (!"WAITING".equals(i.status)
+                  || !Objects.equals(i.side, detached.side)
+                  || !Objects.equals(i.instrumentId, detached.instrumentId)
+                  || !Objects.equals(i.currency, detached.currency)
+                  || !Objects.equals(i.referencePrice, detached.referencePrice)
+                  || i.lots - i.skippedLots != queriedLots
                   || !currentGate.running()
                   || currentGate.recalculationPaused()
                   || !currentGate.reconciled()) return null;
@@ -245,9 +878,11 @@ public class TradingService implements UnsentIntentStop {
                       || best.compareTo(i.firstBestOpposite) != 0)) return null;
               if (!age(i.executedAt).allowed) return null;
               if (resources.requestStarted() == null
+                  || resources.receivedAt() == null
                   || clock.instant().isBefore(resources.requestStarted())
-                  || clock.instant().isAfter(resources.requestStarted().plusSeconds(5)))
-                return null;
+                  || clock.instant().isAfter(resources.requestStarted().plusSeconds(5))
+                  || clock.instant().isBefore(resources.receivedAt())
+                  || clock.instant().isAfter(resources.receivedAt().plusSeconds(5))) return null;
               long inspectionElapsed = System.nanoTime() - inspectionStartedNanos;
               if (inspectionElapsed < 0 || inspectionElapsed > Duration.ofSeconds(5).toNanos())
                 return null;
@@ -278,35 +913,19 @@ public class TradingService implements UnsentIntentStop {
               i.limitPrice =
                   TradePolicy.limit(
                       Side.valueOf(i.side), i.referencePrice, instrument.priceIncrement());
-              BigDecimal reserved = BigDecimal.ZERO;
-              for (var reservation :
-                  em.createQuery(
-                          "from CopyIntent i where i.currency=:currency and i.reservedMoney>0",
-                          CopyIntent.class)
-                      .setParameter("currency", i.currency)
-                      .getResultList()) {
-                BigDecimal reflected =
-                    resources
-                        .bankReflectedReservations()
-                        .getOrDefault(reservation.id, BigDecimal.ZERO);
-                if (reflected.signum() < 0 || reflected.compareTo(reservation.reservedMoney) > 0)
-                  throw new IllegalArgumentException("Unqualified bank reservation coverage");
-                reserved = reserved.add(reservation.reservedMoney.subtract(reflected));
-              }
+              ReservationSnapshot currentReservations = reservationSnapshot(i.currency, resources);
+              if (buySelection != null
+                  && currentReservations.total().compareTo(buySelection.reservations().total())
+                      != 0) return null;
+              BigDecimal reserved = currentReservations.total();
               long allowed;
-              long requested = i.lots - i.skippedLots;
-              if ("BUY".equals(i.side))
-                allowed =
-                    Math.min(
-                        resources.buyMaxLots(),
-                        TradePolicy.affordable(
-                            requested,
-                            instrument.lotSize(),
-                            i.limitPrice,
-                            resources.ownMoney().subtract(reserved),
-                            resources.preliminaryCommission(),
-                            resources.additionalCommissionReserve()));
-              else {
+              long currentRequested = i.lots - i.skippedLots;
+              if ("BUY".equals(i.side)) {
+                if (!buyAffordable(
+                    buySelection.lots(), instrument, i.limitPrice, resources, reserved))
+                  return null;
+                allowed = Math.min(resources.buyMaxLots(), buySelection.lots());
+              } else {
                 MirrorPosition position = position(i.instrumentId);
                 long reservedLots =
                     em.createQuery(
@@ -316,7 +935,7 @@ public class TradingService implements UnsentIntentStop {
                         .getSingleResult();
                 allowed =
                     Math.min(
-                        requested,
+                        currentRequested,
                         Math.min(
                             resources.sellMaxLots(),
                             Math.max(0, position.copiedLots - reservedLots)));
@@ -330,9 +949,10 @@ public class TradingService implements UnsentIntentStop {
                     < 0) allowed = 0;
               }
               if (allowed <= 0) {
-                skipInside(i, "Недостаточно собственных средств или бумаг с комиссией");
+                skipInside(i, TradeNotificationText.RESOURCE_UNAVAILABLE_SKIP_REASON);
                 return null;
               }
+              long resourceSkipped = currentRequested - allowed;
               BigDecimal principal =
                   i.limitPrice
                       .multiply(BigDecimal.valueOf(instrument.lotSize()))
@@ -365,7 +985,9 @@ public class TradingService implements UnsentIntentStop {
               if (!control.consumeTradingPermission(i.executedAt, allowed, i.currency, rub)) {
                 i.status = "SHADOW";
                 i.reason =
-                    "Теневой расчёт: отсутствует подходящий допуск или активация автоотправки";
+                    TradeNotificationText.preserveSkipReasons(
+                        i.reason,
+                        "Теневой расчёт: отсутствует подходящий допуск или активация автоотправки");
                 em.persist(
                     new JournalEntry(
                         clock.instant(), "SHADOW_DECISION", i.instrumentId, i.view().toString()));
@@ -386,17 +1008,17 @@ public class TradingService implements UnsentIntentStop {
               i.skippedLots = i.lots - allowed;
               i.requestedLots = allowed;
               if (i.firstBestOpposite == null) i.firstBestOpposite = best;
-              if (i.skippedLots > 0)
+              if (resourceSkipped > 0) {
+                i.reason =
+                    TradeNotificationText.preserveSkipReasons(
+                        i.reason, TradeNotificationText.RESOURCE_LIMIT_SKIP_REASON);
                 notifications.publish(
                     "RESOURCE_SKIP",
                     i.instrumentId,
                     clock.instant(),
-                    i.side
-                        + ": окончательно пропущено "
-                        + i.skippedLots
-                        + " из "
-                        + i.lots
-                        + " лотов из-за ресурсов");
+                    TradeNotificationText.finalSkip(
+                        i.instrumentId, i.side, i.executedLots, i.lots, i.skippedLots, i.reason));
+              }
               i.reservedMoney = "BUY".equals(i.side) ? principal.add(fees) : fees;
               i.commissionReserve = fees;
               i.reservedLots = "SELL".equals(i.side) ? allowed : 0;
@@ -481,7 +1103,10 @@ public class TradingService implements UnsentIntentStop {
                 i.permittedIssuedAt,
                 i.permittedRubLimit);
           i.status = "WAITING";
-          i.reason = "Внешней отправки не было; требуется свежая проверка ресурсов и возраста";
+          i.reason =
+              TradeNotificationText.preserveSkipReasons(
+                  i.reason,
+                  "Внешней отправки не было; требуется свежая проверка ресурсов и возраста");
           em.persist(
               new JournalEntry(
                   clock.instant(), "KNOWN_NOT_SENT", i.instrumentId, i.id + " " + i.reason));
@@ -654,10 +1279,17 @@ public class TradingService implements UnsentIntentStop {
             i.acceptanceOrderReconciled = false;
             i.acceptanceReconciled = false;
             i.status = "UNKNOWN";
-            i.reason = "Неопределённый результат заявки; резерв сохранён";
+            i.reason =
+                TradeNotificationText.preserveSkipReasons(
+                    i.reason, "Неопределённый результат заявки; резерв сохранён");
             if (i.unknownNotification == null)
               i.unknownNotification =
-                  notifications.publish("ORDER_UNKNOWN", i.instrumentId, clock.instant(), i.reason);
+                  notifications.publish(
+                      "ORDER_UNKNOWN",
+                      i.instrumentId,
+                      clock.instant(),
+                      TradeNotificationText.unknown(
+                          i.instrumentId, i.side, i.executedLots, i.lots, i.skippedLots, i.reason));
             return;
           }
           if (evidence.lotsExecuted() < i.executedLots) {
@@ -750,7 +1382,9 @@ public class TradingService implements UnsentIntentStop {
               i.reservedLots = 0;
               i.reservedMoney = i.commissionReserve;
               i.reason =
-                  "Подтверждённый отказ из-за остановки торгов; ожидание прежней лучшей встречной цены";
+                  TradeNotificationText.preserveSkipReasons(
+                      i.reason,
+                      "Подтверждённый отказ из-за остановки торгов; ожидание прежней лучшей встречной цены");
               em.persist(
                   new JournalEntry(
                       clock.instant(),
@@ -766,16 +1400,27 @@ public class TradingService implements UnsentIntentStop {
             i.reservedMoney = i.commissionReserve;
             allocateRecovery(i);
             if (i.skippedLots > 0 && !wasFinal) {
+              long skippedBeforeSend = Math.max(0, i.lots - i.requestedLots);
+              boolean qualifiedReasonBoundToAttempt =
+                  orderJournal
+                      .latestReason(i.id)
+                      .map(r -> r.reason() == RejectionReason.INSUFFICIENT_RESOURCES)
+                      .orElse(false);
               String text =
-                  i.side
-                      + ": исполнено "
-                      + i.executedLots
-                      + "/"
-                      + i.lots
-                      + ", пропущено "
-                      + i.skippedLots
-                      + "; "
-                      + evidence.detail();
+                  TradeNotificationText.finalSkip(
+                      i.instrumentId,
+                      i.side,
+                      i.executedLots,
+                      i.lots,
+                      i.skippedLots,
+                      TradeNotificationText.finalOrderSkipReason(
+                          i.reason,
+                          qualifiedReasonBoundToAttempt,
+                          evidence.status(),
+                          evidence.rejectionReason(),
+                          i.executedLots,
+                          skippedBeforeSend,
+                          i.skippedLots));
               if (i.fullClose)
                 control.pauseInstrument(
                     i.instrumentId,
@@ -801,7 +1446,9 @@ public class TradingService implements UnsentIntentStop {
               i.deadlineReliable = confirmationBound.isPresent();
               if (!i.deadlineReliable)
                 i.reason =
-                    "Исходная точка таймера сохранена; достоверность оставшегося времени не подтверждена, новая минута не назначается";
+                    TradeNotificationText.preserveSkipReasons(
+                        i.reason,
+                        "Исходная точка таймера сохранена; достоверность оставшегося времени не подтверждена, новая минута не назначается");
             }
           }
           if (i.unknownNotification != null && !stream && (terminal || !i.cancellationPending)) {
@@ -976,14 +1623,16 @@ public class TradingService implements UnsentIntentStop {
             : Optional.<ru.orbita.broker.BuyResourceRejectionClassifier.Qualification>empty();
     if (result.isPresent()) {
       if (!qualified && terminal && result.get().status() == current.status()) {
-        i.reason = result.get().detail();
+        i.reason = TradeNotificationText.preserveSkipReasons(i.reason, result.get().detail());
         orderJournal.qualifyReason(attempt, result.get(), history);
       }
     } else if (qualified) {
       i.reason =
-          qualifiedLotSize == null
-              ? "Причина OTHER; независимый размер лота недоступен; требуется сверка"
-              : "Причина OTHER; прежняя квалификация нехватки средств опровергнута; требуется сверка";
+          TradeNotificationText.preserveSkipReasons(
+              i.reason,
+              qualifiedLotSize == null
+                  ? "Причина OTHER; независимый размер лота недоступен; требуется сверка"
+                  : "Причина OTHER; прежняя квалификация нехватки средств опровергнута; требуется сверка");
       orderJournal.invalidateReason(attempt, current.status(), i.reason, history);
       contradiction(
           i,
@@ -1008,7 +1657,12 @@ public class TradingService implements UnsentIntentStop {
       i.acceptanceReconciled = false;
       if (i.unknownNotification == null)
         i.unknownNotification =
-            notifications.publish("ORDER_UNKNOWN", i.instrumentId, clock.instant(), detail);
+            notifications.publish(
+                "ORDER_UNKNOWN",
+                i.instrumentId,
+                clock.instant(),
+                TradeNotificationText.unknown(
+                    i.instrumentId, i.side, i.executedLots, i.lots, i.skippedLots, detail));
     }
     em.persist(
         new JournalEntry(
@@ -1061,10 +1715,12 @@ public class TradingService implements UnsentIntentStop {
 
   private void skipInside(CopyIntent i, String reason) {
     i.status = "FINAL";
-    i.skippedLots = i.lots;
-    i.reason = reason;
+    i.skippedLots = i.lots - i.executedLots;
+    i.reason = TradeNotificationText.preserveSkipReasons(i.reason, reason);
     allocateRecovery(i);
-    String text = i.side + ": " + reason + "; пропущено " + i.lots + " лотов";
+    String text =
+        TradeNotificationText.finalSkip(
+            i.instrumentId, i.side, i.executedLots, i.lots, i.skippedLots, i.reason);
     if (i.fullClose) control.pauseInstrument(i.instrumentId, text + "; остались бумаги повторения");
     else notifications.publish("COPY_SKIPPED", i.instrumentId, clock.instant(), text);
   }
