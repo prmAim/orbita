@@ -770,18 +770,35 @@ class CopyLifecycleIT {
   }
 
   @Test
-  void expiredFinalSkipKeepsDistinctLastWaitingReasonWithoutDuplicateOrDanglingLabel() {
+  void expiredFinalSkipPreservesSinglePartialReasonAndAge() {
+    String partial = TradeNotificationText.PARTIAL_RECOVERY_SKIP_REASON;
+    String persisted = partial;
+    String age = "Возраст исходного исполнения превышает 60 секунд";
+    String finalReason =
+        TradeNotificationText.preserveSkipReasons(
+            persisted, TradeNotificationText.expiredReason(age, persisted));
+
+    assertThat(finalReason)
+        .isEqualTo(partial + "; Возраст исходного исполнения превышает 60 секунд");
+  }
+
+  @Test
+  void expiredFinalSkipPreservesMixedReasonsAndUnrelatedWaitingDetail() {
     String partial = TradeNotificationText.PARTIAL_RECOVERY_SKIP_REASON;
     String resource = TradeNotificationText.RESOURCE_LIMIT_SKIP_REASON;
-    String reason = TradeNotificationText.expiredReason(partial, partial + "; " + resource);
-    String notification = TradeNotificationText.finalSkip("SBER", "BUY", 0, 10, 10, reason);
+    String persisted = partial + "; " + resource + "; synthetic metadata wait";
+    String age = "Возраст исходного исполнения превышает 60 секунд";
+    String finalReason =
+        TradeNotificationText.preserveSkipReasons(
+            persisted, TradeNotificationText.expiredReason(age, persisted));
 
-    assertThat(notification)
-        .contains("причина: " + partial + "; последнее ожидание: " + resource)
-        .doesNotContain("последнее ожидание: " + partial);
-
-    String withoutDistinctContext = TradeNotificationText.expiredReason(partial, partial);
-    assertThat(withoutDistinctContext).isEqualTo(partial).doesNotContain("последнее ожидание:");
+    assertThat(finalReason)
+        .isEqualTo(
+            partial
+                + "; "
+                + resource
+                + "; Возраст исходного исполнения превышает 60 секунд"
+                + "; последнее ожидание: synthetic metadata wait");
   }
 
   @Test

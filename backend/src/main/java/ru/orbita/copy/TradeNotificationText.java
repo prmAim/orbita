@@ -111,17 +111,12 @@ public final class TradeNotificationText {
 
   static String expiredReason(String ageReason, String lastWaitingReason) {
     String remainingLastWaitingReason = lastWaitingReason;
-    if (ageReason != null) {
-      if (ageReason.contains(PARTIAL_RECOVERY_SKIP_REASON))
-        remainingLastWaitingReason =
-            removeSkipReason(remainingLastWaitingReason, PARTIAL_RECOVERY_SKIP_REASON);
-      if (ageReason.contains(RESOURCE_LIMIT_SKIP_REASON))
-        remainingLastWaitingReason =
-            removeSkipReason(remainingLastWaitingReason, RESOURCE_LIMIT_SKIP_REASON);
-      if (ageReason.contains(RESOURCE_UNAVAILABLE_SKIP_REASON))
-        remainingLastWaitingReason =
-            removeSkipReason(remainingLastWaitingReason, RESOURCE_UNAVAILABLE_SKIP_REASON);
-    }
+    remainingLastWaitingReason =
+        removeSkipReason(remainingLastWaitingReason, PARTIAL_RECOVERY_SKIP_REASON);
+    remainingLastWaitingReason =
+        removeSkipReason(remainingLastWaitingReason, RESOURCE_LIMIT_SKIP_REASON);
+    remainingLastWaitingReason =
+        removeSkipReason(remainingLastWaitingReason, RESOURCE_UNAVAILABLE_SKIP_REASON);
     if (remainingLastWaitingReason == null || remainingLastWaitingReason.isBlank())
       return ageReason;
     if (ageReason == null || ageReason.isBlank()) return remainingLastWaitingReason;
