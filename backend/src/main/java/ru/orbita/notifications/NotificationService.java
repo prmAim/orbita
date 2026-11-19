@@ -198,6 +198,11 @@ public class NotificationService implements NotificationPublisher {
           if (rows.isEmpty()) return;
           View event = rows.getFirst();
           Instant now = clock.instant();
+          String currentText =
+              db.queryForObject(
+                  "select detail from journal_entry where id=(select journal_id from notification where id=?)",
+                  String.class,
+                  claim.id());
           int failures = event.automaticFailures();
           boolean automatic = claim.kind().equals("AUTOMATIC");
           if (automatic && result.outcome() == TelegramTransport.Outcome.FAILURE) failures++;
@@ -212,11 +217,11 @@ public class NotificationService implements NotificationPublisher {
           boolean retryAnnotated =
               success
                   && event.resolvedAt() != null
-                  && !claim.text().equals(event.text())
+                  && !claim.text().equals(currentText)
                   && event.retryAnnotatedNotificationOnCompletion();
           if (success
               && event.resolvedAt() != null
-              && !claim.text().equals(event.text())
+              && !claim.text().equals(currentText)
               && !retryAnnotated) {
             // The original payload actually arrived; preserve it in the journal and emit the
             // resolution once when it was not already published separately.

@@ -430,6 +430,7 @@ public class ControlService {
           state.recalculationPaused = false;
           state.pauseStartedAt = null;
           state.recalculationErrorNotificationId = null;
+          state.lastRecalculationNotificationReason = null;
           state.failedAttempts = 0;
           if ("START".equals(attempt.kind())) {
             if (!state.reconciled) {
@@ -486,21 +487,19 @@ public class ControlService {
             if (state.pauseStartedAt == null) {
               state.pauseStartedAt = now;
               state.recalculationErrorNotificationId = null;
+              state.lastRecalculationNotificationReason = null;
             }
-            long seen =
-                em.createQuery(
-                        "select count(j) from JournalEntry j where j.category='RECALCULATION_FAILED' and j.occurredAt>=:since and j.detail=:reason",
-                        Long.class)
-                    .setParameter("since", state.pauseStartedAt)
-                    .setParameter("reason", error)
-                    .getSingleResult();
-            if (seen == 0)
-              state.recalculationErrorNotificationId =
+            if (!Objects.equals(state.lastRecalculationNotificationReason, error)) {
+              UUID notificationId =
                   notifications.publish(
                       "RECALCULATION_ERROR",
                       null,
                       now,
                       error + "; обязательный пересчёт приостановлен");
+              if (state.recalculationErrorNotificationId == null)
+                state.recalculationErrorNotificationId = notificationId;
+              state.lastRecalculationNotificationReason = error;
+            }
           }
           em.persist(new JournalEntry(now, "RECALCULATION_FAILED", null, error));
           return view(state);
@@ -592,7 +591,10 @@ public class ControlService {
           s.permitEpoch++;
           s.retryAt = null;
           s.recalculationPaused = false;
+          s.pauseStartedAt = null;
           s.recalculationErrorNotificationId = null;
+          s.lastRecalculationNotificationReason = null;
+          s.failedAttempts = 0;
           unsentIntents.getObject().discardUnsent("Общая ручная остановка до начала отправки");
           em.persist(
               new JournalEntry(clock.instant(), "MANUAL_STOP", null, "Остановить повторение"));

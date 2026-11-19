@@ -8,9 +8,11 @@ import java.sql.*;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Locale;
+import java.util.UUID;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.sql.DataSource;
+import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -24,6 +26,9 @@ import org.springframework.context.annotation.Import;
 import org.springframework.context.annotation.Role;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DelegatingDataSource;
+import org.springframework.jdbc.datasource.DriverManagerDataSource;
+import org.springframework.transaction.support.TransactionTemplate;
+import org.testcontainers.postgresql.PostgreSQLContainer;
 import ru.orbita.broker.BrokerGateway;
 import ru.orbita.control.ControlService;
 import ru.orbita.notifications.NotificationService;
@@ -45,6 +50,7 @@ class CapitalTimingIT {
   @Autowired CopyLifecycleIT.MutableClock clock;
   @Autowired JdbcTemplate database;
   @Autowired CopyLifecycleIT.TelegramSimulator telegram;
+  @Autowired TransactionTemplate transactions;
   @Autowired CommitDelay delay;
 
   @BeforeEach
@@ -154,6 +160,89 @@ class CapitalTimingIT {
   }
 
   @Test
+  void firstErrorNotificationKeepsItsIdentityAcrossDifferentFailures() {
+    control.markReconciled();
+    control.start();
+    clock.now = clock.now.plusSeconds(1);
+    Instant pauseStartedAt = clock.instant();
+    broker.failCapital = true;
+    control.mandatoryRecalculation();
+    var firstError =
+        notifications.list(200).stream()
+            .filter(event -> event.category().equals("RECALCULATION_ERROR"))
+            .findFirst()
+            .orElseThrow();
+    telegram.results.add(
+        TelegramTransport.Result.failure("Имитатор: задержка доставки", Duration.ofMinutes(2)));
+    notifications.deliverDue();
+    Instant retryAt = notifications.get(firstError.id()).nextAttemptAt();
+
+    clock.now = pauseStartedAt.plusSeconds(61);
+    broker.failCapital = false;
+    broker.capitalResponse =
+        _ -> {
+          throw new IllegalArgumentException("second simulator failure");
+        };
+    control.mandatoryRecalculation();
+    var secondError =
+        notifications.list(200).stream()
+            .filter(
+                event ->
+                    event.category().equals("RECALCULATION_ERROR")
+                        && !event.id().equals(firstError.id()))
+            .findFirst()
+            .orElseThrow();
+    assertThat(
+            database.queryForObject(
+                "select recalculation_error_notification_id from control_state where id=1",
+                UUID.class))
+        .isEqualTo(firstError.id());
+
+    clock.now = pauseStartedAt.plusSeconds(123);
+    broker.capitalResponse = null;
+    control.recalculate();
+
+    assertThat(notifications.get(firstError.id()).nextAttemptAt()).isEqualTo(retryAt);
+    assertThat(notifications.get(firstError.id()).text())
+        .contains("окончание " + NotificationService.formatTime(clock.instant()));
+    assertThat(notifications.get(secondError.id()).text()).doesNotContain("Пересчёт восстановлен;");
+  }
+
+  @Test
+  void sameFailureAfterRecoveryWithBackwardClockStartsANewPause() {
+    control.markReconciled();
+    control.start();
+    clock.now = clock.now.plusSeconds(1);
+    Instant firstPauseStartedAt = clock.instant();
+    broker.failCapital = true;
+    control.mandatoryRecalculation();
+    var firstError =
+        notifications.list(200).stream()
+            .filter(event -> event.category().equals("RECALCULATION_ERROR"))
+            .findFirst()
+            .orElseThrow();
+
+    clock.now = firstPauseStartedAt.plusSeconds(61);
+    broker.failCapital = false;
+    control.recalculate();
+    clock.now = firstPauseStartedAt.minusSeconds(60);
+    broker.failCapital = true;
+    control.mandatoryRecalculation();
+
+    var errors =
+        notifications.list(200).stream()
+            .filter(event -> event.category().equals("RECALCULATION_ERROR"))
+            .toList();
+    assertThat(errors).hasSize(2);
+    assertThat(
+            database.queryForObject(
+                "select recalculation_error_notification_id from control_state where id=1",
+                UUID.class))
+        .isNotNull()
+        .isNotEqualTo(firstError.id());
+  }
+
+  @Test
   void inFlightSuccessRedeliversAnnotatedMessageWithTheSameId() throws Exception {
     control.markReconciled();
     control.start();
@@ -198,6 +287,158 @@ class CapitalTimingIT {
     assertThat(notifications.list(200))
         .filteredOn(event -> event.category().equals("RECALCULATION_RECOVERED"))
         .hasSize(1);
+  }
+
+  @Test
+  void completionWaitingOnAnnotationLockUsesTheCommittedPayload() throws Exception {
+    Instant failedAt = clock.instant();
+    UUID id =
+        transactions.execute(
+            _ ->
+                notifications.publish(
+                    "RECALCULATION_ERROR", null, failedAt, "simulator unavailable"));
+    Instant recoveredAt = failedAt.plusSeconds(61);
+    String recoveryText =
+        "Пересчёт восстановлен; начало "
+            + NotificationService.formatTime(failedAt)
+            + ", окончание "
+            + NotificationService.formatTime(recoveredAt);
+    var annotationStarted = new CountDownLatch(1);
+    var commitAnnotation = new CountDownLatch(1);
+    telegram.sendStarted = new CountDownLatch(1);
+    telegram.allowSend = new CountDownLatch(1);
+    var delivery = CompletableFuture.runAsync(notifications::deliverDue);
+    CompletableFuture<Void> annotation = null;
+    try {
+      assertThat(telegram.sendStarted.await(5, TimeUnit.SECONDS)).isTrue();
+      annotation =
+          CompletableFuture.runAsync(
+              () ->
+                  transactions.executeWithoutResult(
+                      _ -> {
+                        assertThat(notifications.annotateUndelivered(id, recoveredAt, recoveryText))
+                            .isTrue();
+                        notifications.publish(
+                            "RECALCULATION_RECOVERED", null, recoveredAt, recoveryText);
+                        annotationStarted.countDown();
+                        await(commitAnnotation);
+                      }));
+      assertThat(annotationStarted.await(5, TimeUnit.SECONDS)).isTrue();
+      telegram.allowSend.countDown();
+      awaitBlockedCompletionQuery();
+      commitAnnotation.countDown();
+      annotation.join();
+      delivery.join();
+
+      var pending = notifications.get(id);
+      assertThat(pending.status()).isEqualTo("PENDING");
+      assertThat(pending.text()).contains(recoveryText, id.toString());
+      assertThat(pending.nextAttemptAt()).isEqualTo(clock.instant());
+      notifications.deliverDue();
+      assertThat(notifications.get(id).status()).isEqualTo("DELIVERED");
+      assertThat(telegram.messages).hasSize(2);
+      assertThat(telegram.messages.get(0)).contains("simulator unavailable");
+      assertThat(telegram.messages.get(1)).contains(recoveryText, id.toString());
+    } finally {
+      telegram.allowSend.countDown();
+      commitAnnotation.countDown();
+      if (annotation != null) annotation.join();
+      delivery.join();
+    }
+  }
+
+  @Test
+  void v17ActivePauseMigrationBackfillsTheFirstErrorNotification() {
+    try (var postgres = new PostgreSQLContainer("postgres:17.11-alpine")) {
+      postgres.start();
+      Flyway.configure()
+          .dataSource(postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword())
+          .target("17")
+          .load()
+          .migrate();
+      var database =
+          new JdbcTemplate(
+              new DriverManagerDataSource(
+                  postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword()));
+      Instant pauseStartedAt = Instant.parse("2026-11-19T10:00:00Z");
+      database.update(
+          "update control_state set recalculation_paused=true,pause_started_at=?,failed_attempts=2,last_error=? where id=1",
+          Timestamp.from(pauseStartedAt),
+          "second reason");
+      UUID firstId = UUID.randomUUID();
+      UUID secondId = UUID.randomUUID();
+      insertLegacyRecalculationError(
+          database, firstId, pauseStartedAt, "first reason; обязательный пересчёт приостановлен");
+      insertLegacyRecalculationError(
+          database,
+          secondId,
+          pauseStartedAt.plusSeconds(1),
+          "second reason; обязательный пересчёт приостановлен");
+
+      Flyway.configure()
+          .dataSource(postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword())
+          .load()
+          .migrate();
+
+      assertThat(
+              database.queryForObject(
+                  "select recalculation_error_notification_id from control_state where id=1",
+                  UUID.class))
+          .isEqualTo(firstId);
+      assertThat(
+              database.queryForObject(
+                  "select last_recalculation_notification_reason from control_state where id=1",
+                  String.class))
+          .isEqualTo("second reason");
+    }
+  }
+
+  private static void insertLegacyRecalculationError(
+      JdbcTemplate database, UUID id, Instant at, String ownerText) {
+    Long journalId =
+        database.queryForObject(
+            "insert into journal_entry(occurred_at,category,instrument,detail) values(?,?,'',?) returning id",
+            Long.class,
+            Timestamp.from(at),
+            "NOTIFICATION_RECALCULATION_ERROR",
+            ownerText);
+    database.update(
+        "insert into notification(id,category,instrument,occurred_at,journal_id,status,next_attempt_at) values(?,?,'',?,?,'PENDING',?)",
+        id,
+        "RECALCULATION_ERROR",
+        Timestamp.from(at),
+        journalId,
+        Timestamp.from(at));
+  }
+
+  private void awaitBlockedCompletionQuery() {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+    while (System.nanoTime() < deadline) {
+      Integer blocked =
+          database.queryForObject(
+              "select count(*) from pg_stat_activity where state='active' and wait_event_type='Lock' and query ilike '%n.claim_id=%' and query ilike '%for update of n%' ",
+              Integer.class);
+      if (blocked != null && blocked > 0) return;
+      try {
+        Thread.sleep(10);
+      } catch (InterruptedException exception) {
+        Thread.currentThread().interrupt();
+        throw new IllegalStateException(
+            "Interrupted while awaiting the locked notification read", exception);
+      }
+    }
+    throw new AssertionError("Notification completion never waited for the annotation lock");
+  }
+
+  private static void await(CountDownLatch latch) {
+    try {
+      if (!latch.await(10, TimeUnit.SECONDS))
+        throw new AssertionError("Timed out waiting for a notification transaction latch");
+    } catch (InterruptedException exception) {
+      Thread.currentThread().interrupt();
+      throw new IllegalStateException(
+          "Interrupted while awaiting a notification transaction latch", exception);
+    }
   }
 
   @ParameterizedTest

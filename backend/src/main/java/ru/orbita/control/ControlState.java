@@ -54,6 +54,7 @@ public class ControlState {
   String lastError;
   Instant pauseStartedAt;
   UUID recalculationErrorNotificationId;
+  String lastRecalculationNotificationReason;
   int failedAttempts;
 
   protected ControlState() {}
