@@ -160,7 +160,7 @@ class CapitalTimingIT {
   }
 
   @Test
-  void firstErrorNotificationKeepsItsIdentityAcrossDifferentFailures() {
+  void firstErrorNotificationKeepsItsIdentityAndSuppressesReturnedReasons() {
     control.markReconciled();
     control.start();
     clock.now = clock.now.plusSeconds(1);
@@ -199,6 +199,26 @@ class CapitalTimingIT {
         .isEqualTo(firstError.id());
 
     clock.now = pauseStartedAt.plusSeconds(123);
+    broker.capitalResponse = null;
+    broker.failCapital = true;
+    control.mandatoryRecalculation();
+
+    assertThat(notifications.list(200))
+        .filteredOn(event -> event.category().equals("RECALCULATION_ERROR"))
+        .hasSize(2);
+    assertThat(
+            database.queryForObject(
+                "select count(*) from journal_entry where category='RECALCULATION_FAILED'",
+                Integer.class))
+        .isEqualTo(3);
+    assertThat(
+            database.queryForObject(
+                "select recalculation_error_notification_id from control_state where id=1",
+                UUID.class))
+        .isEqualTo(firstError.id());
+
+    clock.now = pauseStartedAt.plusSeconds(185);
+    broker.failCapital = false;
     broker.capitalResponse = null;
     control.recalculate();
 
@@ -348,7 +368,7 @@ class CapitalTimingIT {
   }
 
   @Test
-  void v17ActivePauseMigrationBackfillsTheFirstErrorNotification() {
+  void v17ActivePauseMigrationBackfillsTheCurrentPauseAfterManualStopAndRestart() {
     try (var postgres = new PostgreSQLContainer("postgres:17.11-alpine")) {
       postgres.start();
       Flyway.configure()
@@ -360,6 +380,30 @@ class CapitalTimingIT {
           new JdbcTemplate(
               new DriverManagerDataSource(
                   postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword()));
+      Instant previousPauseAt = Instant.parse("2026-11-18T10:00:00Z");
+      UUID previousRecoveryId = UUID.randomUUID();
+      insertLegacyNotification(
+          database,
+          previousRecoveryId,
+          "RECALCULATION_RECOVERED",
+          previousPauseAt.minusSeconds(60),
+          "Предыдущая пауза восстановлена");
+      UUID previousErrorId = UUID.randomUUID();
+      Long previousErrorJournalId =
+          insertLegacyRecalculationError(
+              database,
+              previousErrorId,
+              previousPauseAt,
+              "previous reason; обязательный пересчёт приостановлен");
+      Instant stoppedAt = previousPauseAt.plusSeconds(60);
+      insertLegacyJournalEntry(database, stoppedAt, "MANUAL_STOP", "Остановить повторение");
+      Long restartJournalId =
+          insertLegacyJournalEntry(
+              database,
+              stoppedAt.plusSeconds(1),
+              "COEFFICIENT_SAVED",
+              "коэффициент сохранён после успешного запуска");
+
       Instant pauseStartedAt = Instant.parse("2026-11-19T10:00:00Z");
       database.update(
           "update control_state set recalculation_paused=true,pause_started_at=?,failed_attempts=2,last_error=? where id=1",
@@ -384,31 +428,49 @@ class CapitalTimingIT {
               database.queryForObject(
                   "select recalculation_error_notification_id from control_state where id=1",
                   UUID.class))
-          .isEqualTo(firstId);
+          .isEqualTo(firstId)
+          .isNotEqualTo(previousErrorId);
       assertThat(
               database.queryForObject(
-                  "select last_recalculation_notification_reason from control_state where id=1",
-                  String.class))
-          .isEqualTo("second reason");
+                  "select recalculation_pause_journal_boundary from control_state where id=1",
+                  Long.class))
+          .isEqualTo(restartJournalId)
+          .isGreaterThan(previousErrorJournalId);
     }
   }
 
-  private static void insertLegacyRecalculationError(
+  private static Long insertLegacyRecalculationError(
       JdbcTemplate database, UUID id, Instant at, String ownerText) {
+    return insertLegacyNotification(database, id, "RECALCULATION_ERROR", at, ownerText);
+  }
+
+  private static Long insertLegacyNotification(
+      JdbcTemplate database, UUID id, String category, Instant at, String ownerText) {
     Long journalId =
         database.queryForObject(
             "insert into journal_entry(occurred_at,category,instrument,detail) values(?,?,'',?) returning id",
             Long.class,
             Timestamp.from(at),
-            "NOTIFICATION_RECALCULATION_ERROR",
+            "NOTIFICATION_" + category,
             ownerText);
     database.update(
         "insert into notification(id,category,instrument,occurred_at,journal_id,status,next_attempt_at) values(?,?,'',?,?,'PENDING',?)",
         id,
-        "RECALCULATION_ERROR",
+        category,
         Timestamp.from(at),
         journalId,
         Timestamp.from(at));
+    return journalId;
+  }
+
+  private static Long insertLegacyJournalEntry(
+      JdbcTemplate database, Instant at, String category, String detail) {
+    return database.queryForObject(
+        "insert into journal_entry(occurred_at,category,instrument,detail) values(?,?,'',?) returning id",
+        Long.class,
+        Timestamp.from(at),
+        category,
+        detail);
   }
 
   private void awaitBlockedCompletionQuery() {

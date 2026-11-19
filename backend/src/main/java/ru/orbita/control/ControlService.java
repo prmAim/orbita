@@ -430,7 +430,7 @@ public class ControlService {
           state.recalculationPaused = false;
           state.pauseStartedAt = null;
           state.recalculationErrorNotificationId = null;
-          state.lastRecalculationNotificationReason = null;
+          state.recalculationPauseJournalBoundary = null;
           state.failedAttempts = 0;
           if ("START".equals(attempt.kind())) {
             if (!state.reconciled) {
@@ -487,9 +487,9 @@ public class ControlService {
             if (state.pauseStartedAt == null) {
               state.pauseStartedAt = now;
               state.recalculationErrorNotificationId = null;
-              state.lastRecalculationNotificationReason = null;
+              state.recalculationPauseJournalBoundary = latestJournalId();
             }
-            if (!Objects.equals(state.lastRecalculationNotificationReason, error)) {
+            if (!hasPublishedRecalculationError(state, error)) {
               UUID notificationId =
                   notifications.publish(
                       "RECALCULATION_ERROR",
@@ -498,7 +498,6 @@ public class ControlService {
                       error + "; обязательный пересчёт приостановлен");
               if (state.recalculationErrorNotificationId == null)
                 state.recalculationErrorNotificationId = notificationId;
-              state.lastRecalculationNotificationReason = error;
             }
           }
           em.persist(new JournalEntry(now, "RECALCULATION_FAILED", null, error));
@@ -509,6 +508,27 @@ public class ControlService {
   private static boolean current(ControlState state, Attempt attempt) {
     return Objects.equals(state.attemptId, attempt.id())
         && state.generation == attempt.generation();
+  }
+
+  private Long latestJournalId() {
+    return ((Number)
+            em.createNativeQuery("select coalesce(max(id), 0) from journal_entry")
+                .getSingleResult())
+        .longValue();
+  }
+
+  private boolean hasPublishedRecalculationError(ControlState state, String error) {
+    long boundary = Objects.requireNonNullElse(state.recalculationPauseJournalBoundary, 0L);
+    String ownerPrefix = error + "; обязательный пересчёт приостановлен\n";
+    return em
+        .createQuery(
+            "select j.detail from JournalEntry j where j.category=:category and j.id>:boundary",
+            String.class)
+        .setParameter("category", "NOTIFICATION_RECALCULATION_ERROR")
+        .setParameter("boundary", boundary)
+        .getResultList()
+        .stream()
+        .anyMatch(detail -> detail.startsWith(ownerPrefix));
   }
 
   private static String capitalTimingError(Attempt attempt, long elapsed) {
@@ -593,7 +613,7 @@ public class ControlService {
           s.recalculationPaused = false;
           s.pauseStartedAt = null;
           s.recalculationErrorNotificationId = null;
-          s.lastRecalculationNotificationReason = null;
+          s.recalculationPauseJournalBoundary = null;
           s.failedAttempts = 0;
           unsentIntents.getObject().discardUnsent("Общая ручная остановка до начала отправки");
           em.persist(

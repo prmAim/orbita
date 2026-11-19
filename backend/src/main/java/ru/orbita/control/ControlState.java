@@ -54,7 +54,7 @@ public class ControlState {
   String lastError;
   Instant pauseStartedAt;
   UUID recalculationErrorNotificationId;
-  String lastRecalculationNotificationReason;
+  Long recalculationPauseJournalBoundary;
   int failedAttempts;
 
   protected ControlState() {}
