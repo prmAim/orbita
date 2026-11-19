@@ -220,9 +220,6 @@ public class TradingService implements UnsentIntentStop {
       }
     }
     if (lastScanned != null) readinessCursor = lastScanned;
-    snapshot.sort(
-        Comparator.comparingLong((CopyIntent intent) -> intent.prioritySequence)
-            .thenComparing(intent -> intent.id, TradingService::compareQueueUuid));
     return List.copyOf(snapshot);
   }
 
@@ -240,9 +237,7 @@ public class TradingService implements UnsentIntentStop {
       if (gate.recalculationPaused() || !gate.reconciled()) continue;
       AgeCheck age = age(intent.executedAt);
       if (age.expired) {
-        skip(
-            intent.id,
-            age.reason + (intent.reason == null ? "" : "; последнее ожидание: " + intent.reason));
+        skip(intent.id, TradeNotificationText.expiredReason(age.reason, intent.reason));
         continue;
       }
       if (age.allowed) eligible.add(intent);
@@ -760,15 +755,45 @@ public class TradingService implements UnsentIntentStop {
     if (gate.recalculationPaused() || !gate.reconciled()) return;
     AgeCheck age = age(detached.executedAt);
     if (age.expired) {
-      skip(
-          id,
-          age.reason + (detached.reason == null ? "" : "; последнее ожидание: " + detached.reason));
+      skip(id, TradeNotificationText.expiredReason(age.reason, detached.reason));
       return;
     }
     if (!age.allowed) return;
     if (!preflightDone) supplied = inspect(gateway, detached).preflight();
     if (supplied == null || supplied.resources() == null || !preflightMatches(detached, supplied))
       return;
+    ResourceEvidence previousResources = supplied.resources();
+    if (previousResources.qualified()) {
+      try {
+        ResourceEvidence refreshed = gateway.resources(supplied.request());
+        if (refreshed == null) return;
+        if (refreshed.qualified()
+            && (previousResources.preliminaryCommission() == null
+                || refreshed.preliminaryCommission() == null
+                || previousResources
+                        .preliminaryCommission()
+                        .compareTo(refreshed.preliminaryCommission())
+                    != 0
+                || previousResources.additionalCommissionReserve() == null
+                || refreshed.additionalCommissionReserve() == null
+                || previousResources
+                        .additionalCommissionReserve()
+                        .compareTo(refreshed.additionalCommissionReserve())
+                    != 0)) return;
+        supplied =
+            new Preflight(
+                refreshed,
+                supplied.best(),
+                supplied.queriedLimit(),
+                supplied.startedNanos(),
+                supplied.request(),
+                supplied.requestedInstrument());
+      } catch (RuntimeException failure) {
+        PersistenceBoundary.rethrowBrokerPersistence(failure);
+        return;
+      }
+    }
+    if (!preflightMatches(detached, supplied)) return;
     ResourceEvidence fullResources = supplied.resources();
     BigDecimal best = supplied.best();
     BigDecimal queriedLimit = supplied.queriedLimit();

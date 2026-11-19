@@ -109,6 +109,25 @@ public final class TradeNotificationText {
     return UNQUALIFIED_FINAL_SKIP_REASON;
   }
 
+  static String expiredReason(String ageReason, String lastWaitingReason) {
+    String remainingLastWaitingReason = lastWaitingReason;
+    if (ageReason != null) {
+      if (ageReason.contains(PARTIAL_RECOVERY_SKIP_REASON))
+        remainingLastWaitingReason =
+            removeSkipReason(remainingLastWaitingReason, PARTIAL_RECOVERY_SKIP_REASON);
+      if (ageReason.contains(RESOURCE_LIMIT_SKIP_REASON))
+        remainingLastWaitingReason =
+            removeSkipReason(remainingLastWaitingReason, RESOURCE_LIMIT_SKIP_REASON);
+      if (ageReason.contains(RESOURCE_UNAVAILABLE_SKIP_REASON))
+        remainingLastWaitingReason =
+            removeSkipReason(remainingLastWaitingReason, RESOURCE_UNAVAILABLE_SKIP_REASON);
+    }
+    if (remainingLastWaitingReason == null || remainingLastWaitingReason.isBlank())
+      return ageReason;
+    if (ageReason == null || ageReason.isBlank()) return remainingLastWaitingReason;
+    return ageReason + "; последнее ожидание: " + remainingLastWaitingReason;
+  }
+
   private static String appendReason(String currentReason, String nextReason) {
     if (nextReason == null || nextReason.isBlank()) return currentReason;
     if (currentReason == null || currentReason.isBlank()) return nextReason;

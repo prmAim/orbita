@@ -40,6 +40,11 @@ import ru.orbita.web.OwnerCredentials;
 class CopyLifecycleIT {
   @Autowired CopyService copies;
   @Autowired TradingService trading;
+
+  private TradingService tradingTarget() {
+    return org.springframework.test.util.AopTestUtils.getUltimateTargetObject(trading);
+  }
+
   @Autowired ControlService control;
   @Autowired Simulator broker;
   @Autowired MutableClock clock;
@@ -765,6 +770,21 @@ class CopyLifecycleIT {
   }
 
   @Test
+  void expiredFinalSkipKeepsDistinctLastWaitingReasonWithoutDuplicateOrDanglingLabel() {
+    String partial = TradeNotificationText.PARTIAL_RECOVERY_SKIP_REASON;
+    String resource = TradeNotificationText.RESOURCE_LIMIT_SKIP_REASON;
+    String reason = TradeNotificationText.expiredReason(partial, partial + "; " + resource);
+    String notification = TradeNotificationText.finalSkip("SBER", "BUY", 0, 10, 10, reason);
+
+    assertThat(notification)
+        .contains("причина: " + partial + "; последнее ожидание: " + resource)
+        .doesNotContain("последнее ожидание: " + partial);
+
+    String withoutDistinctContext = TradeNotificationText.expiredReason(partial, partial);
+    assertThat(withoutDistinctContext).isEqualTo(partial).doesNotContain("последнее ожидание:");
+  }
+
+  @Test
   void preserveSkipReasonsDeduplicatesMixedKnownReasonsInEitherOrder() {
     String partial = TradeNotificationText.PARTIAL_RECOVERY_SKIP_REASON;
     String resource = TradeNotificationText.RESOURCE_LIMIT_SKIP_REASON;
@@ -1272,7 +1292,7 @@ class CopyLifecycleIT {
     assertThat(copies.intents())
         .singleElement()
         .satisfies(intent -> assertThat(intent.reservedMoney()).isEqualByComparingTo("1000"));
-    assertThat(broker.resourcesCalls).isLessThanOrEqualTo(16);
+    assertThat(broker.resourcesCalls).isLessThanOrEqualTo(17);
   }
 
   @Test
@@ -1399,6 +1419,45 @@ class CopyLifecycleIT {
             });
   }
 
+  @Test
+  void waitingSnapshotReturnsDatabasePagesInCyclicOrderFromInteriorCursor() throws Exception {
+    runningAtFive();
+    clock.now = clock.now.plusSeconds(1);
+    for (String instrument : List.of("instrument-A", "instrument-B", "instrument-C")) {
+      copies.accept(source("queue-" + instrument, instrument, Side.BUY, 1, clock.instant()));
+      clock.now = clock.now.plusSeconds(1);
+    }
+
+    var cursorField = TradingService.class.getDeclaredField("readinessCursor");
+    cursorField.setAccessible(true);
+    var cursorConstructor = cursorField.getType().getDeclaredConstructor(long.class, UUID.class);
+    cursorConstructor.setAccessible(true);
+    var waitingSnapshot = TradingService.class.getDeclaredMethod("waitingSnapshot");
+    waitingSnapshot.setAccessible(true);
+
+    try {
+      cursorField.set(tradingTarget(), null);
+      @SuppressWarnings("unchecked")
+      List<CopyIntent> initial = (List<CopyIntent>) waitingSnapshot.invoke(tradingTarget());
+      var cursorIntent =
+          initial.stream()
+              .filter(intent -> intent.instrumentId.equals("instrument-B"))
+              .findFirst()
+              .orElseThrow();
+      cursorField.set(
+          tradingTarget(),
+          cursorConstructor.newInstance(cursorIntent.prioritySequence, cursorIntent.id));
+
+      @SuppressWarnings("unchecked")
+      List<CopyIntent> ordered = (List<CopyIntent>) waitingSnapshot.invoke(tradingTarget());
+      assertThat(ordered)
+          .extracting(intent -> intent.instrumentId)
+          .containsExactly("instrument-C", "instrument-A", "instrument-B");
+    } finally {
+      cursorField.set(tradingTarget(), null);
+    }
+  }
+
   @org.junit.jupiter.api.Timeout(value = 20, unit = java.util.concurrent.TimeUnit.SECONDS)
   @Test
   void readyIntentIsNotStarvedByHundredDelayedMetadataMisses() {
@@ -1442,15 +1501,16 @@ class CopyLifecycleIT {
         .hasSize(100)
         .allSatisfy(intent -> assertThat(intent.status()).isEqualTo("WAITING"));
     assertThat(broker.posts).isEqualTo(1);
-    assertThat(broker.sentRequests)
-        .extracting(OrderRequest::instrumentId)
-        .containsExactly("ready-101");
+    assertThat(broker.sentRequests).hasSize(1);
+    String winner = broker.sentRequests.get(0).instrumentId();
+    assertThat(winner).isIn("ready-101", "ready-102");
+    String loser = winner.equals("ready-101") ? "ready-102" : "ready-101";
     assertThat(copies.intents())
-        .filteredOn(intent -> intent.instrumentId().equals("ready-101"))
+        .filteredOn(intent -> intent.instrumentId().equals(winner))
         .singleElement()
         .satisfies(intent -> assertThat(intent.reservedMoney().signum()).isPositive());
     assertThat(copies.intents())
-        .filteredOn(intent -> intent.instrumentId().equals("ready-102"))
+        .filteredOn(intent -> intent.instrumentId().equals(loser))
         .singleElement()
         .satisfies(
             intent -> {
@@ -1494,10 +1554,14 @@ class CopyLifecycleIT {
         .hasSize(100)
         .allSatisfy(intent -> assertThat(intent.status()).isEqualTo("WAITING"));
     assertThat(broker.posts).isEqualTo(1);
-    assertThat(broker.sent.instrumentId()).isEqualTo("ready-101");
+    assertThat(broker.sentRequests).hasSize(1);
+    String winner = broker.sentRequests.get(0).instrumentId();
+    assertThat(winner).isIn("ready-101", "ready-102");
+    assertThat(broker.sent.instrumentId()).isEqualTo(winner);
     assertThat(broker.sent.lots()).isEqualTo(1);
+    String loser = winner.equals("ready-101") ? "ready-102" : "ready-101";
     assertThat(copies.intents())
-        .filteredOn(intent -> intent.sourceOrderId().equals("order-ready-101"))
+        .filteredOn(intent -> intent.sourceOrderId().equals("order-" + winner))
         .singleElement()
         .satisfies(
             intent -> {
@@ -1506,12 +1570,98 @@ class CopyLifecycleIT {
                   .isEqualByComparingTo(new BigDecimal("100.50").add(broker.buyCommissionPerLot));
             });
     assertThat(copies.intents())
-        .filteredOn(intent -> intent.sourceOrderId().equals("order-ready-102"))
+        .filteredOn(intent -> intent.sourceOrderId().equals("order-" + loser))
         .singleElement()
         .satisfies(
             intent -> {
               assertThat(intent.status()).isEqualTo("FINAL");
               assertThat(intent.skippedLots()).isEqualTo(5);
+              assertThat(intent.reservedMoney()).isEqualByComparingTo(BigDecimal.ZERO);
+            });
+  }
+
+  @org.junit.jupiter.api.Timeout(value = 15, unit = java.util.concurrent.TimeUnit.SECONDS)
+  @Test
+  void serialPrepareRefreshesCashAfterParallelBuySnapshots() throws Exception {
+    runningAtFive();
+    broker.availableMoney = new BigDecimal("150");
+    broker.buyMaxLots = 1;
+    broker.preliminaryCommission = BigDecimal.ZERO;
+    broker.additionalCommissionReserve = BigDecimal.ZERO;
+    broker.fillEveryPost = true;
+    clock.now = clock.now.plusSeconds(1);
+    broker.mirrorCapital = new BigDecimal("100000");
+    control.recalculate();
+    assertThat(
+            copies
+                .accept(source("cash-first", "cash-first", Side.BUY, 1, clock.instant()))
+                .newLots())
+        .isEqualTo(1L);
+    assertThat(
+            copies
+                .accept(source("cash-second", "cash-second", Side.BUY, 1, clock.instant()))
+                .newLots())
+        .isEqualTo(1L);
+
+    var arrivals = new java.util.concurrent.CountDownLatch(2);
+    var release = new java.util.concurrent.CountDownLatch(1);
+    var firstSnapshotRequests = java.util.concurrent.ConcurrentHashMap.<UUID>newKeySet();
+    broker.resourcesRequestHook =
+        request -> {
+          if (!firstSnapshotRequests.add(request.requestId())) return;
+          arrivals.countDown();
+          try {
+            if (!release.await(5, java.util.concurrent.TimeUnit.SECONDS))
+              throw new IllegalStateException("resource snapshot barrier timed out");
+          } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(interrupted);
+          }
+        };
+    broker.afterPostHook =
+        () -> {
+          if (broker.posts == 1)
+            broker.availableMoney = broker.availableMoney.subtract(broker.sent.limitPrice());
+        };
+    var completedTasks = new java.util.concurrent.CountDownLatch(2);
+    tradingTarget().readinessTaskCompletedHook = completedTasks::countDown;
+    tradingTarget().beforeReadinessCollectionHook =
+        () -> {
+          try {
+            if (!completedTasks.await(5, java.util.concurrent.TimeUnit.SECONDS))
+              throw new IllegalStateException("readiness completion barrier timed out");
+          } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(interrupted);
+          }
+        };
+    var dispatcher = java.util.concurrent.Executors.newSingleThreadExecutor();
+    try {
+      var dispatch = dispatcher.submit(trading::dispatchReady);
+      assertThat(arrivals.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+      release.countDown();
+      dispatch.get(10, java.util.concurrent.TimeUnit.SECONDS);
+    } finally {
+      release.countDown();
+      dispatcher.shutdownNow();
+      assertThat(dispatcher.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+      broker.resourcesRequestHook = null;
+      broker.afterPostHook = null;
+      tradingTarget().readinessTaskCompletedHook = () -> {};
+      tradingTarget().beforeReadinessCollectionHook = () -> {};
+    }
+
+    assertThat(broker.sentRequests).hasSize(1);
+    assertThat(broker.posts).isEqualTo(1);
+    assertThat(copies.intents()).hasSize(2);
+    assertThat(copies.intents())
+        .filteredOn(intent -> !intent.instrumentId().equals(broker.sent.instrumentId()))
+        .singleElement()
+        .satisfies(
+            intent -> {
+              assertThat(intent.status()).isEqualTo("FINAL");
+              assertThat(intent.skippedLots()).isEqualTo(1);
+              assertThat(intent.reservedMoney()).isEqualByComparingTo(BigDecimal.ZERO);
             });
   }
 
@@ -1542,8 +1692,8 @@ class CopyLifecycleIT {
           }
         };
     var completedTasks = new java.util.concurrent.CountDownLatch(2);
-    trading.readinessTaskCompletedHook = completedTasks::countDown;
-    trading.beforeReadinessCollectionHook =
+    tradingTarget().readinessTaskCompletedHook = completedTasks::countDown;
+    tradingTarget().beforeReadinessCollectionHook =
         () -> {
           try {
             if (!completedTasks.await(5, java.util.concurrent.TimeUnit.SECONDS))
@@ -1564,8 +1714,8 @@ class CopyLifecycleIT {
       dispatcher.shutdownNow();
       assertThat(dispatcher.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
       broker.instrumentIdHook = null;
-      trading.readinessTaskCompletedHook = () -> {};
-      trading.beforeReadinessCollectionHook = () -> {};
+      tradingTarget().readinessTaskCompletedHook = () -> {};
+      tradingTarget().beforeReadinessCollectionHook = () -> {};
     }
 
     assertThat(broker.sentRequests)
@@ -2609,6 +2759,7 @@ class CopyLifecycleIT {
               fillEveryPost ? OrderStatus.FILLED : OrderStatus.UNKNOWN,
               fillEveryPost ? r.lots() : 0);
       orders.put(r.requestId(), fillEveryPost ? result : evidence(r, OrderStatus.FILLED, 1));
+      if (fillEveryPost && afterPostHook != null) afterPostHook.run();
       return result;
     }
 
