@@ -90,7 +90,8 @@ public class NotificationService implements NotificationPublisher {
     Claim claim = transactions.execute(status -> claim(id, "MANUAL"));
     if (claim != null) {
       deliver(claim);
-      deliverDue();
+      Claim overdue = transactions.execute(status -> claim(id, "AUTOMATIC"));
+      if (overdue != null) deliver(overdue);
     }
     return get(id);
   }
@@ -99,9 +100,52 @@ public class NotificationService implements NotificationPublisher {
     return MOSCOW.format(at);
   }
 
+  /** Adds a pause end to its undelivered error message while keeping the outbox schedule. */
+  @Transactional
+  public boolean annotateUndelivered(UUID id, Instant at, String ownerText) {
+    if (id == null) throw new IllegalArgumentException("Notification ID required");
+    if (at == null) throw new IllegalArgumentException("Annotation time required");
+    if (ownerText == null || ownerText.isBlank() || ownerText.length() > 1000)
+      throw new IllegalArgumentException("Annotation must contain 1 to 1000 characters");
+
+    var rows = db.query(EVENT + "where n.id=? for update of n", (rs, n) -> view(rs), id);
+    if (rows.isEmpty()) return false;
+    var event = rows.getFirst();
+    if (event.resolvedAt() != null
+        || !(event.status().equals("PENDING") || event.status().equals("SENDING"))) return false;
+    String marker = "\nИдентификатор уведомления:";
+    String updated = event.text();
+    if (!updated.contains(ownerText)) {
+      if (!updated.contains(marker)) return false;
+      updated = updated.replace(marker, "\n" + ownerText + marker);
+      if (db.update(
+              "update journal_entry set detail=? where id=(select journal_id from notification where id=?)",
+              updated,
+              event.id())
+          != 1) return false;
+    }
+    return db.update(
+            "update notification set resolved_at=?,resolution_text=?,retry_annotated_notification_on_completion=true where id=?",
+            Timestamp.from(at),
+            ownerText,
+            id)
+        == 1;
+  }
+
   private Claim claim(UUID requested, String kind) {
     Instant now = clock.instant();
-    String scope = requested == null ? "n.status='PENDING' and n.next_attempt_at<=?" : "n.id=?";
+    String scope;
+    Object[] parameters;
+    if (requested == null) {
+      scope = "n.status='PENDING' and n.next_attempt_at<=?";
+      parameters = new Object[] {Timestamp.from(now)};
+    } else if (kind.equals("AUTOMATIC")) {
+      scope = "n.id=? and n.status='PENDING' and n.next_attempt_at<=?";
+      parameters = new Object[] {requested, Timestamp.from(now)};
+    } else {
+      scope = "n.id=?";
+      parameters = new Object[] {requested};
+    }
     var rows =
         db.query(
             EVENT
@@ -109,7 +153,7 @@ public class NotificationService implements NotificationPublisher {
                 + scope
                 + " order by n.occurred_at,n.id limit 1 for update of n skip locked",
             (rs, n) -> view(rs),
-            requested == null ? Timestamp.from(now) : requested);
+            parameters);
     if (rows.isEmpty()) return null;
     var event = rows.getFirst();
     if (!event.status().equals("PENDING")
@@ -154,6 +198,11 @@ public class NotificationService implements NotificationPublisher {
           if (rows.isEmpty()) return;
           View event = rows.getFirst();
           Instant now = clock.instant();
+          String currentText =
+              db.queryForObject(
+                  "select detail from journal_entry where id=(select journal_id from notification where id=?)",
+                  String.class,
+                  claim.id());
           int failures = event.automaticFailures();
           boolean automatic = claim.kind().equals("AUTOMATIC");
           if (automatic && result.outcome() == TelegramTransport.Outcome.FAILURE) failures++;
@@ -165,9 +214,17 @@ public class NotificationService implements NotificationPublisher {
             if (next == null || blocked.isAfter(next)) next = blocked;
           }
           boolean success = result.outcome() == TelegramTransport.Outcome.SUCCESS;
-          if (success && event.resolvedAt() != null && !claim.text().equals(event.text())) {
+          boolean retryAnnotated =
+              success
+                  && event.resolvedAt() != null
+                  && !claim.text().equals(currentText)
+                  && event.retryAnnotatedNotificationOnCompletion();
+          if (success
+              && event.resolvedAt() != null
+              && !claim.text().equals(currentText)
+              && !retryAnnotated) {
             // The original payload actually arrived; preserve it in the journal and emit the
-            // resolution once.
+            // resolution once when it was not already published separately.
             db.update(
                 "update journal_entry set detail=? where id=(select journal_id from notification where id=?)",
                 claim.text(),
@@ -187,10 +244,10 @@ public class NotificationService implements NotificationPublisher {
               result.detail(),
               claim.attempt());
           db.update(
-              "update notification set status=?,automatic_failures=?,next_attempt_at=?,telegram_block_until=?,claim_id=null,claim_started_at=null,claim_kind=null,last_result=?,version=version+1 where id=?",
-              success ? "DELIVERED" : "PENDING",
+              "update notification set status=?,automatic_failures=?,next_attempt_at=?,telegram_block_until=?,claim_id=null,claim_started_at=null,claim_kind=null,retry_annotated_notification_on_completion=false,last_result=?,version=version+1 where id=?",
+              success && !retryAnnotated ? "DELIVERED" : "PENDING",
               failures,
-              success ? null : timestamp(next),
+              retryAnnotated ? Timestamp.from(now) : success ? null : timestamp(next),
               timestamp(blocked),
               result.detail(),
               claim.id());
@@ -325,7 +382,8 @@ public class NotificationService implements NotificationPublisher {
         rs.getString("last_result"),
         instant(rs, rs.findColumn("resolved_at")),
         rs.getString("resolution_text"),
-        rs.getString("resolution_category"));
+        rs.getString("resolution_category"),
+        rs.getBoolean("retry_annotated_notification_on_completion"));
   }
 
   private record Claim(UUID id, UUID attempt, String kind, String text) {}
@@ -344,7 +402,8 @@ public class NotificationService implements NotificationPublisher {
       String lastResult,
       Instant resolvedAt,
       String resolutionText,
-      String resolutionCategory) {}
+      String resolutionCategory,
+      boolean retryAnnotatedNotificationOnCompletion) {}
 
   public record Attempt(
       UUID id,

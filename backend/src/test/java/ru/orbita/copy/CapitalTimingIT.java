@@ -5,10 +5,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 import java.lang.reflect.*;
 import java.math.BigDecimal;
 import java.sql.*;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Locale;
+import java.util.UUID;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.sql.DataSource;
+import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -22,28 +26,481 @@ import org.springframework.context.annotation.Import;
 import org.springframework.context.annotation.Role;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DelegatingDataSource;
+import org.springframework.jdbc.datasource.DriverManagerDataSource;
+import org.springframework.transaction.support.TransactionTemplate;
+import org.testcontainers.postgresql.PostgreSQLContainer;
 import ru.orbita.broker.BrokerGateway;
 import ru.orbita.control.ControlService;
+import ru.orbita.notifications.NotificationService;
+import ru.orbita.notifications.TelegramTransport;
 
 @SpringBootTest(
     properties = {
       "orbita.source-account=source",
       "orbita.mirror-account=mirror",
+      "orbita.telegram.enabled=false",
       "orbita.worker.enabled=false"
     })
 @Import({CopyLifecycleIT.Fixture.class, CapitalTimingIT.JdbcTiming.class})
 class CapitalTimingIT {
   @Autowired ControlService control;
+  @Autowired NotificationService notifications;
   @Autowired CopyService copies;
   @Autowired CopyLifecycleIT.Simulator broker;
   @Autowired CopyLifecycleIT.MutableClock clock;
   @Autowired JdbcTemplate database;
+  @Autowired CopyLifecycleIT.TelegramSimulator telegram;
+  @Autowired TransactionTemplate transactions;
   @Autowired CommitDelay delay;
 
   @BeforeEach
   void reset() {
     delay.reset();
     CopyLifecycleIT.reset(database, broker, clock);
+    telegram.reset();
+  }
+
+  @Test
+  void delayedRecalculationErrorKeepsItsTimeIdAndDeadlineAndRecoveryIsIndependent() {
+    control.markReconciled();
+    control.start();
+    clock.now = clock.now.plusSeconds(1);
+    Instant pauseStartedAt = clock.instant();
+    broker.failCapital = true;
+    control.mandatoryRecalculation();
+
+    var firstError =
+        notifications.list(200).stream()
+            .filter(event -> event.category().equals("RECALCULATION_ERROR"))
+            .findFirst()
+            .orElseThrow();
+    assertThat(
+            database.queryForObject(
+                "select recalculation_error_notification_id from control_state where id=1",
+                java.util.UUID.class))
+        .isEqualTo(firstError.id());
+    String originalText = firstError.text();
+    telegram.results.add(
+        TelegramTransport.Result.failure("Имитатор: задержка доставки", Duration.ofMinutes(2)));
+    notifications.deliverDue();
+    var pending = notifications.get(firstError.id());
+    Instant retryAt = pending.nextAttemptAt();
+    assertThat(pending.status()).isEqualTo("PENDING");
+    assertThat(retryAt).isEqualTo(pauseStartedAt.plus(Duration.ofMinutes(2)));
+
+    clock.now = pauseStartedAt.plusSeconds(61);
+    broker.failCapital = false;
+    control.mandatoryRecalculation();
+
+    assertThat(control.status().recalculationPaused()).isFalse();
+    var annotated = notifications.get(firstError.id());
+    assertThat(annotated.status()).isEqualTo("PENDING");
+    assertThat(annotated.nextAttemptAt()).isEqualTo(retryAt);
+    String originalPrefix =
+        originalText.substring(0, originalText.indexOf("\nИдентификатор уведомления:"));
+    assertThat(annotated.text())
+        .startsWith(originalPrefix)
+        .contains(
+            "Пересчёт восстановлен; начало " + NotificationService.formatTime(pauseStartedAt),
+            "окончание " + NotificationService.formatTime(clock.instant()),
+            firstError.id().toString());
+
+    var recovery =
+        notifications.list(200).stream()
+            .filter(event -> event.category().equals("RECALCULATION_RECOVERED"))
+            .findFirst()
+            .orElseThrow();
+    assertThat(recovery.id()).isNotEqualTo(firstError.id());
+    notifications.deliverDue();
+    assertThat(telegram.lastText).isEqualTo(recovery.text());
+    assertThat(notifications.get(firstError.id()).nextAttemptAt()).isEqualTo(retryAt);
+
+    clock.now = retryAt;
+    notifications.deliverDue();
+    assertThat(notifications.get(firstError.id()).status()).isEqualTo("DELIVERED");
+    assertThat(telegram.lastText).isEqualTo(notifications.get(firstError.id()).text());
+    assertThat(telegram.lastText)
+        .contains(
+            NotificationService.formatTime(pauseStartedAt),
+            "Пересчёт восстановлен; начало " + NotificationService.formatTime(pauseStartedAt),
+            "окончание " + NotificationService.formatTime(pauseStartedAt.plusSeconds(61)),
+            firstError.id().toString());
+    assertThat(notifications.attempts(firstError.id()))
+        .extracting(NotificationService.Attempt::payload)
+        .containsExactly(originalText, annotated.text());
+    assertThat(telegram.messages).containsExactly(originalText, recovery.text(), annotated.text());
+  }
+
+  @Test
+  void clockCorrectionDoesNotRollBackSuccessfulRecalculation() {
+    control.markReconciled();
+    control.start();
+    clock.now = clock.now.plusSeconds(1);
+    Instant pauseStartedAt = clock.instant();
+    broker.failCapital = true;
+    control.mandatoryRecalculation();
+    var firstError =
+        notifications.list(200).stream()
+            .filter(event -> event.category().equals("RECALCULATION_ERROR"))
+            .findFirst()
+            .orElseThrow();
+
+    clock.now = pauseStartedAt.minus(Duration.ofMinutes(5));
+    broker.failCapital = false;
+    control.recalculate();
+
+    assertThat(control.status().recalculationPaused()).isFalse();
+    assertThat(notifications.get(firstError.id()).text())
+        .contains(
+            "Пересчёт восстановлен; начало " + NotificationService.formatTime(pauseStartedAt),
+            "длительность не подтверждена");
+    assertThat(notifications.list(200))
+        .filteredOn(event -> event.category().equals("RECALCULATION_RECOVERED"))
+        .hasSize(1);
+  }
+
+  @Test
+  void firstErrorNotificationKeepsItsIdentityAndSuppressesReturnedReasons() {
+    control.markReconciled();
+    control.start();
+    clock.now = clock.now.plusSeconds(1);
+    Instant pauseStartedAt = clock.instant();
+    broker.failCapital = true;
+    control.mandatoryRecalculation();
+    var firstError =
+        notifications.list(200).stream()
+            .filter(event -> event.category().equals("RECALCULATION_ERROR"))
+            .findFirst()
+            .orElseThrow();
+    telegram.results.add(
+        TelegramTransport.Result.failure("Имитатор: задержка доставки", Duration.ofMinutes(2)));
+    notifications.deliverDue();
+    Instant retryAt = notifications.get(firstError.id()).nextAttemptAt();
+
+    clock.now = pauseStartedAt.plusSeconds(61);
+    broker.failCapital = false;
+    broker.capitalResponse =
+        _ -> {
+          throw new IllegalArgumentException("second simulator failure");
+        };
+    control.mandatoryRecalculation();
+    var secondError =
+        notifications.list(200).stream()
+            .filter(
+                event ->
+                    event.category().equals("RECALCULATION_ERROR")
+                        && !event.id().equals(firstError.id()))
+            .findFirst()
+            .orElseThrow();
+    assertThat(
+            database.queryForObject(
+                "select recalculation_error_notification_id from control_state where id=1",
+                UUID.class))
+        .isEqualTo(firstError.id());
+
+    clock.now = pauseStartedAt.plusSeconds(123);
+    broker.capitalResponse = null;
+    broker.failCapital = true;
+    control.mandatoryRecalculation();
+
+    assertThat(notifications.list(200))
+        .filteredOn(event -> event.category().equals("RECALCULATION_ERROR"))
+        .hasSize(2);
+    assertThat(
+            database.queryForObject(
+                "select count(*) from journal_entry where category='RECALCULATION_FAILED'",
+                Integer.class))
+        .isEqualTo(3);
+    assertThat(
+            database.queryForObject(
+                "select recalculation_error_notification_id from control_state where id=1",
+                UUID.class))
+        .isEqualTo(firstError.id());
+
+    clock.now = pauseStartedAt.plusSeconds(185);
+    broker.failCapital = false;
+    broker.capitalResponse = null;
+    control.recalculate();
+
+    assertThat(notifications.get(firstError.id()).nextAttemptAt()).isEqualTo(retryAt);
+    assertThat(notifications.get(firstError.id()).text())
+        .contains("окончание " + NotificationService.formatTime(clock.instant()));
+    assertThat(notifications.get(secondError.id()).text()).doesNotContain("Пересчёт восстановлен;");
+  }
+
+  @Test
+  void sameFailureAfterRecoveryWithBackwardClockStartsANewPause() {
+    control.markReconciled();
+    control.start();
+    clock.now = clock.now.plusSeconds(1);
+    Instant firstPauseStartedAt = clock.instant();
+    broker.failCapital = true;
+    control.mandatoryRecalculation();
+    var firstError =
+        notifications.list(200).stream()
+            .filter(event -> event.category().equals("RECALCULATION_ERROR"))
+            .findFirst()
+            .orElseThrow();
+
+    clock.now = firstPauseStartedAt.plusSeconds(61);
+    broker.failCapital = false;
+    control.recalculate();
+    clock.now = firstPauseStartedAt.minusSeconds(60);
+    broker.failCapital = true;
+    control.mandatoryRecalculation();
+
+    var errors =
+        notifications.list(200).stream()
+            .filter(event -> event.category().equals("RECALCULATION_ERROR"))
+            .toList();
+    assertThat(errors).hasSize(2);
+    assertThat(
+            database.queryForObject(
+                "select recalculation_error_notification_id from control_state where id=1",
+                UUID.class))
+        .isNotNull()
+        .isNotEqualTo(firstError.id());
+  }
+
+  @Test
+  void inFlightSuccessRedeliversAnnotatedMessageWithTheSameId() throws Exception {
+    control.markReconciled();
+    control.start();
+    clock.now = clock.now.plusSeconds(1);
+    Instant pauseStartedAt = clock.instant();
+    broker.failCapital = true;
+    control.mandatoryRecalculation();
+    var firstError =
+        notifications.list(200).stream()
+            .filter(event -> event.category().equals("RECALCULATION_ERROR"))
+            .findFirst()
+            .orElseThrow();
+    String sentPayload = firstError.text();
+
+    telegram.sendStarted = new CountDownLatch(1);
+    telegram.allowSend = new CountDownLatch(1);
+    var delivery = CompletableFuture.runAsync(notifications::deliverDue);
+    try {
+      assertThat(telegram.sendStarted.await(5, TimeUnit.SECONDS)).isTrue();
+      clock.now = clock.now.plusSeconds(61);
+      broker.failCapital = false;
+      control.mandatoryRecalculation();
+    } finally {
+      telegram.allowSend.countDown();
+    }
+    delivery.join();
+
+    var pendingCorrection = notifications.get(firstError.id());
+    assertThat(pendingCorrection.status()).isEqualTo("PENDING");
+    assertThat(pendingCorrection.nextAttemptAt()).isEqualTo(clock.instant());
+    assertThat(pendingCorrection.text())
+        .contains(
+            "Пересчёт восстановлен; начало " + NotificationService.formatTime(pauseStartedAt),
+            firstError.id().toString());
+    notifications.deliverDue();
+    assertThat(notifications.get(firstError.id()).status()).isEqualTo("DELIVERED");
+    assertThat(telegram.messages).containsExactly(sentPayload, pendingCorrection.text());
+    assertThat(telegram.lastText).isEqualTo(pendingCorrection.text());
+    assertThat(notifications.attempts(firstError.id()))
+        .extracting(NotificationService.Attempt::payload)
+        .containsExactly(sentPayload, pendingCorrection.text());
+    assertThat(notifications.list(200))
+        .filteredOn(event -> event.category().equals("RECALCULATION_RECOVERED"))
+        .hasSize(1);
+  }
+
+  @Test
+  void completionWaitingOnAnnotationLockUsesTheCommittedPayload() throws Exception {
+    Instant failedAt = clock.instant();
+    UUID id =
+        transactions.execute(
+            _ ->
+                notifications.publish(
+                    "RECALCULATION_ERROR", null, failedAt, "simulator unavailable"));
+    Instant recoveredAt = failedAt.plusSeconds(61);
+    String recoveryText =
+        "Пересчёт восстановлен; начало "
+            + NotificationService.formatTime(failedAt)
+            + ", окончание "
+            + NotificationService.formatTime(recoveredAt);
+    var annotationStarted = new CountDownLatch(1);
+    var commitAnnotation = new CountDownLatch(1);
+    telegram.sendStarted = new CountDownLatch(1);
+    telegram.allowSend = new CountDownLatch(1);
+    var delivery = CompletableFuture.runAsync(notifications::deliverDue);
+    CompletableFuture<Void> annotation = null;
+    try {
+      assertThat(telegram.sendStarted.await(5, TimeUnit.SECONDS)).isTrue();
+      annotation =
+          CompletableFuture.runAsync(
+              () ->
+                  transactions.executeWithoutResult(
+                      _ -> {
+                        assertThat(notifications.annotateUndelivered(id, recoveredAt, recoveryText))
+                            .isTrue();
+                        notifications.publish(
+                            "RECALCULATION_RECOVERED", null, recoveredAt, recoveryText);
+                        annotationStarted.countDown();
+                        await(commitAnnotation);
+                      }));
+      assertThat(annotationStarted.await(5, TimeUnit.SECONDS)).isTrue();
+      telegram.allowSend.countDown();
+      awaitBlockedCompletionQuery();
+      commitAnnotation.countDown();
+      annotation.join();
+      delivery.join();
+
+      var pending = notifications.get(id);
+      assertThat(pending.status()).isEqualTo("PENDING");
+      assertThat(pending.text()).contains(recoveryText, id.toString());
+      assertThat(pending.nextAttemptAt()).isEqualTo(clock.instant());
+      notifications.deliverDue();
+      assertThat(notifications.get(id).status()).isEqualTo("DELIVERED");
+      assertThat(telegram.messages).hasSize(2);
+      assertThat(telegram.messages.get(0)).contains("simulator unavailable");
+      assertThat(telegram.messages.get(1)).contains(recoveryText, id.toString());
+    } finally {
+      telegram.allowSend.countDown();
+      commitAnnotation.countDown();
+      if (annotation != null) annotation.join();
+      delivery.join();
+    }
+  }
+
+  @Test
+  void v17ActivePauseMigrationBackfillsTheCurrentPauseAfterManualStopAndRestart() {
+    try (var postgres = new PostgreSQLContainer("postgres:17.11-alpine")) {
+      postgres.start();
+      Flyway.configure()
+          .dataSource(postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword())
+          .target("17")
+          .load()
+          .migrate();
+      var database =
+          new JdbcTemplate(
+              new DriverManagerDataSource(
+                  postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword()));
+      Instant previousPauseAt = Instant.parse("2026-11-18T10:00:00Z");
+      UUID previousRecoveryId = UUID.randomUUID();
+      insertLegacyNotification(
+          database,
+          previousRecoveryId,
+          "RECALCULATION_RECOVERED",
+          previousPauseAt.minusSeconds(60),
+          "Предыдущая пауза восстановлена");
+      UUID previousErrorId = UUID.randomUUID();
+      Long previousErrorJournalId =
+          insertLegacyRecalculationError(
+              database,
+              previousErrorId,
+              previousPauseAt,
+              "previous reason; обязательный пересчёт приостановлен");
+      Instant stoppedAt = previousPauseAt.plusSeconds(60);
+      insertLegacyJournalEntry(database, stoppedAt, "MANUAL_STOP", "Остановить повторение");
+      Long restartJournalId =
+          insertLegacyJournalEntry(
+              database,
+              stoppedAt.plusSeconds(1),
+              "COEFFICIENT_SAVED",
+              "коэффициент сохранён после успешного запуска");
+
+      Instant pauseStartedAt = Instant.parse("2026-11-19T10:00:00Z");
+      database.update(
+          "update control_state set recalculation_paused=true,pause_started_at=?,failed_attempts=2,last_error=? where id=1",
+          Timestamp.from(pauseStartedAt),
+          "second reason");
+      UUID firstId = UUID.randomUUID();
+      UUID secondId = UUID.randomUUID();
+      insertLegacyRecalculationError(
+          database, firstId, pauseStartedAt, "first reason; обязательный пересчёт приостановлен");
+      insertLegacyRecalculationError(
+          database,
+          secondId,
+          pauseStartedAt.plusSeconds(1),
+          "second reason; обязательный пересчёт приостановлен");
+
+      Flyway.configure()
+          .dataSource(postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword())
+          .load()
+          .migrate();
+
+      assertThat(
+              database.queryForObject(
+                  "select recalculation_error_notification_id from control_state where id=1",
+                  UUID.class))
+          .isEqualTo(firstId)
+          .isNotEqualTo(previousErrorId);
+      assertThat(
+              database.queryForObject(
+                  "select recalculation_pause_journal_boundary from control_state where id=1",
+                  Long.class))
+          .isEqualTo(restartJournalId)
+          .isGreaterThan(previousErrorJournalId);
+    }
+  }
+
+  private static Long insertLegacyRecalculationError(
+      JdbcTemplate database, UUID id, Instant at, String ownerText) {
+    return insertLegacyNotification(database, id, "RECALCULATION_ERROR", at, ownerText);
+  }
+
+  private static Long insertLegacyNotification(
+      JdbcTemplate database, UUID id, String category, Instant at, String ownerText) {
+    Long journalId =
+        database.queryForObject(
+            "insert into journal_entry(occurred_at,category,instrument,detail) values(?,?,'',?) returning id",
+            Long.class,
+            Timestamp.from(at),
+            "NOTIFICATION_" + category,
+            ownerText);
+    database.update(
+        "insert into notification(id,category,instrument,occurred_at,journal_id,status,next_attempt_at) values(?,?,'',?,?,'PENDING',?)",
+        id,
+        category,
+        Timestamp.from(at),
+        journalId,
+        Timestamp.from(at));
+    return journalId;
+  }
+
+  private static Long insertLegacyJournalEntry(
+      JdbcTemplate database, Instant at, String category, String detail) {
+    return database.queryForObject(
+        "insert into journal_entry(occurred_at,category,instrument,detail) values(?,?,'',?) returning id",
+        Long.class,
+        Timestamp.from(at),
+        category,
+        detail);
+  }
+
+  private void awaitBlockedCompletionQuery() {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+    while (System.nanoTime() < deadline) {
+      Integer blocked =
+          database.queryForObject(
+              "select count(*) from pg_stat_activity where state='active' and wait_event_type='Lock' and query ilike '%n.claim_id=%' and query ilike '%for update of n%' ",
+              Integer.class);
+      if (blocked != null && blocked > 0) return;
+      try {
+        Thread.sleep(10);
+      } catch (InterruptedException exception) {
+        Thread.currentThread().interrupt();
+        throw new IllegalStateException(
+            "Interrupted while awaiting the locked notification read", exception);
+      }
+    }
+    throw new AssertionError("Notification completion never waited for the annotation lock");
+  }
+
+  private static void await(CountDownLatch latch) {
+    try {
+      if (!latch.await(10, TimeUnit.SECONDS))
+        throw new AssertionError("Timed out waiting for a notification transaction latch");
+    } catch (InterruptedException exception) {
+      Thread.currentThread().interrupt();
+      throw new IllegalStateException(
+          "Interrupted while awaiting a notification transaction latch", exception);
+    }
   }
 
   @ParameterizedTest

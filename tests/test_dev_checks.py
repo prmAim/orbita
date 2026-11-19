@@ -54,11 +54,11 @@ class DemoSchemaCheckTests(unittest.TestCase):
     def test_current_and_legacy_pairs_pass(self):
         result = self.run_check()
         self.assertEqual(0, result.returncode, result.stderr)
-        self.assertIn("1:15; 2:16,17", result.stdout)
+        self.assertIn("1:15; 2:16,17,18", result.stdout)
 
     def test_new_unqualified_migration_fails(self):
         path = (
-            self.root / "backend/src/main/resources/db/migration/V18__unqualified.sql"
+            self.root / "backend/src/main/resources/db/migration/V19__unqualified.sql"
         )
         path.write_text("select 1;", encoding="utf-8")
         result = self.run_check()
@@ -69,18 +69,18 @@ class DemoSchemaCheckTests(unittest.TestCase):
         cases = (
             (
                 "deploy/demo-data.ps1",
-                "$baseline.schema -cne '17'",
                 "$baseline.schema -cne '18'",
+                "$baseline.schema -cne '17'",
             ),
             (
                 "backend/src/test/java/ru/orbita/broker/InterfaceDemoLedger.java",
-                '!"17".equals',
                 '!"18".equals',
+                '!"17".equals',
             ),
             (
                 "deploy/demo/cleanup.sql",
                 "schema_version is distinct from '16' and",
-                "schema_version is distinct from '18' and",
+                "schema_version is distinct from '17' and",
             ),
             ("deploy/demo/cleanup.sql", "b.version in (1,2)", "b.version in (1,2,3)"),
         )
@@ -109,13 +109,13 @@ class DemoSchemaCheckTests(unittest.TestCase):
         cases = (
             (
                 "deploy/demo-data.ps1",
-                "if($baseline.schema -cne '17'){throw",
-                "if($baseline.schema -eq '17'){throw",
+                "if($baseline.schema -cne '18'){throw",
+                "if($baseline.schema -eq '18'){throw",
             ),
             (
                 "backend/src/test/java/ru/orbita/broker/InterfaceDemoLedger.java",
-                'if (!row.next() || !"17".equals(row.getString(1)))',
-                'if (!row.next() && !"17".equals(row.getString(1)))',
+                'if (!row.next() || !"18".equals(row.getString(1)))',
+                'if (!row.next() && !"18".equals(row.getString(1)))',
             ),
             (
                 "deploy/demo/cleanup.sql",
@@ -136,24 +136,24 @@ class DemoSchemaCheckTests(unittest.TestCase):
 
     def test_comment_cannot_replace_actual_guard(self):
         path = "deploy/demo-data.ps1"
-        original = "if($baseline.schema -cne '17'){throw"
+        original = "if($baseline.schema -cne '18'){throw"
         self.mutate(
             path,
             original,
-            "<# " + original + " #> if($baseline.schema -cne '18'){throw",
+            "<# " + original + " #> if($baseline.schema -cne '17'){throw",
         )
         self.assertNotEqual(0, self.run_check().returncode)
 
     def test_inline_comment_cannot_supply_a_guard(self):
         self.mutate(
             "deploy/demo-data.ps1",
-            "$baseline.schema -cne '17'",
             "$baseline.schema -cne '18'",
+            "$baseline.schema -cne '17'",
         )
         path = self.root / "deploy/demo-data.ps1"
         with path.open("a", encoding="utf-8") as stream:
             stream.write(
-                "\nWrite-Output 'something' # if($baseline.schema -cne '17'){throw\n"
+                "\nWrite-Output 'something' # if($baseline.schema -cne '18'){throw\n"
             )
         self.assertNotEqual(0, self.run_check().returncode)
 

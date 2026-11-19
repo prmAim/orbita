@@ -72,7 +72,7 @@ class CopyLifecycleIT {
     db.execute(
         "truncate broker_fill,copy_intent,source_execution,incoming_receipt,mirror_position,mirror_trade_receipt,instrument_state,journal_entry,notification_attempt,notification restart identity cascade");
     db.update(
-        "update control_state set mode='NOT_STARTED',coefficient=null,ratio_numerator=null,ratio_denominator=null,active_capital_candidate_id=null,observation_boundary=null,resume_boundary=null,observation_boundary_trusted=false,resume_boundary_trusted=false,observation_activated=false,automatic_boundary=null,permit_limit=null,permit_issued_at=null,permit_id=null,permit_epoch=0,first_acceptance=true,live_accepted=false,reconciled=false,feed_ready=false,shadow_version=null,shadow_buy_checked=false,shadow_sell_checked=false,recalculation_paused=false,attempt_id=null,attempt_kind=null,generation=0,completed_due=null,retry_at=null,last_error=null,pause_started_at=null,failed_attempts=0 where id=1");
+        "update control_state set mode='NOT_STARTED',coefficient=null,ratio_numerator=null,ratio_denominator=null,active_capital_candidate_id=null,observation_boundary=null,resume_boundary=null,observation_boundary_trusted=false,resume_boundary_trusted=false,observation_activated=false,automatic_boundary=null,permit_limit=null,permit_issued_at=null,permit_id=null,permit_epoch=0,first_acceptance=true,live_accepted=false,reconciled=false,feed_ready=false,shadow_version=null,shadow_buy_checked=false,shadow_sell_checked=false,recalculation_paused=false,attempt_id=null,attempt_kind=null,generation=0,completed_due=null,retry_at=null,last_error=null,pause_started_at=null,recalculation_error_notification_id=null,recalculation_pause_journal_boundary=null,failed_attempts=0 where id=1");
     clock.now = Instant.parse("2026-11-15T10:00:00Z");
     clock.evidenceAvailable = true;
     clock.nextEvidence = null;
@@ -2526,11 +2526,34 @@ class CopyLifecycleIT {
 
   static class TelegramSimulator implements TelegramTransport {
     final List<String> messages = new ArrayList<>();
+    final Deque<Result> results = new ArrayDeque<>();
+    volatile java.util.concurrent.CountDownLatch sendStarted;
+    volatile java.util.concurrent.CountDownLatch allowSend;
+    String lastText;
 
     @Override
     public Result send(String text) {
+      lastText = text;
       messages.add(text);
-      return Result.success();
+      if (sendStarted != null) sendStarted.countDown();
+      if (allowSend != null) {
+        try {
+          if (!allowSend.await(10, java.util.concurrent.TimeUnit.SECONDS))
+            return Result.noResponse();
+        } catch (InterruptedException exception) {
+          Thread.currentThread().interrupt();
+          return Result.noResponse();
+        }
+      }
+      return results.isEmpty() ? Result.success() : results.remove();
+    }
+
+    void reset() {
+      messages.clear();
+      results.clear();
+      sendStarted = null;
+      allowSend = null;
+      lastText = null;
     }
   }
 

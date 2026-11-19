@@ -53,6 +53,8 @@ public class ControlState {
   Instant retryAt;
   String lastError;
   Instant pauseStartedAt;
+  UUID recalculationErrorNotificationId;
+  Long recalculationPauseJournalBoundary;
   int failedAttempts;
 
   protected ControlState() {}
