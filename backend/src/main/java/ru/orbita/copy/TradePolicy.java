@@ -44,5 +44,4 @@ public final class TradePolicy {
     if (earliest.isBefore(executedAt)) return Age.WAIT_FOR_TIME;
     return Age.ALLOWED;
   }
-
 }

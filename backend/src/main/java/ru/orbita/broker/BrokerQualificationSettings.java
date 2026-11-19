@@ -40,7 +40,9 @@ public record BrokerQualificationSettings(
         ownMoneyBasis == null ? BrokerQualifications.OwnMoneyBasis.UNQUALIFIED : ownMoneyBasis;
   }
 
-  /** Preserves callers using the qualification settings constructor from before tariff attestation. */
+  /**
+   * Preserves callers using the qualification settings constructor from before tariff attestation.
+   */
   public BrokerQualificationSettings(
       boolean enabled,
       boolean capitalCompositionConfirmed,

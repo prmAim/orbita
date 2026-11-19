@@ -28,5 +28,4 @@ class TradePolicyTest {
     assertThat(TradePolicy.limit(SELL, new BigDecimal("101"), new BigDecimal("0.1")))
         .isEqualByComparingTo("100.5");
   }
-
 }

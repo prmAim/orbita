@@ -50,8 +50,7 @@ public final class TInvestBrokerGateway implements BrokerGateway {
   }
 
   @Override
-  public boolean buyTotalCostNondecreasing(
-      String accountId, String instrumentId, String currency) {
+  public boolean buyTotalCostNondecreasing(String accountId, String instrumentId, String currency) {
     return qualifications.buyTotalCostNondecreasingQualified(
         accountId, instrumentId, currency, clock.instant());
   }

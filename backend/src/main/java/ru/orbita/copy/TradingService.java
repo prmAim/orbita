@@ -1,7 +1,7 @@
 package ru.orbita.copy;
 
-import jakarta.persistence.*;
 import jakarta.annotation.PreDestroy;
+import jakarta.persistence.*;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.*;
@@ -26,6 +26,8 @@ public class TradingService implements UnsentIntentStop {
   private static final int READY_INTENT_BATCH_SIZE = 100;
   private static final int READINESS_CONCURRENCY = 16;
   private static final int MAX_READINESS_PASS_INTENTS = 128;
+  private static final long READINESS_ITEM_BUDGET_NANOS = Duration.ofSeconds(5).toNanos();
+  private static final long READINESS_PASS_BUDGET_NANOS = Duration.ofSeconds(12).toNanos();
   private static final Set<String> LIVE =
       Set.of("SEND_STARTED", "ACTIVE", "UNKNOWN", "CANCEL_STARTED");
   private final EntityManager em;
@@ -40,13 +42,21 @@ public class TradingService implements UnsentIntentStop {
   private final ru.orbita.valuation.RubValuation rubValuation;
   private final OrderEvidenceJournal orderJournal;
   // BrokerGateway calls are synchronous; cancellation still depends on transport-level deadlines.
+  volatile Runnable readinessTaskCompletedHook = () -> {};
+  volatile Runnable beforeReadinessCollectionHook = () -> {};
   private final ExecutorService readinessExecutor =
       new ThreadPoolExecutor(
           READINESS_CONCURRENCY,
           READINESS_CONCURRENCY,
           0L,
           TimeUnit.MILLISECONDS,
-          new ArrayBlockingQueue<>(READINESS_CONCURRENCY));
+          new ArrayBlockingQueue<>(READINESS_CONCURRENCY)) {
+        @Override
+        protected void afterExecute(Runnable task, Throwable failure) {
+          super.afterExecute(task, failure);
+          readinessTaskCompletedHook.run();
+        }
+      };
   private QueuePosition readinessCursor;
 
   public TradingService(
@@ -148,6 +158,7 @@ public class TradingService implements UnsentIntentStop {
     replayOrderEvidence();
     BrokerGateway gateway = gateways.getIfAvailable();
     if (gateway == null) return;
+    QueuePosition snapshotStart = readinessCursor;
     List<CopyIntent> waiting = waitingSnapshot();
     if (waiting.isEmpty()) return;
 
@@ -163,10 +174,9 @@ public class TradingService implements UnsentIntentStop {
         waiting.stream()
             .filter(intent -> "WAITING".equals(intent.status))
             .filter(
-                intent ->
-                    intent.retryOf == null || !haltedParentsPrepared.contains(intent.retryOf))
+                intent -> intent.retryOf == null || !haltedParentsPrepared.contains(intent.retryOf))
             .toList();
-    dispatchWaiting(gateway, waitingOnly);
+    dispatchWaiting(gateway, waitingOnly, snapshotStart);
   }
 
   private List<CopyIntent> waitingSnapshot() {
@@ -199,7 +209,7 @@ public class TradingService implements UnsentIntentStop {
       boolean reachedUpper =
           lastScanned.prioritySequence() > upper.prioritySequence()
               || (lastScanned.prioritySequence() == upper.prioritySequence()
-                  && lastScanned.id().compareTo(upper.id()) >= 0);
+                  && lastScanned.id().equals(upper.id()));
       if (reachedUpper) {
         if (!wrapped && cursor != null) {
           wrapped = true;
@@ -212,12 +222,13 @@ public class TradingService implements UnsentIntentStop {
     if (lastScanned != null) readinessCursor = lastScanned;
     snapshot.sort(
         Comparator.comparingLong((CopyIntent intent) -> intent.prioritySequence)
-            .thenComparing(intent -> intent.id));
+            .thenComparing(intent -> intent.id, TradingService::compareQueueUuid));
     return List.copyOf(snapshot);
   }
 
   // Read-only broker preflight runs in bounded waves; reservations and PostOrder remain serialized.
-  private void dispatchWaiting(BrokerGateway gateway, List<CopyIntent> waiting) {
+  private void dispatchWaiting(
+      BrokerGateway gateway, List<CopyIntent> waiting, QueuePosition snapshotStart) {
     var gate = control.gate();
     List<CopyIntent> eligible = new ArrayList<>();
     for (CopyIntent intent : waiting) {
@@ -237,38 +248,90 @@ public class TradingService implements UnsentIntentStop {
       if (age.allowed) eligible.add(intent);
     }
 
-    for (int offset = 0; offset < eligible.size(); offset += READINESS_CONCURRENCY) {
-      int end = Math.min(offset + READINESS_CONCURRENCY, eligible.size());
-      CompletionService<ReadinessResult> completed =
-          new ExecutorCompletionService<>(readinessExecutor);
-      try {
-        for (int index = offset; index < end; index++) {
-          CopyIntent intent = eligible.get(index);
-          completed.submit(() -> inspect(gateway, intent));
-        }
-        List<ReadinessResult> results = new ArrayList<>(end - offset);
-        Throwable readinessFailure = null;
-        for (int index = offset; index < end; index++) {
+    CompletionService<ReadinessResult> completed =
+        new ExecutorCompletionService<>(readinessExecutor);
+    Map<Future<ReadinessResult>, PendingReadiness> pending = new IdentityHashMap<>();
+    int next = 0;
+    QueuePosition lastSubmitted = null;
+    boolean stopSubmitting = false;
+    boolean collectionHookCalled = false;
+    long passDeadline = System.nanoTime() + READINESS_PASS_BUDGET_NANOS;
+    try {
+      while (next < eligible.size() || !pending.isEmpty()) {
+        if (readinessExecutor.isShutdown() || System.nanoTime() - passDeadline >= 0) break;
+
+        while (!stopSubmitting
+            && next < eligible.size()
+            && pending.size() < READINESS_CONCURRENCY) {
+          if (readinessExecutor.isShutdown()) {
+            stopSubmitting = true;
+            break;
+          }
+          CopyIntent intent = eligible.get(next);
+          Future<ReadinessResult> future;
           try {
-            results.add(completed(completed.take()));
-          } catch (RuntimeException | Error failed) {
-            if (readinessFailure == null) readinessFailure = failed;
+            future = completed.submit(() -> inspect(gateway, intent));
+          } catch (RejectedExecutionException saturated) {
+            stopSubmitting = true;
+            break;
+          }
+          pending.put(
+              future, new PendingReadiness(System.nanoTime() + READINESS_ITEM_BUDGET_NANOS));
+          next++;
+          lastSubmitted = new QueuePosition(intent.prioritySequence, intent.id);
+        }
+        if (readinessExecutor.isShutdown() || pending.isEmpty()) break;
+        if (!collectionHookCalled) {
+          beforeReadinessCollectionHook.run();
+          collectionHookCalled = true;
+        }
+
+        long now = System.nanoTime();
+        long waitNanos = passDeadline - now;
+        for (PendingReadiness submission : pending.values())
+          waitNanos = Math.min(waitNanos, submission.deadlineNanos() - now);
+        Future<ReadinessResult> first =
+            completed.poll(Math.max(0L, waitNanos), TimeUnit.NANOSECONDS);
+
+        List<Future<ReadinessResult>> available = new ArrayList<>();
+        if (first != null) available.add(first);
+        Future<ReadinessResult> nextCompleted;
+        while ((nextCompleted = completed.poll()) != null) available.add(nextCompleted);
+
+        List<ReadinessResult> results = new ArrayList<>(available.size());
+        for (Future<ReadinessResult> future : available) {
+          PendingReadiness submission = pending.remove(future);
+          if (submission != null && !future.isCancelled()) results.add(completed(future));
+        }
+
+        now = System.nanoTime();
+        var iterator = pending.entrySet().iterator();
+        while (iterator.hasNext()) {
+          var entry = iterator.next();
+          if (now - entry.getValue().deadlineNanos() < 0) continue;
+          Future<ReadinessResult> future = entry.getKey();
+          iterator.remove();
+          if (future.isDone()) {
+            if (!future.isCancelled()) results.add(completed(future));
+          } else {
+            future.cancel(true);
           }
         }
-        if (readinessFailure instanceof RuntimeException runtime) throw runtime;
-        if (readinessFailure instanceof Error error) throw error;
+
         results.sort(
             Comparator.comparing(ReadinessResult::readyAt)
                 .thenComparingLong(result -> result.intent().prioritySequence)
-                .thenComparing(result -> result.intent().id));
+                .thenComparing(result -> result.intent().id, TradingService::compareQueueUuid));
         for (ReadinessResult result : results)
           prepare(gateway, result.intent().id, result.preflight());
-      } catch (InterruptedException interrupted) {
-        Thread.currentThread().interrupt();
-        return;
-      } catch (RejectedExecutionException saturated) {
-        return;
       }
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+      return;
+    } finally {
+      for (Future<ReadinessResult> future : pending.keySet()) future.cancel(true);
+      if (next < eligible.size())
+        readinessCursor = lastSubmitted == null ? snapshotStart : lastSubmitted;
     }
   }
 
@@ -315,9 +378,7 @@ public class TradingService implements UnsentIntentStop {
       if (resources == null || !withinReadinessBudget(startedNanos))
         return new ReadinessResult(intent, null, clock.instant());
       BigDecimal best =
-          gateway
-              .bestOppositePrice(intent.instrumentId, Side.valueOf(intent.side))
-              .orElse(null);
+          gateway.bestOppositePrice(intent.instrumentId, Side.valueOf(intent.side)).orElse(null);
       if (!withinReadinessBudget(startedNanos))
         return new ReadinessResult(intent, null, clock.instant());
       return new ReadinessResult(
@@ -340,7 +401,7 @@ public class TradingService implements UnsentIntentStop {
 
   private boolean withinReadinessBudget(long startedNanos) {
     long elapsed = System.nanoTime() - startedNanos;
-    return elapsed >= 0 && elapsed <= Duration.ofSeconds(5).toNanos();
+    return elapsed >= 0 && elapsed <= READINESS_ITEM_BUDGET_NANOS;
   }
 
   private boolean preflightMatches(CopyIntent current, Preflight preflight) {
@@ -370,7 +431,16 @@ public class TradingService implements UnsentIntentStop {
         && Objects.equals(requested, resources.instrument());
   }
 
+  private record PendingReadiness(long deadlineNanos) {}
+
   private record ReadinessResult(CopyIntent intent, Preflight preflight, Instant readyAt) {}
+
+  private static int compareQueueUuid(UUID left, UUID right) {
+    int most = Long.compareUnsigned(left.getMostSignificantBits(), right.getMostSignificantBits());
+    return most != 0
+        ? most
+        : Long.compareUnsigned(left.getLeastSignificantBits(), right.getLeastSignificantBits());
+  }
 
   private QueuePosition waitingHighWater() {
     return tx.execute(
@@ -427,10 +497,7 @@ public class TradingService implements UnsentIntentStop {
   private record ReservationSnapshot(BigDecimal total) {}
 
   private record BuySelection(
-      long lots,
-      ResourceEvidence quote,
-      ReservationSnapshot reservations,
-      boolean complete) {}
+      long lots, ResourceEvidence quote, ReservationSnapshot reservations, boolean complete) {}
 
   private ReservationSnapshot reservationSnapshot(String currency, ResourceEvidence resources) {
     BigDecimal reserved = BigDecimal.ZERO;
@@ -441,9 +508,7 @@ public class TradingService implements UnsentIntentStop {
             .setParameter("currency", currency)
             .getResultList()) {
       BigDecimal reflected =
-          resources
-              .bankReflectedReservations()
-              .getOrDefault(reservation.id, BigDecimal.ZERO);
+          resources.bankReflectedReservations().getOrDefault(reservation.id, BigDecimal.ZERO);
       if (reflected.signum() < 0 || reflected.compareTo(reservation.reservedMoney) > 0)
         throw new IllegalArgumentException("Unqualified bank reservation coverage");
       reserved = reserved.add(reservation.reservedMoney.subtract(reflected));
@@ -494,7 +559,8 @@ public class TradingService implements UnsentIntentStop {
         && full.buyMaxLots() == candidate.buyMaxLots()
         && full.sellMaxLots() == candidate.sellMaxLots()
         && full.ownMoney().compareTo(candidate.ownMoney()) == 0
-        && full.additionalCommissionReserve().compareTo(candidate.additionalCommissionReserve()) == 0
+        && full.additionalCommissionReserve().compareTo(candidate.additionalCommissionReserve())
+            == 0
         && sameAmounts(full.bankReflectedReservations(), candidate.bankReflectedReservations());
   }
 
@@ -509,6 +575,25 @@ public class TradingService implements UnsentIntentStop {
         limit.multiply(BigDecimal.valueOf(instrument.lotSize())).multiply(BigDecimal.valueOf(lots));
     BigDecimal fees = quote.preliminaryCommission().add(quote.additionalCommissionReserve());
     return principal.add(fees).compareTo(quote.ownMoney().subtract(reserved)) <= 0;
+  }
+
+  private BigDecimal buyTotalCost(
+      long lots, Instrument instrument, BigDecimal limit, ResourceEvidence quote) {
+    return limit
+        .multiply(BigDecimal.valueOf(instrument.lotSize()))
+        .multiply(BigDecimal.valueOf(lots))
+        .add(quote.preliminaryCommission())
+        .add(quote.additionalCommissionReserve());
+  }
+
+  private boolean recordNondecreasingBuyCost(
+      Map<Long, BigDecimal> observed, long lots, BigDecimal totalCost) {
+    for (var entry : observed.entrySet()) {
+      if ((entry.getKey() < lots && entry.getValue().compareTo(totalCost) > 0)
+          || (entry.getKey() > lots && entry.getValue().compareTo(totalCost) < 0)) return false;
+    }
+    observed.put(lots, totalCost);
+    return true;
   }
 
   private boolean withinBuyInspectionBudget(long inspectionStartedNanos) {
@@ -561,7 +646,12 @@ public class TradingService implements UnsentIntentStop {
       upperQuote =
           gateway.resources(
               new OrderRequest(
-                  properties.mirrorAccount(), intent.id, intent.instrumentId, Side.BUY, upper, limit));
+                  properties.mirrorAccount(),
+                  intent.id,
+                  intent.instrumentId,
+                  Side.BUY,
+                  upper,
+                  limit));
     }
     if (!consistentBuyQuote(
         full, upperQuote, upper, instrument, intent.currency, inspectionStartedNanos))
@@ -572,6 +662,14 @@ public class TradingService implements UnsentIntentStop {
     boolean nondecreasing =
         gateway.buyTotalCostNondecreasing(
             properties.mirrorAccount(), intent.instrumentId, intent.currency);
+    Map<Long, BigDecimal> observedTotalCosts = nondecreasing ? new HashMap<>() : null;
+    if (nondecreasing) {
+      observedTotalCosts.put(requested, buyTotalCost(requested, instrument, limit, full));
+      if (!recordNondecreasingBuyCost(
+          observedTotalCosts, upper, buyTotalCost(upper, instrument, limit, upperQuote)))
+        return new BuySelection(0, full, reservations, false);
+    }
+    ResourceEvidence selectedQuote = null;
     long low = 0;
     long high = upper;
     if (nondecreasing) {
@@ -590,10 +688,14 @@ public class TradingService implements UnsentIntentStop {
                     candidate,
                     limit));
         if (!consistentBuyQuote(
-            full, quote, candidate, instrument, intent.currency, inspectionStartedNanos))
+                full, quote, candidate, instrument, intent.currency, inspectionStartedNanos)
+            || !recordNondecreasingBuyCost(
+                observedTotalCosts, candidate, buyTotalCost(candidate, instrument, limit, quote)))
           return new BuySelection(0, full, reservations, false);
-        if (buyAffordable(candidate, instrument, limit, quote, reservations.total())) low = candidate;
-        else high = candidate;
+        if (buyAffordable(candidate, instrument, limit, quote, reservations.total())) {
+          low = candidate;
+          selectedQuote = quote;
+        } else high = candidate;
       }
     } else {
       for (long candidate = upper - 1; candidate > 0; candidate--) {
@@ -613,6 +715,7 @@ public class TradingService implements UnsentIntentStop {
           return new BuySelection(0, full, reservations, false);
         if (buyAffordable(candidate, instrument, limit, quote, reservations.total())) {
           low = candidate;
+          selectedQuote = quote;
           break;
         }
       }
@@ -627,6 +730,8 @@ public class TradingService implements UnsentIntentStop {
                 properties.mirrorAccount(), intent.id, intent.instrumentId, Side.BUY, low, limit));
     if (!consistentBuyQuote(
             full, confirmed, low, instrument, intent.currency, inspectionStartedNanos)
+        || selectedQuote == null
+        || confirmed.preliminaryCommission().compareTo(selectedQuote.preliminaryCommission()) != 0
         || !buyAffordable(low, instrument, limit, confirmed, reservations.total()))
       return new BuySelection(0, full, reservations, false);
     return new BuySelection(low, confirmed, reservations, true);
@@ -662,9 +767,8 @@ public class TradingService implements UnsentIntentStop {
     }
     if (!age.allowed) return;
     if (!preflightDone) supplied = inspect(gateway, detached).preflight();
-    if (supplied == null
-        || supplied.resources() == null
-        || !preflightMatches(detached, supplied)) return;
+    if (supplied == null || supplied.resources() == null || !preflightMatches(detached, supplied))
+      return;
     ResourceEvidence fullResources = supplied.resources();
     BigDecimal best = supplied.best();
     BigDecimal queriedLimit = supplied.queriedLimit();
@@ -693,8 +797,8 @@ public class TradingService implements UnsentIntentStop {
           });
       return;
     }
-    if (!resourceEvidenceValid(fullResources, instrument, detached.currency, inspectionStartedNanos))
-      return;
+    if (!resourceEvidenceValid(
+        fullResources, instrument, detached.currency, inspectionStartedNanos)) return;
     BuySelection buySelection;
     ResourceEvidence resources;
     if ("BUY".equals(detached.side)) {
@@ -753,8 +857,7 @@ public class TradingService implements UnsentIntentStop {
                   || clock.instant().isBefore(resources.requestStarted())
                   || clock.instant().isAfter(resources.requestStarted().plusSeconds(5))
                   || clock.instant().isBefore(resources.receivedAt())
-                  || clock.instant().isAfter(resources.receivedAt().plusSeconds(5)))
-                return null;
+                  || clock.instant().isAfter(resources.receivedAt().plusSeconds(5))) return null;
               long inspectionElapsed = System.nanoTime() - inspectionStartedNanos;
               if (inspectionElapsed < 0 || inspectionElapsed > Duration.ofSeconds(5).toNanos())
                 return null;
@@ -787,14 +890,15 @@ public class TradingService implements UnsentIntentStop {
                       Side.valueOf(i.side), i.referencePrice, instrument.priceIncrement());
               ReservationSnapshot currentReservations = reservationSnapshot(i.currency, resources);
               if (buySelection != null
-                  && currentReservations.total().compareTo(buySelection.reservations().total()) != 0)
-                return null;
+                  && currentReservations.total().compareTo(buySelection.reservations().total())
+                      != 0) return null;
               BigDecimal reserved = currentReservations.total();
               long allowed;
               long currentRequested = i.lots - i.skippedLots;
               if ("BUY".equals(i.side)) {
                 if (!buyAffordable(
-                    buySelection.lots(), instrument, i.limitPrice, resources, reserved)) return null;
+                    buySelection.lots(), instrument, i.limitPrice, resources, reserved))
+                  return null;
                 allowed = Math.min(resources.buyMaxLots(), buySelection.lots());
               } else {
                 MirrorPosition position = position(i.instrumentId);

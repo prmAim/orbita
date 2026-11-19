@@ -22,8 +22,7 @@ public final class TradeNotificationText {
   static final String CONFIRMED_HALT_REJECTION_REASON =
       "Подтверждённый отказ из-за остановки торгов";
   static final String UNSENT_FINAL_SKIP_REASON = "Объём не отправлялся до заявки";
-  static final String UNQUALIFIED_FINAL_SKIP_REASON =
-      "Причина остатка заявки не квалифицирована";
+  static final String UNQUALIFIED_FINAL_SKIP_REASON = "Причина остатка заявки не квалифицирована";
 
   private TradeNotificationText() {}
 

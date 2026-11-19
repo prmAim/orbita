@@ -35,8 +35,7 @@ class BrokerQualificationBindingTest {
           assertThat(profile.capitalQualified("source", NOW)).isFalse();
           assertThat(profile.resourcesQualified("mirror", "asset", "RUB", NOW)).isFalse();
           assertThat(profile.additionalCommissionReserve()).isNull();
-          assertThat(
-                  profile.buyTotalCostNondecreasingQualified("mirror", "asset", "RUB", NOW))
+          assertThat(profile.buyTotalCostNondecreasingQualified("mirror", "asset", "RUB", NOW))
               .isFalse();
         });
   }
@@ -56,8 +55,7 @@ class BrokerQualificationBindingTest {
               assertThat(profile.resourcesQualified("mirror", "other", "RUB", NOW)).isFalse();
               assertThat(profile.resourcesQualified("mirror", "asset", "USD", NOW)).isFalse();
               assertThat(profile.additionalCommissionReserve()).isEqualByComparingTo("1.000000009");
-              assertThat(
-                      profile.buyTotalCostNondecreasingQualified("mirror", "asset", "RUB", NOW))
+              assertThat(profile.buyTotalCostNondecreasingQualified("mirror", "asset", "RUB", NOW))
                   .isFalse();
             });
   }
@@ -66,22 +64,19 @@ class BrokerQualificationBindingTest {
   void explicitTotalBuyCostConfirmationIsScopedToTheQualifiedProfile() {
     context
         .withPropertyValues(validProfile())
-        .withPropertyValues("orbita.broker.qualification.total-buy-cost-nondecreasing-confirmed=true")
+        .withPropertyValues(
+            "orbita.broker.qualification.total-buy-cost-nondecreasing-confirmed=true")
         .run(
             app -> {
               assertThat(app).hasNotFailed();
               var profile = app.getBean(BrokerQualifications.class);
-              assertThat(
-                      profile.buyTotalCostNondecreasingQualified("mirror", "asset", "RUB", NOW))
+              assertThat(profile.buyTotalCostNondecreasingQualified("mirror", "asset", "RUB", NOW))
                   .isTrue();
-              assertThat(
-                      profile.buyTotalCostNondecreasingQualified("source", "asset", "RUB", NOW))
+              assertThat(profile.buyTotalCostNondecreasingQualified("source", "asset", "RUB", NOW))
                   .isFalse();
-              assertThat(
-                      profile.buyTotalCostNondecreasingQualified("mirror", "other", "RUB", NOW))
+              assertThat(profile.buyTotalCostNondecreasingQualified("mirror", "other", "RUB", NOW))
                   .isFalse();
-              assertThat(
-                      profile.buyTotalCostNondecreasingQualified("mirror", "asset", "USD", NOW))
+              assertThat(profile.buyTotalCostNondecreasingQualified("mirror", "asset", "USD", NOW))
                   .isFalse();
             });
   }

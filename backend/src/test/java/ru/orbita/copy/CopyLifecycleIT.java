@@ -77,9 +77,11 @@ class CopyLifecycleIT {
     broker.capitalHook = null;
     broker.capitalResponse = null;
     broker.afterPostHook = null;
+    broker.postHook = null;
     broker.afterReconcileHook = null;
     clock.receiptInstants.clear();
     broker.resourcesHook = null;
+    broker.resourcesRequestHook = null;
     broker.blockPurchases = false;
     broker.settlementCurrency = "RUB";
     broker.cancels = 0;
@@ -107,6 +109,7 @@ class CopyLifecycleIT {
     broker.minimumBuyCommissionFloor = null;
     broker.buyTotalCosts.clear();
     broker.monotonicBuyPricing = true;
+    broker.attestBuyTotalCosts = false;
     broker.finalCommissionAvailable = true;
     broker.instrumentLotSize = 1;
     broker.instrumentHook = null;
@@ -1312,6 +1315,90 @@ class CopyLifecycleIT {
         .satisfies(intent -> assertThat(intent.reservedMoney()).isEqualByComparingTo("3"));
   }
 
+  @Test
+  void changedSelectedBuyFeeWaitsWithoutPostingOrReserving() {
+    runningAtFive();
+    broker.availableMoney = new BigDecimal("210");
+    broker.buyMaxLots = 2;
+    broker.additionalCommissionReserve = BigDecimal.ZERO;
+    broker.buyTotalCosts.put(2L, new BigDecimal("220"));
+    broker.buyTotalCosts.put(1L, new BigDecimal("120"));
+    Map<Long, Integer> reads = new HashMap<>();
+    broker.resourcesRequestHook =
+        request -> {
+          if (request.side() == Side.BUY
+              && request.lots() == 1
+              && reads.merge(1L, 1, Integer::sum) == 2)
+            broker.buyTotalCosts.put(1L, new BigDecimal("105"));
+        };
+    clock.now = clock.now.plusSeconds(1);
+    var execution =
+        new SourceExecution(
+            "source",
+            "changed-selected-buy-fee",
+            "changed-selected-buy-fee-order",
+            "instrument",
+            Side.BUY,
+            new BigDecimal("0.4"),
+            new BigDecimal("200"),
+            "RUB",
+            clock.instant(),
+            clock.instant());
+    broker.historyExecutions.add(execution);
+
+    assertThat(copies.accept(execution).newLots()).isEqualTo(2);
+    trading.dispatchReady();
+
+    assertThat(broker.posts).isZero();
+    assertThat(copies.intents())
+        .singleElement()
+        .satisfies(
+            intent -> {
+              assertThat(intent.status()).isEqualTo("WAITING");
+              assertThat(intent.reservedMoney()).isEqualByComparingTo("0");
+            });
+  }
+
+  @Test
+  void attestedDecreasingBuyTotalCostWaitsWithoutPostingOrReserving() {
+    runningAtFive();
+    broker.availableMoney = new BigDecimal("4");
+    broker.buyMaxLots = 4;
+    broker.oppositePrice = BigDecimal.ONE;
+    broker.preliminaryCommission = BigDecimal.ZERO;
+    broker.additionalCommissionReserve = BigDecimal.ZERO;
+    broker.buyTotalCosts.put(4L, new BigDecimal("9"));
+    broker.buyTotalCosts.put(2L, new BigDecimal("10"));
+    broker.buyTotalCosts.put(1L, new BigDecimal("5.1"));
+    broker.attestBuyTotalCosts = true;
+    clock.now = clock.now.plusSeconds(1);
+    var execution =
+        new SourceExecution(
+            "source",
+            "decreasing-attested-buy-cost",
+            "decreasing-attested-buy-cost-order",
+            "instrument",
+            Side.BUY,
+            new BigDecimal("0.8"),
+            BigDecimal.ONE,
+            "RUB",
+            clock.instant(),
+            clock.instant());
+    broker.historyExecutions.add(execution);
+
+    assertThat(copies.accept(execution).newLots()).isEqualTo(4);
+    trading.dispatchReady();
+
+    assertThat(broker.posts).isZero();
+    assertThat(copies.intents())
+        .singleElement()
+        .satisfies(
+            intent -> {
+              assertThat(intent.status()).isEqualTo("WAITING");
+              assertThat(intent.reservedMoney()).isEqualByComparingTo("0");
+            });
+  }
+
   @org.junit.jupiter.api.Timeout(value = 20, unit = java.util.concurrent.TimeUnit.SECONDS)
   @Test
   void readyIntentIsNotStarvedByHundredDelayedMetadataMisses() {
@@ -1454,6 +1541,18 @@ class CopyLifecycleIT {
             throw new IllegalStateException(interrupted);
           }
         };
+    var completedTasks = new java.util.concurrent.CountDownLatch(2);
+    trading.readinessTaskCompletedHook = completedTasks::countDown;
+    trading.beforeReadinessCollectionHook =
+        () -> {
+          try {
+            if (!completedTasks.await(5, java.util.concurrent.TimeUnit.SECONDS))
+              throw new IllegalStateException("readiness completion barrier timed out");
+          } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(interrupted);
+          }
+        };
     var dispatcher = java.util.concurrent.Executors.newSingleThreadExecutor();
     try {
       var dispatch = dispatcher.submit(trading::dispatchReady);
@@ -1463,14 +1562,69 @@ class CopyLifecycleIT {
     } finally {
       release.countDown();
       dispatcher.shutdownNow();
-      assertThat(dispatcher.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+      assertThat(dispatcher.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
       broker.instrumentIdHook = null;
+      trading.readinessTaskCompletedHook = () -> {};
+      trading.beforeReadinessCollectionHook = () -> {};
     }
 
     assertThat(broker.sentRequests)
         .extracting(OrderRequest::instrumentId)
         .containsExactly("tie-first", "tie-second");
     assertThat(copies.intents()).hasSize(2);
+  }
+
+  @org.junit.jupiter.api.Timeout(value = 15, unit = java.util.concurrent.TimeUnit.SECONDS)
+  @Test
+  void readyPostDoesNotWaitForBlockedPeer() throws Exception {
+    runningAtFive();
+    broker.availableMoney = new BigDecimal("1000");
+    broker.buyMaxLots = 1;
+    broker.fillEveryPost = true;
+    clock.now = clock.now.plusSeconds(1);
+    copies.accept(source("slow-peer", "slow-peer", Side.BUY, 1, clock.instant()));
+    copies.accept(source("ready-peer", "ready-peer", Side.BUY, 1, clock.instant()));
+
+    var slowEntered = new java.util.concurrent.CountDownLatch(1);
+    var releaseSlow = new java.util.concurrent.CountDownLatch(1);
+    var readyPosted = new java.util.concurrent.CountDownLatch(1);
+    var slowStillBlocked = new java.util.concurrent.atomic.AtomicBoolean();
+    var firstSlowRead = new java.util.concurrent.atomic.AtomicBoolean();
+    broker.instrumentIdHook =
+        id -> {
+          if (!id.equals("slow-peer") || !firstSlowRead.compareAndSet(false, true)) return;
+          slowStillBlocked.set(true);
+          slowEntered.countDown();
+          try {
+            if (!releaseSlow.await(5, java.util.concurrent.TimeUnit.SECONDS))
+              throw new IllegalStateException("slow readiness timed out");
+          } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(interrupted);
+          } finally {
+            slowStillBlocked.set(false);
+          }
+        };
+    broker.postHook =
+        request -> {
+          if (request.instrumentId().equals("ready-peer")) readyPosted.countDown();
+        };
+
+    var dispatcher = java.util.concurrent.Executors.newSingleThreadExecutor();
+    try {
+      var dispatch = dispatcher.submit(trading::dispatchReady);
+      assertThat(slowEntered.await(3, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+      assertThat(readyPosted.await(3, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+      assertThat(slowStillBlocked.get()).isTrue();
+      releaseSlow.countDown();
+      dispatch.get(5, java.util.concurrent.TimeUnit.SECONDS);
+    } finally {
+      releaseSlow.countDown();
+      dispatcher.shutdownNow();
+      assertThat(dispatcher.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+      broker.instrumentIdHook = null;
+      broker.postHook = null;
+    }
   }
 
   private void runningAtFive() {
@@ -2268,8 +2422,11 @@ class CopyLifecycleIT {
     BigDecimal minimumBuyCommissionFloor;
     final Map<Long, BigDecimal> buyTotalCosts = new HashMap<>();
     boolean monotonicBuyPricing = true;
+    boolean attestBuyTotalCosts;
+    java.util.function.Consumer<OrderRequest> resourcesRequestHook;
     BigDecimal sourceCash = new BigDecimal("100"), mirrorCash = new BigDecimal("100");
     Runnable afterPostHook;
+    java.util.function.Consumer<OrderRequest> postHook;
     Runnable afterReconcileHook;
     Runnable resourcesHook;
     Runnable instrumentHook;
@@ -2292,7 +2449,7 @@ class CopyLifecycleIT {
 
     public boolean buyTotalCostNondecreasing(
         String accountId, String instrumentId, String currency) {
-      return monotonicBuyPricing && buyTotalCosts.isEmpty();
+      return monotonicBuyPricing && (buyTotalCosts.isEmpty() || attestBuyTotalCosts);
     }
 
     public CapitalEvidence capital(String account) {
@@ -2316,6 +2473,7 @@ class CopyLifecycleIT {
     public ResourceEvidence resources(OrderRequest r) {
       resourcesCalls++;
       if (resourcesHook != null) resourcesHook.run();
+      if (resourcesRequestHook != null) resourcesRequestHook.accept(r);
       return new ResourceEvidence(
           "mirror",
           instrument(r.instrumentId()),
@@ -2344,10 +2502,7 @@ class CopyLifecycleIT {
       if (request.side() == Side.BUY && buyCommissionPerLot != null)
         return buyCommissionPerLot
             .multiply(BigDecimal.valueOf(request.lots()))
-            .max(
-                minimumBuyCommissionFloor == null
-                    ? BigDecimal.ZERO
-                    : minimumBuyCommissionFloor);
+            .max(minimumBuyCommissionFloor == null ? BigDecimal.ZERO : minimumBuyCommissionFloor);
       return preliminaryCommission;
     }
 
@@ -2416,6 +2571,7 @@ class CopyLifecycleIT {
       posts++;
       sent = r;
       sentRequests.add(r);
+      if (postHook != null) postHook.accept(r);
       if (rejectNext != null) {
         var reason = rejectNext;
         rejectNext = null;
