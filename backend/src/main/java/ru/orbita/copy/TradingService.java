@@ -267,7 +267,8 @@ public class TradingService implements UnsentIntentStop {
           _ -> {
             control.gate();
             var i = em.find(CopyIntent.class, id);
-            if ("WAITING".equals(i.status)) i.reason = resources.detail();
+            if ("WAITING".equals(i.status))
+              i.reason = TradeNotificationText.preserveSkipReasons(i.reason, resources.detail());
           });
       return;
     }
@@ -419,7 +420,9 @@ public class TradingService implements UnsentIntentStop {
               if (!control.consumeTradingPermission(i.executedAt, allowed, i.currency, rub)) {
                 i.status = "SHADOW";
                 i.reason =
-                    "Теневой расчёт: отсутствует подходящий допуск или активация автоотправки";
+                    TradeNotificationText.preserveSkipReasons(
+                        i.reason,
+                        "Теневой расчёт: отсутствует подходящий допуск или активация автоотправки");
                 em.persist(
                     new JournalEntry(
                         clock.instant(), "SHADOW_DECISION", i.instrumentId, i.view().toString()));
@@ -442,7 +445,7 @@ public class TradingService implements UnsentIntentStop {
               if (i.firstBestOpposite == null) i.firstBestOpposite = best;
               if (resourceSkipped > 0) {
                 i.reason =
-                    TradeNotificationText.withRecoverySkipReason(
+                    TradeNotificationText.preserveSkipReasons(
                         i.reason, TradeNotificationText.RESOURCE_LIMIT_SKIP_REASON);
                 notifications.publish(
                     "RESOURCE_SKIP",
@@ -535,7 +538,10 @@ public class TradingService implements UnsentIntentStop {
                 i.permittedIssuedAt,
                 i.permittedRubLimit);
           i.status = "WAITING";
-          i.reason = "Внешней отправки не было; требуется свежая проверка ресурсов и возраста";
+          i.reason =
+              TradeNotificationText.preserveSkipReasons(
+                  i.reason,
+                  "Внешней отправки не было; требуется свежая проверка ресурсов и возраста");
           em.persist(
               new JournalEntry(
                   clock.instant(), "KNOWN_NOT_SENT", i.instrumentId, i.id + " " + i.reason));
@@ -708,7 +714,9 @@ public class TradingService implements UnsentIntentStop {
             i.acceptanceOrderReconciled = false;
             i.acceptanceReconciled = false;
             i.status = "UNKNOWN";
-            i.reason = "Неопределённый результат заявки; резерв сохранён";
+            i.reason =
+                TradeNotificationText.preserveSkipReasons(
+                    i.reason, "Неопределённый результат заявки; резерв сохранён");
             if (i.unknownNotification == null)
               i.unknownNotification =
                   notifications.publish(
@@ -809,7 +817,9 @@ public class TradingService implements UnsentIntentStop {
               i.reservedLots = 0;
               i.reservedMoney = i.commissionReserve;
               i.reason =
-                  "Подтверждённый отказ из-за остановки торгов; ожидание прежней лучшей встречной цены";
+                  TradeNotificationText.preserveSkipReasons(
+                      i.reason,
+                      "Подтверждённый отказ из-за остановки торгов; ожидание прежней лучшей встречной цены");
               em.persist(
                   new JournalEntry(
                       clock.instant(),
@@ -860,7 +870,9 @@ public class TradingService implements UnsentIntentStop {
               i.deadlineReliable = confirmationBound.isPresent();
               if (!i.deadlineReliable)
                 i.reason =
-                    "Исходная точка таймера сохранена; достоверность оставшегося времени не подтверждена, новая минута не назначается";
+                    TradeNotificationText.preserveSkipReasons(
+                        i.reason,
+                        "Исходная точка таймера сохранена; достоверность оставшегося времени не подтверждена, новая минута не назначается");
             }
           }
           if (i.unknownNotification != null && !stream && (terminal || !i.cancellationPending)) {
@@ -1035,14 +1047,16 @@ public class TradingService implements UnsentIntentStop {
             : Optional.<ru.orbita.broker.BuyResourceRejectionClassifier.Qualification>empty();
     if (result.isPresent()) {
       if (!qualified && terminal && result.get().status() == current.status()) {
-        i.reason = result.get().detail();
+        i.reason = TradeNotificationText.preserveSkipReasons(i.reason, result.get().detail());
         orderJournal.qualifyReason(attempt, result.get(), history);
       }
     } else if (qualified) {
       i.reason =
-          qualifiedLotSize == null
-              ? "Причина OTHER; независимый размер лота недоступен; требуется сверка"
-              : "Причина OTHER; прежняя квалификация нехватки средств опровергнута; требуется сверка";
+          TradeNotificationText.preserveSkipReasons(
+              i.reason,
+              qualifiedLotSize == null
+                  ? "Причина OTHER; независимый размер лота недоступен; требуется сверка"
+                  : "Причина OTHER; прежняя квалификация нехватки средств опровергнута; требуется сверка");
       orderJournal.invalidateReason(attempt, current.status(), i.reason, history);
       contradiction(
           i,
@@ -1126,7 +1140,7 @@ public class TradingService implements UnsentIntentStop {
   private void skipInside(CopyIntent i, String reason) {
     i.status = "FINAL";
     i.skippedLots = i.lots - i.executedLots;
-    i.reason = TradeNotificationText.withRecoverySkipReason(i.reason, reason);
+    i.reason = TradeNotificationText.preserveSkipReasons(i.reason, reason);
     allocateRecovery(i);
     String text =
         TradeNotificationText.finalSkip(

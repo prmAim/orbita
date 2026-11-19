@@ -804,10 +804,26 @@ class CopyLifecycleIT {
               assertThat(intent.skippedLots()).isEqualTo(25);
             });
 
+    broker.fillEveryPost = false;
     trading.dispatchReady();
 
     assertThat(broker.posts).isEqualTo(1);
     assertThat(broker.sent.lots()).isEqualTo(25);
+    assertThat(copies.intents())
+        .filteredOn(intent -> intent.sourceOrderId().equals("order-recovery-partial-buy"))
+        .singleElement()
+        .satisfies(intent -> assertThat(intent.status()).isEqualTo("UNKNOWN"));
+    broker.orders.put(
+        broker.sent.requestId(), broker.evidence(broker.sent, OrderStatus.FILLED, 25));
+    trading.reconcileOnly();
+    assertThat(copies.intents())
+        .filteredOn(intent -> intent.sourceOrderId().equals("order-recovery-partial-buy"))
+        .singleElement()
+        .satisfies(
+            intent -> {
+              assertThat(intent.status()).isEqualTo("FINAL");
+              assertThat(intent.executedLots()).isEqualTo(25);
+            });
     var notices =
         notifications.list(100).stream()
             .filter(

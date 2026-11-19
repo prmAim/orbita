@@ -12,27 +12,34 @@ public final class TradeNotificationText {
 
   private TradeNotificationText() {}
 
-  static String withRecoverySkipReason(String currentReason, String nextReason) {
-    if (currentReason != null && currentReason.contains(PARTIAL_RECOVERY_SKIP_REASON))
-      return appendReason(currentReason, nextReason);
-    return nextReason;
+  static String preserveSkipReasons(String currentReason, String nextReason) {
+    String preserved = nextReason;
+    if (currentReason != null) {
+      if (currentReason.contains(PARTIAL_RECOVERY_SKIP_REASON))
+        preserved = appendReason(preserved, PARTIAL_RECOVERY_SKIP_REASON);
+      if (currentReason.contains(RESOURCE_LIMIT_SKIP_REASON))
+        preserved = appendReason(preserved, RESOURCE_LIMIT_SKIP_REASON);
+    }
+    return preserved;
   }
 
   static String finalOrderSkipReason(
       String persistedReason, String evidenceReason, long skippedBeforeSend, long skippedAtFinal) {
-    boolean hasPersistedSkipReason =
-        persistedReason != null
-            && (persistedReason.contains(PARTIAL_RECOVERY_SKIP_REASON)
-                || persistedReason.contains(RESOURCE_LIMIT_SKIP_REASON));
-    if (!hasPersistedSkipReason) return evidenceReason;
-    return skippedAtFinal > skippedBeforeSend
-        ? appendReason(persistedReason, evidenceReason)
-        : persistedReason;
+    String reason = null;
+    if (persistedReason != null) {
+      if (persistedReason.contains(PARTIAL_RECOVERY_SKIP_REASON))
+        reason = appendReason(reason, PARTIAL_RECOVERY_SKIP_REASON);
+      if (persistedReason.contains(RESOURCE_LIMIT_SKIP_REASON))
+        reason = appendReason(reason, RESOURCE_LIMIT_SKIP_REASON);
+    }
+    if (reason == null) return evidenceReason;
+    return skippedAtFinal > skippedBeforeSend ? appendReason(reason, evidenceReason) : reason;
   }
 
   private static String appendReason(String currentReason, String nextReason) {
-    if (nextReason == null || nextReason.isBlank() || currentReason.contains(nextReason))
-      return currentReason;
+    if (nextReason == null || nextReason.isBlank()) return currentReason;
+    if (currentReason == null || currentReason.isBlank()) return nextReason;
+    if (currentReason.contains(nextReason)) return currentReason;
     return currentReason + "; " + nextReason;
   }
 
