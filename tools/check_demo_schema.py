@@ -45,7 +45,7 @@ def check(root):
             for v in cleanup["2"]
         )
         or len(set(cleanup["2"])) != len(cleanup["2"])
-        or not {"16", "17", current}.issubset(cleanup["2"])
+        or not {"16", "17", "18", current}.issubset(cleanup["2"])
     ):
         raise ValueError("malformed or unsupported schema/manifest qualification")
     migrations = []

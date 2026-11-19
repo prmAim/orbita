@@ -68,6 +68,11 @@ class CapitalTimingIT {
             .filter(event -> event.category().equals("RECALCULATION_ERROR"))
             .findFirst()
             .orElseThrow();
+    assertThat(
+            database.queryForObject(
+                "select recalculation_error_notification_id from control_state where id=1",
+                java.util.UUID.class))
+        .isEqualTo(firstError.id());
     String originalText = firstError.text();
     telegram.results.add(
         TelegramTransport.Result.failure("Имитатор: задержка доставки", Duration.ofMinutes(2)));
@@ -118,6 +123,81 @@ class CapitalTimingIT {
         .extracting(NotificationService.Attempt::payload)
         .containsExactly(originalText, annotated.text());
     assertThat(telegram.messages).containsExactly(originalText, recovery.text(), annotated.text());
+  }
+
+  @Test
+  void clockCorrectionDoesNotRollBackSuccessfulRecalculation() {
+    control.markReconciled();
+    control.start();
+    clock.now = clock.now.plusSeconds(1);
+    Instant pauseStartedAt = clock.instant();
+    broker.failCapital = true;
+    control.mandatoryRecalculation();
+    var firstError =
+        notifications.list(200).stream()
+            .filter(event -> event.category().equals("RECALCULATION_ERROR"))
+            .findFirst()
+            .orElseThrow();
+
+    clock.now = pauseStartedAt.minus(Duration.ofMinutes(5));
+    broker.failCapital = false;
+    control.recalculate();
+
+    assertThat(control.status().recalculationPaused()).isFalse();
+    assertThat(notifications.get(firstError.id()).text())
+        .contains(
+            "Пересчёт восстановлен; начало " + NotificationService.formatTime(pauseStartedAt),
+            "длительность не подтверждена");
+    assertThat(notifications.list(200))
+        .filteredOn(event -> event.category().equals("RECALCULATION_RECOVERED"))
+        .hasSize(1);
+  }
+
+  @Test
+  void inFlightSuccessRedeliversAnnotatedMessageWithTheSameId() throws Exception {
+    control.markReconciled();
+    control.start();
+    clock.now = clock.now.plusSeconds(1);
+    Instant pauseStartedAt = clock.instant();
+    broker.failCapital = true;
+    control.mandatoryRecalculation();
+    var firstError =
+        notifications.list(200).stream()
+            .filter(event -> event.category().equals("RECALCULATION_ERROR"))
+            .findFirst()
+            .orElseThrow();
+    String sentPayload = firstError.text();
+
+    telegram.sendStarted = new CountDownLatch(1);
+    telegram.allowSend = new CountDownLatch(1);
+    var delivery = CompletableFuture.runAsync(notifications::deliverDue);
+    try {
+      assertThat(telegram.sendStarted.await(5, TimeUnit.SECONDS)).isTrue();
+      clock.now = clock.now.plusSeconds(61);
+      broker.failCapital = false;
+      control.mandatoryRecalculation();
+    } finally {
+      telegram.allowSend.countDown();
+    }
+    delivery.join();
+
+    var pendingCorrection = notifications.get(firstError.id());
+    assertThat(pendingCorrection.status()).isEqualTo("PENDING");
+    assertThat(pendingCorrection.nextAttemptAt()).isEqualTo(clock.instant());
+    assertThat(pendingCorrection.text())
+        .contains(
+            "Пересчёт восстановлен; начало " + NotificationService.formatTime(pauseStartedAt),
+            firstError.id().toString());
+    notifications.deliverDue();
+    assertThat(notifications.get(firstError.id()).status()).isEqualTo("DELIVERED");
+    assertThat(telegram.messages).containsExactly(sentPayload, pendingCorrection.text());
+    assertThat(telegram.lastText).isEqualTo(pendingCorrection.text());
+    assertThat(notifications.attempts(firstError.id()))
+        .extracting(NotificationService.Attempt::payload)
+        .containsExactly(sentPayload, pendingCorrection.text());
+    assertThat(notifications.list(200))
+        .filteredOn(event -> event.category().equals("RECALCULATION_RECOVERED"))
+        .hasSize(1);
   }
 
   @ParameterizedTest
