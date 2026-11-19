@@ -1,6 +1,8 @@
 package ru.orbita.copy;
 
 import java.math.BigDecimal;
+import ru.orbita.broker.BrokerGateway.OrderStatus;
+import ru.orbita.broker.BrokerGateway.RejectionReason;
 
 /** Builds owner-facing copy-trade notices from the same persisted trade facts as the journal. */
 public final class TradeNotificationText {
@@ -9,31 +11,103 @@ public final class TradeNotificationText {
   static final String RESOURCE_LIMIT_SKIP_REASON = "Объём ограничен доступными ресурсами";
   static final String RESOURCE_UNAVAILABLE_SKIP_REASON =
       "Недостаточно собственных средств или бумаг с комиссией";
+  static final String CONFIRMED_CANCEL_UNKNOWN_REASON =
+      "Подтверждённая отмена заявки; причина брокера неизвестна";
+  static final String CONFIRMED_PARTIAL_CANCEL_UNKNOWN_REASON =
+      "Часть заявки исполнена, остаток подтверждённо отменён; причина брокера неизвестна";
+  static final String CONFIRMED_REJECTION_UNKNOWN_REASON =
+      "Подтверждённый отказ брокера; причина отказа неизвестна";
+  static final String CONFIRMED_PARTIAL_REJECTION_UNKNOWN_REASON =
+      "Часть заявки исполнена; остаток подтверждённо отклонён брокером; причина отказа неизвестна";
+  static final String CONFIRMED_HALT_REJECTION_REASON =
+      "Подтверждённый отказ из-за остановки торгов";
+  static final String UNSENT_FINAL_SKIP_REASON = "Объём не отправлялся до заявки";
+  static final String UNQUALIFIED_FINAL_SKIP_REASON =
+      "Причина остатка заявки не квалифицирована";
 
   private TradeNotificationText() {}
 
   static String preserveSkipReasons(String currentReason, String nextReason) {
-    String preserved = nextReason;
-    if (currentReason != null) {
-      if (currentReason.contains(PARTIAL_RECOVERY_SKIP_REASON))
+    String preserved = preservedSkipReasons(currentReason);
+    if (nextReason != null) {
+      if (nextReason.contains(PARTIAL_RECOVERY_SKIP_REASON))
         preserved = appendReason(preserved, PARTIAL_RECOVERY_SKIP_REASON);
-      if (currentReason.contains(RESOURCE_LIMIT_SKIP_REASON))
+      if (nextReason.contains(RESOURCE_LIMIT_SKIP_REASON))
         preserved = appendReason(preserved, RESOURCE_LIMIT_SKIP_REASON);
+      if (nextReason.contains(RESOURCE_UNAVAILABLE_SKIP_REASON))
+        preserved = appendReason(preserved, RESOURCE_UNAVAILABLE_SKIP_REASON);
+      String remaining = nextReason;
+      remaining = removeSkipReason(remaining, PARTIAL_RECOVERY_SKIP_REASON);
+      remaining = removeSkipReason(remaining, RESOURCE_LIMIT_SKIP_REASON);
+      remaining = removeSkipReason(remaining, RESOURCE_UNAVAILABLE_SKIP_REASON);
+      return appendReason(preserved, remaining);
+    }
+    return preserved;
+  }
+
+  private static String preservedSkipReasons(String persistedReason) {
+    String preserved = null;
+    if (persistedReason != null) {
+      if (persistedReason.contains(PARTIAL_RECOVERY_SKIP_REASON))
+        preserved = appendReason(preserved, PARTIAL_RECOVERY_SKIP_REASON);
+      if (persistedReason.contains(RESOURCE_LIMIT_SKIP_REASON))
+        preserved = appendReason(preserved, RESOURCE_LIMIT_SKIP_REASON);
+      if (persistedReason.contains(RESOURCE_UNAVAILABLE_SKIP_REASON))
+        preserved = appendReason(preserved, RESOURCE_UNAVAILABLE_SKIP_REASON);
     }
     return preserved;
   }
 
   static String finalOrderSkipReason(
-      String persistedReason, String evidenceReason, long skippedBeforeSend, long skippedAtFinal) {
-    String reason = null;
-    if (persistedReason != null) {
-      if (persistedReason.contains(PARTIAL_RECOVERY_SKIP_REASON))
-        reason = appendReason(reason, PARTIAL_RECOVERY_SKIP_REASON);
-      if (persistedReason.contains(RESOURCE_LIMIT_SKIP_REASON))
-        reason = appendReason(reason, RESOURCE_LIMIT_SKIP_REASON);
+      String persistedReason,
+      boolean qualifiedReasonBoundToAttempt,
+      OrderStatus status,
+      RejectionReason rejectionReason,
+      long executedLots,
+      long skippedBeforeSend,
+      long skippedAtFinal) {
+    String reason = preservedSkipReasons(persistedReason);
+    if (skippedAtFinal > skippedBeforeSend) {
+      String attemptReason =
+          qualifiedReasonBoundToAttempt ? qualifiedAttemptReason(persistedReason) : null;
+      reason =
+          appendReason(
+              reason,
+              attemptReason != null
+                  ? attemptReason
+                  : terminalSkipReason(status, rejectionReason, executedLots));
     }
-    if (reason == null) return evidenceReason;
-    return skippedAtFinal > skippedBeforeSend ? appendReason(reason, evidenceReason) : reason;
+    return reason == null ? UNSENT_FINAL_SKIP_REASON : reason;
+  }
+
+  private static String qualifiedAttemptReason(String persistedReason) {
+    String reason = persistedReason;
+    reason = removeSkipReason(reason, PARTIAL_RECOVERY_SKIP_REASON);
+    reason = removeSkipReason(reason, RESOURCE_LIMIT_SKIP_REASON);
+    reason = removeSkipReason(reason, RESOURCE_UNAVAILABLE_SKIP_REASON);
+    return reason == null || reason.isBlank() ? RESOURCE_UNAVAILABLE_SKIP_REASON : reason;
+  }
+
+  private static String removeSkipReason(String currentReason, String skipReason) {
+    if (currentReason == null) return null;
+    String result = currentReason.replace("; " + skipReason, "");
+    result = result.replace(skipReason + "; ", "");
+    return result.equals(skipReason) || result.isBlank() ? null : result;
+  }
+
+  private static String terminalSkipReason(
+      OrderStatus status, RejectionReason rejectionReason, long executedLots) {
+    if (status == OrderStatus.CANCELLED)
+      return executedLots > 0
+          ? CONFIRMED_PARTIAL_CANCEL_UNKNOWN_REASON
+          : CONFIRMED_CANCEL_UNKNOWN_REASON;
+    if (status == OrderStatus.REJECTED) {
+      if (rejectionReason == RejectionReason.HALTED) return CONFIRMED_HALT_REJECTION_REASON;
+      return executedLots > 0
+          ? CONFIRMED_PARTIAL_REJECTION_UNKNOWN_REASON
+          : CONFIRMED_REJECTION_UNKNOWN_REASON;
+    }
+    return UNQUALIFIED_FINAL_SKIP_REASON;
   }
 
   private static String appendReason(String currentReason, String nextReason) {

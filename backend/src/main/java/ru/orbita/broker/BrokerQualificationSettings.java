@@ -5,6 +5,7 @@ import java.time.Instant;
 import java.util.Locale;
 import java.util.Set;
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.context.properties.bind.ConstructorBinding;
 import ru.orbita.control.OrbitaProperties;
 
 /**
@@ -25,7 +26,9 @@ public record BrokerQualificationSettings(
     String reserveCurrency,
     Instant validUntil,
     boolean actualCommissionTotalConfirmed,
-    BrokerQualifications.OwnMoneyBasis ownMoneyBasis) {
+    BrokerQualifications.OwnMoneyBasis ownMoneyBasis,
+    boolean totalBuyCostNondecreasingConfirmed) {
+  @ConstructorBinding
   public BrokerQualificationSettings {
     capitalAccountIds = capitalAccountIds == null ? Set.of() : Set.copyOf(capitalAccountIds);
     instrumentIds = instrumentIds == null ? Set.of() : Set.copyOf(instrumentIds);
@@ -35,6 +38,40 @@ public record BrokerQualificationSettings(
             : reserveCurrency.toUpperCase(Locale.ROOT);
     ownMoneyBasis =
         ownMoneyBasis == null ? BrokerQualifications.OwnMoneyBasis.UNQUALIFIED : ownMoneyBasis;
+  }
+
+  /** Preserves callers using the qualification settings constructor from before tariff attestation. */
+  public BrokerQualificationSettings(
+      boolean enabled,
+      boolean capitalCompositionConfirmed,
+      boolean ownResourceInterpretationConfirmed,
+      boolean commissionInterpretationConfirmed,
+      boolean marginDisabledConfirmed,
+      BigDecimal additionalCommissionReserve,
+      String evidenceReference,
+      Set<String> capitalAccountIds,
+      String mirrorAccountId,
+      Set<String> instrumentIds,
+      String reserveCurrency,
+      Instant validUntil,
+      boolean actualCommissionTotalConfirmed,
+      BrokerQualifications.OwnMoneyBasis ownMoneyBasis) {
+    this(
+        enabled,
+        capitalCompositionConfirmed,
+        ownResourceInterpretationConfirmed,
+        commissionInterpretationConfirmed,
+        marginDisabledConfirmed,
+        additionalCommissionReserve,
+        evidenceReference,
+        capitalAccountIds,
+        mirrorAccountId,
+        instrumentIds,
+        reserveCurrency,
+        validUntil,
+        actualCommissionTotalConfirmed,
+        ownMoneyBasis,
+        false);
   }
 
   BrokerQualifications qualifiedProfile(OrbitaProperties accounts) {
@@ -56,7 +93,8 @@ public record BrokerQualificationSettings(
         ownResourceInterpretationConfirmed
             || commissionInterpretationConfirmed
             || marginDisabledConfirmed;
-    boolean instrumentScope = resources || actualCommissionTotalConfirmed;
+    boolean instrumentScope =
+        resources || actualCommissionTotalConfirmed || totalBuyCostNondecreasingConfirmed;
     if (instrumentScope) require(!instrumentIds.isEmpty(), "Qualified instrument scope required");
     require(
         instrumentIds.stream().allMatch(id -> text(id, 256)),
@@ -93,7 +131,8 @@ public record BrokerQualificationSettings(
         reserveCurrency,
         validUntil,
         actualCommissionTotalConfirmed,
-        ownMoneyBasis);
+        ownMoneyBasis,
+        totalBuyCostNondecreasingConfirmed);
   }
 
   private static boolean text(String value, int maximum) {

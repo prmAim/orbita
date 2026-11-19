@@ -375,6 +375,12 @@ public interface BrokerGateway extends AutoCloseable {
         List.of(), List.of("Mirror history unavailable"), fromInclusive, throughInclusive);
   }
 
+  /** Explicit, scoped evidence for nondecreasing total BUY cost; adapters default to unknown. */
+  default boolean buyTotalCostNondecreasing(
+      String accountId, String instrumentId, String currency) {
+    return false;
+  }
+
   default java.util.Optional<BigDecimal> bestOppositePrice(String instrumentId, Side side) {
     return java.util.Optional.empty();
   }

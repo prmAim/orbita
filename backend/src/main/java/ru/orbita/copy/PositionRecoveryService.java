@@ -285,10 +285,16 @@ public class PositionRecoveryService {
           if (i.executionId.equals(buy.id) && "WAITING".equals(i.status)) {
             long remaining = Math.max(0, retainedQuantity - i.executedLots);
             if (remaining == 0)
-              finalSkip(i, "Подтверждённое закрытие или проданная доля исходной покупки", true);
+              finalSkip(
+                  i,
+                  TradeNotificationText.preserveSkipReasons(
+                      i.reason, "Подтверждённое закрытие или проданная доля исходной покупки"),
+                  true);
             else if (i.lots - remaining > i.skippedLots) {
               i.skippedLots = i.lots - remaining;
-              i.reason = TradeNotificationText.PARTIAL_RECOVERY_SKIP_REASON;
+              i.reason =
+                  TradeNotificationText.preserveSkipReasons(
+                      i.reason, TradeNotificationText.PARTIAL_RECOVERY_SKIP_REASON);
             }
           }
       }

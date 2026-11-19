@@ -72,6 +72,7 @@ class CopyLifecycleIT {
     clock.evidenceAvailable = true;
     clock.nextEvidence = null;
     broker.posts = 0;
+    broker.resourcesCalls = 0;
     broker.capitalCalls = 0;
     broker.capitalHook = null;
     broker.capitalResponse = null;
@@ -102,9 +103,15 @@ class CopyLifecycleIT {
     broker.orders.clear();
     broker.currencyCash = false;
     broker.zeroFees = false;
+    broker.buyCommissionPerLot = null;
+    broker.minimumBuyCommissionFloor = null;
+    broker.buyTotalCosts.clear();
+    broker.monotonicBuyPricing = true;
     broker.finalCommissionAvailable = true;
     broker.instrumentLotSize = 1;
     broker.instrumentHook = null;
+    broker.instrumentIdHook = null;
+    broker.sentRequests.clear();
     broker.individualLotFills = false;
     broker.sourceCash = new BigDecimal("100");
     broker.mirrorCash = new BigDecimal("100");
@@ -711,6 +718,61 @@ class CopyLifecycleIT {
   }
 
   @Test
+  void fullCloseRecoveryPreservesPriorResourceSkipInItsNotice() {
+    runningAtFive();
+    clock.now = clock.now.plusSeconds(1);
+    copies.accept(source("recovery-full-close-buy", Side.BUY, 2, clock.instant()));
+    assertThat(
+            db.update(
+                "update copy_intent set skipped_lots=2,reason=? where source_order_id=?",
+                TradeNotificationText.RESOURCE_LIMIT_SKIP_REASON,
+                "order-recovery-full-close-buy"))
+        .isEqualTo(1);
+    clock.now = clock.now.plusSeconds(1);
+    copies.accept(source("recovery-full-close-sale", Side.SELL, 2, clock.instant()));
+
+    reconciliation.reconcile();
+    recovery.recover();
+
+    assertThat(copies.intents())
+        .filteredOn(intent -> intent.sourceOrderId().equals("order-recovery-full-close-buy"))
+        .singleElement()
+        .satisfies(
+            intent -> {
+              assertThat(intent.status()).isEqualTo("FINAL");
+              assertThat(intent.executedLots()).isZero();
+              assertThat(intent.lots()).isEqualTo(10);
+              assertThat(intent.skippedLots()).isEqualTo(10);
+              assertThat(intent.reason())
+                  .contains(
+                      TradeNotificationText.RESOURCE_LIMIT_SKIP_REASON,
+                      "Подтверждённое закрытие или проданная доля исходной покупки");
+            });
+    assertThat(notifications.list(100))
+        .filteredOn(event -> event.category().equals("COPY_SKIPPED"))
+        .singleElement()
+        .satisfies(
+            notice ->
+                assertThat(notice.text())
+                    .contains(
+                        "исполнено 0/10",
+                        "пропущено 10 лотов",
+                        TradeNotificationText.RESOURCE_LIMIT_SKIP_REASON,
+                        "Подтверждённое закрытие или проданная доля исходной покупки"));
+  }
+
+  @Test
+  void preserveSkipReasonsDeduplicatesMixedKnownReasonsInEitherOrder() {
+    String partial = TradeNotificationText.PARTIAL_RECOVERY_SKIP_REASON;
+    String resource = TradeNotificationText.RESOURCE_LIMIT_SKIP_REASON;
+
+    assertThat(TradeNotificationText.preserveSkipReasons(partial, resource + "; " + partial))
+        .isEqualTo(partial + "; " + resource);
+    assertThat(TradeNotificationText.preserveSkipReasons(resource, partial + "; " + resource))
+        .isEqualTo(resource + "; " + partial);
+  }
+
+  @Test
   void recoveryDoesNotNotifyForBuyVolumeFoldedIntoOneCorrectiveSale() {
     runningAtFive();
     clock.now = clock.now.plusSeconds(1);
@@ -777,6 +839,14 @@ class CopyLifecycleIT {
       broker.instrumentHook = null;
     }
 
+    // Seed the persisted pre-send resource skip that recovery must retain while changing its size.
+    assertThat(
+            db.update(
+                "update copy_intent set skipped_lots=5,reason=? where source_order_id=?",
+                TradeNotificationText.RESOURCE_LIMIT_SKIP_REASON,
+                "order-recovery-partial-buy"))
+        .isEqualTo(1);
+
     clock.now = clock.now.plusSeconds(1);
     copies.accept(source("recovery-partial-sale", Side.SELL, 5, clock.instant()));
     broker.instrumentHook =
@@ -802,6 +872,10 @@ class CopyLifecycleIT {
               assertThat(intent.status()).isEqualTo("WAITING");
               assertThat(intent.lots()).isEqualTo(50);
               assertThat(intent.skippedLots()).isEqualTo(25);
+              assertThat(intent.reason())
+                  .contains(
+                      TradeNotificationText.RESOURCE_LIMIT_SKIP_REASON,
+                      TradeNotificationText.PARTIAL_RECOVERY_SKIP_REASON);
             });
 
     broker.fillEveryPost = false;
@@ -814,7 +888,7 @@ class CopyLifecycleIT {
         .singleElement()
         .satisfies(intent -> assertThat(intent.status()).isEqualTo("UNKNOWN"));
     broker.orders.put(
-        broker.sent.requestId(), broker.evidence(broker.sent, OrderStatus.FILLED, 25));
+        broker.sent.requestId(), broker.evidence(broker.sent, OrderStatus.CANCELLED, 10));
     trading.reconcileOnly();
     assertThat(copies.intents())
         .filteredOn(intent -> intent.sourceOrderId().equals("order-recovery-partial-buy"))
@@ -822,7 +896,7 @@ class CopyLifecycleIT {
         .satisfies(
             intent -> {
               assertThat(intent.status()).isEqualTo("FINAL");
-              assertThat(intent.executedLots()).isEqualTo(25);
+              assertThat(intent.executedLots()).isEqualTo(10);
             });
     var notices =
         notifications.list(100).stream()
@@ -841,9 +915,14 @@ class CopyLifecycleIT {
                   .contains(
                       "instrument",
                       "Покупка",
-                      "исполнено 25/50",
-                      "пропущено 25 лотов",
-                      "Проданная доля исходной покупки");
+                      "исполнено 10/50",
+                      "пропущено 40 лотов",
+                      TradeNotificationText.RESOURCE_LIMIT_SKIP_REASON,
+                      TradeNotificationText.PARTIAL_RECOVERY_SKIP_REASON,
+                      TradeNotificationText.CONFIRMED_PARTIAL_CANCEL_UNKNOWN_REASON);
+              assertThat(notice.text())
+                  .doesNotContain(
+                      "PostOrder response", "GetOrderState by original UUID", "stages in lots");
             });
   }
 
@@ -1032,12 +1111,65 @@ class CopyLifecycleIT {
         .satisfies(p -> assertThat(p.copiedLots()).isEqualTo(50));
   }
 
+  @org.junit.jupiter.params.ParameterizedTest
+  @org.junit.jupiter.params.provider.CsvSource({"105.99, 0", "106, 1"})
+  void reducedBuyRespectsMinimumCommissionAndAdditionalReserve(
+      String availableMoney, int expectedPosts) {
+    runningAtFive();
+    broker.availableMoney = new BigDecimal(availableMoney);
+    broker.buyMaxLots = 1;
+    broker.additionalCommissionReserve = BigDecimal.ONE;
+    broker.instrumentLotSize = 1;
+    broker.buyCommissionPerLot = new BigDecimal("0.10");
+    broker.minimumBuyCommissionFloor = new BigDecimal("5");
+    broker.fillEveryPost = false;
+    clock.now = clock.now.plusSeconds(1);
+    var execution =
+        new SourceExecution(
+            "source",
+            "reduced-buy-minimum-fee",
+            "reduced-buy-minimum-fee-order",
+            "instrument",
+            Side.BUY,
+            new BigDecimal("200"),
+            new BigDecimal("99.503"),
+            "RUB",
+            clock.instant(),
+            clock.instant());
+    broker.historyExecutions.add(execution);
+
+    assertThat(copies.accept(execution).newLots()).isEqualTo(1000);
+    trading.dispatchReady();
+
+    assertThat(broker.posts).isEqualTo(expectedPosts);
+    if (expectedPosts == 1) {
+      assertThat(broker.sent.lots()).isEqualTo(1);
+      assertThat(broker.sent.limitPrice()).isEqualByComparingTo("100");
+      assertThat(copies.intents())
+          .singleElement()
+          .satisfies(intent -> assertThat(intent.reservedMoney()).isEqualByComparingTo("106"));
+    } else {
+      assertThat(copies.intents())
+          .singleElement()
+          .satisfies(
+              intent -> {
+                assertThat(intent.status()).isEqualTo("FINAL");
+                assertThat(intent.skippedLots()).isEqualTo(1000);
+                assertThat(intent.reservedMoney()).isEqualByComparingTo("0");
+              });
+      assertThat(copies.journal(0, 200))
+          .filteredOn(entry -> entry.category().equals("SEND_STARTED"))
+          .isEmpty();
+    }
+  }
+
   @Test
   void buyCommissionIsScaledToAffordableLotsBeforeTheOrderIsSent() {
     runningAtFive();
     broker.availableMoney = new BigDecimal("150");
     broker.buyMaxLots = 1;
     broker.preliminaryCommission = new BigDecimal("100");
+    broker.buyCommissionPerLot = new BigDecimal("0.10");
     broker.additionalCommissionReserve = BigDecimal.ZERO;
     broker.fillEveryPost = false;
     clock.now = clock.now.plusSeconds(1);
@@ -1064,14 +1196,125 @@ class CopyLifecycleIT {
     assertThat(copies.intents())
         .singleElement()
         .satisfies(intent -> assertThat(intent.reservedMoney()).isEqualByComparingTo("100.10"));
-    assertThat(copies.journal(0, 200))
-        .filteredOn(entry -> entry.category().equals("SEND_STARTED"))
-        .singleElement()
-        .satisfies(entry -> assertThat(entry.detail()).contains("lots=1 reserve=100.100000000"));
   }
 
   @Test
-  void readyIntentAfterTheFirstHundredWaitingForDataIsConsideredInOrderWithoutDoubleReservation() {
+  void buyCostUsesTenUnderlyingUnitsPerLotAndRetainsCommissionAndAdditionalReserve() {
+    runningAtFive();
+    broker.availableMoney = new BigDecimal("1010");
+    broker.buyMaxLots = 10;
+    broker.preliminaryCommission = new BigDecimal("100");
+    broker.buyCommissionPerLot = new BigDecimal("0.10");
+    broker.additionalCommissionReserve = new BigDecimal("5");
+    broker.instrumentLotSize = 10;
+    broker.fillEveryPost = false;
+    clock.now = clock.now.plusSeconds(1);
+    var execution =
+        new SourceExecution(
+            "source",
+            "buy-ten-units-per-lot",
+            "buy-ten-units-per-lot-order",
+            "instrument",
+            Side.BUY,
+            new BigDecimal("200"),
+            new BigDecimal("99.503"),
+            "RUB",
+            clock.instant(),
+            clock.instant());
+    broker.historyExecutions.add(execution);
+
+    assertThat(copies.accept(execution).newLots()).isEqualTo(1000);
+    trading.dispatchReady();
+
+    assertThat(broker.posts).isEqualTo(1);
+    assertThat(broker.sent.lots()).isEqualTo(1);
+    assertThat(broker.sent.limitPrice()).isEqualByComparingTo("100");
+    assertThat(copies.intents())
+        .singleElement()
+        .satisfies(intent -> assertThat(intent.reservedMoney()).isEqualByComparingTo("1005.10"));
+  }
+
+  @Test
+  void largeMinimumFeeFindsTheInteriorMaximumWithBoundedResourceProbes() {
+    runningAtFive();
+    broker.availableMoney = new BigDecimal("1000");
+    broker.buyMaxLots = 10000;
+    broker.preliminaryCommission = BigDecimal.ZERO;
+    broker.buyCommissionPerLot = BigDecimal.ZERO;
+    broker.minimumBuyCommissionFloor = new BigDecimal("900");
+    broker.additionalCommissionReserve = BigDecimal.ONE;
+    broker.instrumentLotSize = 1;
+    broker.fillEveryPost = false;
+    clock.now = clock.now.plusSeconds(1);
+    var execution =
+        new SourceExecution(
+            "source",
+            "large-minimum-fee",
+            "large-minimum-fee-order",
+            "instrument",
+            Side.BUY,
+            new BigDecimal("2000"),
+            new BigDecimal("0.996"),
+            "RUB",
+            clock.instant(),
+            clock.instant());
+    broker.historyExecutions.add(execution);
+
+    assertThat(copies.accept(execution).newLots()).isEqualTo(10000);
+    trading.dispatchReady();
+
+    assertThat(broker.posts).isEqualTo(1);
+    assertThat(broker.sent.lots()).isEqualTo(99);
+    assertThat(broker.sent.limitPrice()).isEqualByComparingTo("1");
+    assertThat(copies.intents())
+        .singleElement()
+        .satisfies(intent -> assertThat(intent.reservedMoney()).isEqualByComparingTo("1000"));
+    assertThat(broker.resourcesCalls).isLessThanOrEqualTo(16);
+  }
+
+  @Test
+  void unconfirmedNonmonotoneBuyCostDescendsToAffordableThirdLot() {
+    runningAtFive();
+    broker.availableMoney = new BigDecimal("4");
+    broker.buyMaxLots = 4;
+    broker.preliminaryCommission = BigDecimal.ZERO;
+    broker.additionalCommissionReserve = BigDecimal.ZERO;
+    broker.instrumentLotSize = 1;
+    broker.buyTotalCosts.put(1L, new BigDecimal("5.1"));
+    broker.buyTotalCosts.put(2L, new BigDecimal("5.2"));
+    broker.buyTotalCosts.put(3L, new BigDecimal("3"));
+    broker.buyTotalCosts.put(4L, new BigDecimal("9"));
+    broker.monotonicBuyPricing = false;
+    broker.fillEveryPost = false;
+    clock.now = clock.now.plusSeconds(1);
+    var execution =
+        new SourceExecution(
+            "source",
+            "nonmonotone-buy-cost",
+            "nonmonotone-buy-cost-order",
+            "instrument",
+            Side.BUY,
+            BigDecimal.ONE,
+            new BigDecimal("0.996"),
+            "RUB",
+            clock.instant(),
+            clock.instant());
+    broker.historyExecutions.add(execution);
+
+    assertThat(copies.accept(execution).newLots()).isEqualTo(5);
+    trading.dispatchReady();
+
+    assertThat(broker.posts).isEqualTo(1);
+    assertThat(broker.sent.lots()).isEqualTo(3);
+    assertThat(broker.sent.limitPrice()).isEqualByComparingTo("1");
+    assertThat(copies.intents())
+        .singleElement()
+        .satisfies(intent -> assertThat(intent.reservedMoney()).isEqualByComparingTo("3"));
+  }
+
+  @org.junit.jupiter.api.Timeout(value = 20, unit = java.util.concurrent.TimeUnit.SECONDS)
+  @Test
+  void readyIntentIsNotStarvedByHundredDelayedMetadataMisses() {
     runningAtFive();
     broker.availableMoney = new BigDecimal("150");
     broker.buyMaxLots = 1;
@@ -1080,10 +1323,71 @@ class CopyLifecycleIT {
     broker.fillEveryPost = false;
     clock.now = clock.now.plusSeconds(1);
     var instrumentReads = new java.util.concurrent.atomic.AtomicInteger();
-    broker.instrumentHook =
-        () -> {
-          if (instrumentReads.incrementAndGet() <= 100)
-            throw new IllegalStateException("synthetic instrument metadata unavailable");
+    broker.instrumentIdHook =
+        id -> {
+          if (!id.startsWith("waiting-instrument-")) return;
+          instrumentReads.incrementAndGet();
+          try {
+            Thread.sleep(700);
+          } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(interrupted);
+          }
+          throw new IllegalStateException("synthetic instrument metadata unavailable");
+        };
+    for (int index = 1; index <= 100; index++)
+      copies.accept(
+          source("waiting-" + index, "waiting-instrument-" + index, Side.BUY, 1, clock.instant()));
+    copies.accept(source("ready-101", "ready-101", Side.BUY, 1, clock.instant()));
+    copies.accept(source("ready-102", "ready-102", Side.BUY, 1, clock.instant()));
+
+    long startedNanos = System.nanoTime();
+    try {
+      trading.dispatchReady();
+    } finally {
+      broker.instrumentIdHook = null;
+    }
+    assertThat(System.nanoTime() - startedNanos)
+        .isLessThan(java.util.concurrent.TimeUnit.SECONDS.toNanos(15));
+    assertThat(instrumentReads.get()).isEqualTo(100);
+    assertThat(copies.intents())
+        .filteredOn(intent -> intent.instrumentId().startsWith("waiting-instrument-"))
+        .hasSize(100)
+        .allSatisfy(intent -> assertThat(intent.status()).isEqualTo("WAITING"));
+    assertThat(broker.posts).isEqualTo(1);
+    assertThat(broker.sentRequests)
+        .extracting(OrderRequest::instrumentId)
+        .containsExactly("ready-101");
+    assertThat(copies.intents())
+        .filteredOn(intent -> intent.instrumentId().equals("ready-101"))
+        .singleElement()
+        .satisfies(intent -> assertThat(intent.reservedMoney().signum()).isPositive());
+    assertThat(copies.intents())
+        .filteredOn(intent -> intent.instrumentId().equals("ready-102"))
+        .singleElement()
+        .satisfies(
+            intent -> {
+              assertThat(intent.status()).isEqualTo("FINAL");
+              assertThat(intent.reservedMoney()).isEqualByComparingTo(BigDecimal.ZERO);
+            });
+  }
+
+  @Test
+  void readyIntentAfterTheFirstHundredWaitingForDataIsConsideredInOrderWithoutDoubleReservation() {
+    runningAtFive();
+    broker.availableMoney = new BigDecimal("150");
+    broker.buyMaxLots = 1;
+    broker.preliminaryCommission = new BigDecimal("0.5");
+    broker.buyCommissionPerLot = new BigDecimal("0.10");
+    broker.additionalCommissionReserve = BigDecimal.ZERO;
+    broker.fillEveryPost = false;
+    clock.now = clock.now.plusSeconds(1);
+    var instrumentReads = new java.util.concurrent.atomic.AtomicInteger();
+    broker.instrumentIdHook =
+        id -> {
+          if (!id.startsWith("waiting-instrument-")) return;
+          instrumentReads.incrementAndGet();
+          throw new IllegalStateException("synthetic instrument metadata unavailable");
         };
     for (int index = 1; index <= 100; index++)
       copies.accept(
@@ -1094,10 +1398,10 @@ class CopyLifecycleIT {
     try {
       trading.dispatchReady();
     } finally {
-      broker.instrumentHook = null;
+      broker.instrumentIdHook = null;
     }
 
-    assertThat(instrumentReads.get()).isGreaterThan(100);
+    assertThat(instrumentReads.get()).isEqualTo(100);
     assertThat(copies.intents())
         .filteredOn(intent -> intent.instrumentId().startsWith("waiting-instrument-"))
         .hasSize(100)
@@ -1108,7 +1412,12 @@ class CopyLifecycleIT {
     assertThat(copies.intents())
         .filteredOn(intent -> intent.sourceOrderId().equals("order-ready-101"))
         .singleElement()
-        .satisfies(intent -> assertThat(intent.reservedMoney()).isEqualByComparingTo("100.60"));
+        .satisfies(
+            intent -> {
+              assertThat(intent.limitPrice()).isEqualByComparingTo("100.50");
+              assertThat(intent.reservedMoney())
+                  .isEqualByComparingTo(new BigDecimal("100.50").add(broker.buyCommissionPerLot));
+            });
     assertThat(copies.intents())
         .filteredOn(intent -> intent.sourceOrderId().equals("order-ready-102"))
         .singleElement()
@@ -1117,6 +1426,51 @@ class CopyLifecycleIT {
               assertThat(intent.status()).isEqualTo("FINAL");
               assertThat(intent.skippedLots()).isEqualTo(5);
             });
+  }
+
+  @org.junit.jupiter.api.Timeout(value = 15, unit = java.util.concurrent.TimeUnit.SECONDS)
+  @Test
+  void simultaneouslyReadyIntentsPostInSourceJournalOrder() throws Exception {
+    runningAtFive();
+    broker.availableMoney = new BigDecimal("1000");
+    broker.buyMaxLots = 1;
+    broker.fillEveryPost = true;
+    clock.now = clock.now.plusSeconds(1);
+    copies.accept(source("tie-first", "tie-first", Side.BUY, 1, clock.instant()));
+    copies.accept(source("tie-second", "tie-second", Side.BUY, 1, clock.instant()));
+
+    var arrivals = new java.util.concurrent.CountDownLatch(2);
+    var release = new java.util.concurrent.CountDownLatch(1);
+    var firstReads = java.util.concurrent.ConcurrentHashMap.<String>newKeySet();
+    broker.instrumentIdHook =
+        id -> {
+          if (!(id.equals("tie-first") || id.equals("tie-second")) || !firstReads.add(id)) return;
+          arrivals.countDown();
+          try {
+            if (!release.await(5, java.util.concurrent.TimeUnit.SECONDS))
+              throw new IllegalStateException("readiness barrier timed out");
+          } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(interrupted);
+          }
+        };
+    var dispatcher = java.util.concurrent.Executors.newSingleThreadExecutor();
+    try {
+      var dispatch = dispatcher.submit(trading::dispatchReady);
+      assertThat(arrivals.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+      release.countDown();
+      dispatch.get(10, java.util.concurrent.TimeUnit.SECONDS);
+    } finally {
+      release.countDown();
+      dispatcher.shutdownNow();
+      assertThat(dispatcher.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+      broker.instrumentIdHook = null;
+    }
+
+    assertThat(broker.sentRequests)
+        .extracting(OrderRequest::instrumentId)
+        .containsExactly("tie-first", "tie-second");
+    assertThat(copies.intents()).hasSize(2);
   }
 
   private void runningAtFive() {
@@ -1884,8 +2238,10 @@ class CopyLifecycleIT {
     boolean individualLotFills;
     final Clock clock;
     int posts;
+    int resourcesCalls;
     int capitalCalls;
     OrderRequest sent;
+    final List<OrderRequest> sentRequests = new ArrayList<>();
     Runnable capitalHook;
     java.util.function.Function<String, CapitalEvidence> capitalResponse;
     boolean failCapital;
@@ -1908,11 +2264,16 @@ class CopyLifecycleIT {
     final Map<UUID, OrderEvidence> orders = new HashMap<>();
     boolean currencyCash;
     boolean zeroFees;
+    BigDecimal buyCommissionPerLot;
+    BigDecimal minimumBuyCommissionFloor;
+    final Map<Long, BigDecimal> buyTotalCosts = new HashMap<>();
+    boolean monotonicBuyPricing = true;
     BigDecimal sourceCash = new BigDecimal("100"), mirrorCash = new BigDecimal("100");
     Runnable afterPostHook;
     Runnable afterReconcileHook;
     Runnable resourcesHook;
     Runnable instrumentHook;
+    java.util.function.Consumer<String> instrumentIdHook;
     boolean blockPurchases;
     String settlementCurrency = "RUB";
     int cancels;
@@ -1924,8 +2285,14 @@ class CopyLifecycleIT {
 
     public Instrument instrument(String id) {
       if (instrumentHook != null) instrumentHook.run();
+      if (instrumentIdHook != null) instrumentIdHook.accept(id);
       return new Instrument(
           id, instrumentLotSize, new BigDecimal("0.01"), settlementCurrency, true, true, true);
+    }
+
+    public boolean buyTotalCostNondecreasing(
+        String accountId, String instrumentId, String currency) {
+      return monotonicBuyPricing && buyTotalCosts.isEmpty();
     }
 
     public CapitalEvidence capital(String account) {
@@ -1947,6 +2314,7 @@ class CopyLifecycleIT {
     }
 
     public ResourceEvidence resources(OrderRequest r) {
+      resourcesCalls++;
       if (resourcesHook != null) resourcesHook.run();
       return new ResourceEvidence(
           "mirror",
@@ -1954,12 +2322,33 @@ class CopyLifecycleIT {
           availableMoney,
           buyMaxLots,
           100,
-          zeroFees ? BigDecimal.ZERO : preliminaryCommission,
+          quotedCommission(r),
           zeroFees ? BigDecimal.ZERO : additionalCommissionReserve,
           clock.instant(),
           clock.instant(),
           !(blockPurchases && r.side() == Side.BUY),
           "simulator");
+    }
+
+    private BigDecimal quotedCommission(OrderRequest request) {
+      if (zeroFees) return BigDecimal.ZERO;
+      BigDecimal total = buyTotalCosts.get(request.lots());
+      if (request.side() == Side.BUY && total != null)
+        return total
+            .subtract(
+                request
+                    .limitPrice()
+                    .multiply(BigDecimal.valueOf(instrumentLotSize))
+                    .multiply(BigDecimal.valueOf(request.lots())))
+            .subtract(additionalCommissionReserve);
+      if (request.side() == Side.BUY && buyCommissionPerLot != null)
+        return buyCommissionPerLot
+            .multiply(BigDecimal.valueOf(request.lots()))
+            .max(
+                minimumBuyCommissionFloor == null
+                    ? BigDecimal.ZERO
+                    : minimumBuyCommissionFloor);
+      return preliminaryCommission;
     }
 
     public History history(Instant a, Instant b) {
@@ -2026,6 +2415,7 @@ class CopyLifecycleIT {
     public OrderEvidence post(OrderRequest r) {
       posts++;
       sent = r;
+      sentRequests.add(r);
       if (rejectNext != null) {
         var reason = rejectNext;
         rejectNext = null;
@@ -2145,7 +2535,7 @@ class CopyLifecycleIT {
                           settlementCurrency,
                           clock.instant())),
           clock.instant(),
-          "simulator",
+          "PostOrder response: GetOrderState by original UUID; stages in lots",
           state == OrderStatus.REJECTED ? RejectionReason.OTHER : RejectionReason.NONE,
           received,
           ru.orbita.broker.BrokerReceiptClock.domain());

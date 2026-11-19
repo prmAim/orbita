@@ -18,7 +18,8 @@ public record BrokerQualifications(
     String reserveCurrency,
     Instant validUntil,
     boolean actualCommissionTotalConfirmed,
-    OwnMoneyBasis ownMoneyBasis) {
+    OwnMoneyBasis ownMoneyBasis,
+    boolean totalBuyCostNondecreasingConfirmed) {
   public enum OwnMoneyBasis {
     UNQUALIFIED,
     GROSS_BEFORE_PROGRAM_RESERVES,
@@ -28,6 +29,38 @@ public record BrokerQualifications(
   public BrokerQualifications {
     capitalAccountIds = Set.copyOf(capitalAccountIds);
     instrumentIds = Set.copyOf(instrumentIds);
+  }
+
+  /** Preserves callers using the qualification constructor from before tariff attestation. */
+  public BrokerQualifications(
+      boolean capitalCompositionConfirmed,
+      boolean ownResourceInterpretationConfirmed,
+      boolean commissionInterpretationConfirmed,
+      boolean marginDisabledConfirmed,
+      BigDecimal additionalCommissionReserve,
+      String evidenceReference,
+      Set<String> capitalAccountIds,
+      String mirrorAccountId,
+      Set<String> instrumentIds,
+      String reserveCurrency,
+      Instant validUntil,
+      boolean actualCommissionTotalConfirmed,
+      OwnMoneyBasis ownMoneyBasis) {
+    this(
+        capitalCompositionConfirmed,
+        ownResourceInterpretationConfirmed,
+        commissionInterpretationConfirmed,
+        marginDisabledConfirmed,
+        additionalCommissionReserve,
+        evidenceReference,
+        capitalAccountIds,
+        mirrorAccountId,
+        instrumentIds,
+        reserveCurrency,
+        validUntil,
+        actualCommissionTotalConfirmed,
+        ownMoneyBasis,
+        false);
   }
 
   public static BrokerQualifications unconfirmed() {
@@ -75,6 +108,15 @@ public record BrokerQualifications(
         && accountId.equals(mirrorAccountId)
         && instrumentIds.contains(instrumentId)
         && currency.equalsIgnoreCase(reserveCurrency);
+  }
+
+  public boolean buyTotalCostNondecreasingQualified(
+      String accountId, String instrumentId, String currency, Instant now) {
+    return totalBuyCostNondecreasingConfirmed
+        && accountId != null
+        && instrumentId != null
+        && currency != null
+        && scopeMatches(accountId, instrumentId, currency, now);
   }
 
   public java.util.List<String> resourceProblems(
