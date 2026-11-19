@@ -153,26 +153,80 @@ class NotificationDeliveryIT {
     assertThat(notifications.attempts(id)).hasSize(3);
   }
 
-  @Test
-  void overdueAutomaticAttemptRunsOnceAfterUnansweredManualAttempt() {
+  @org.junit.jupiter.params.ParameterizedTest
+  @org.junit.jupiter.params.provider.EnumSource(
+      value = TelegramTransport.Outcome.class,
+      names = {"FAILURE", "NO_RESPONSE"})
+  void overdueAutomaticAttemptRunsOnceForSelectedNotificationAfterFailedManualAttempt(
+      TelegramTransport.Outcome manualOutcome) {
     notifications.ignoreRestoredQueue();
-    clock.now = Instant.parse("2026-11-13T12:00:00Z");
+    Instant start = Instant.parse("2026-11-13T12:00:00Z");
+    clock.now = start;
     telegram.results.add(TelegramTransport.Result.failure("Недоступно", Duration.ZERO));
-    UUID id =
+    UUID a =
         transactions.execute(
-            status -> publisher.publish("ERROR", "GAZP", clock.instant(), "GAZP: ошибка чтения."));
+            status -> publisher.publish("ERROR", "SBER", clock.instant(), "A: ошибка чтения."));
+    clock.now = start.plusSeconds(1);
+    telegram.results.add(TelegramTransport.Result.failure("Недоступно", Duration.ZERO));
+    UUID b =
+        transactions.execute(
+            status -> publisher.publish("ERROR", "GAZP", clock.instant(), "B: ошибка чтения."));
     notifications.deliverDue();
+    notifications.deliverDue();
+    assertThat(notifications.attempts(a))
+        .extracting(NotificationService.Attempt::kind)
+        .containsExactly("AUTOMATIC");
+    assertThat(notifications.attempts(b))
+        .extracting(NotificationService.Attempt::kind)
+        .containsExactly("AUTOMATIC");
+
     clock.now = Instant.parse("2026-11-13T12:00:55Z");
     telegram.beforeSend = () -> clock.now = Instant.parse("2026-11-13T12:01:05Z");
-    telegram.results.add(TelegramTransport.Result.noResponse());
+    telegram.results.add(
+        manualOutcome == TelegramTransport.Outcome.FAILURE
+            ? TelegramTransport.Result.failure("Ручная ошибка", Duration.ZERO)
+            : TelegramTransport.Result.noResponse());
     telegram.results.add(TelegramTransport.Result.failure("Недоступно", Duration.ZERO));
-    notifications.retryNow(id);
-    assertThat(notifications.attempts(id))
+    notifications.retryNow(b);
+    assertThat(notifications.attempts(a))
+        .extracting(NotificationService.Attempt::kind)
+        .containsExactly("AUTOMATIC");
+    assertThat(notifications.attempts(b))
         .extracting(NotificationService.Attempt::kind)
         .containsExactly("AUTOMATIC", "MANUAL", "AUTOMATIC");
-    assertThat(notifications.get(id).automaticFailures()).isEqualTo(2);
-    assertThat(notifications.get(id).nextAttemptAt())
+    assertThat(notifications.get(b).automaticFailures()).isEqualTo(2);
+    assertThat(notifications.get(b).nextAttemptAt())
         .isEqualTo(Instant.parse("2026-11-13T12:03:05Z"));
+  }
+
+  @Test
+  void successfulManualRetryDoesNotRepeatTheSelectedNotificationOrDrainOlderDueEvents() {
+    notifications.ignoreRestoredQueue();
+    Instant start = Instant.parse("2026-11-13T13:00:00Z");
+    clock.now = start;
+    telegram.results.add(TelegramTransport.Result.failure("Недоступно", Duration.ZERO));
+    UUID a =
+        transactions.execute(
+            status -> publisher.publish("ERROR", "SBER", clock.instant(), "A: ошибка чтения."));
+    clock.now = start.plusSeconds(1);
+    telegram.results.add(TelegramTransport.Result.failure("Недоступно", Duration.ZERO));
+    UUID b =
+        transactions.execute(
+            status -> publisher.publish("ERROR", "GAZP", clock.instant(), "B: ошибка чтения."));
+    notifications.deliverDue();
+    notifications.deliverDue();
+
+    clock.now = Instant.parse("2026-11-13T13:01:05Z");
+    telegram.results.add(TelegramTransport.Result.success());
+    notifications.retryNow(b);
+
+    assertThat(notifications.attempts(b))
+        .extracting(NotificationService.Attempt::kind)
+        .containsExactly("AUTOMATIC", "MANUAL");
+    assertThat(notifications.get(b).status()).isEqualTo("DELIVERED");
+    assertThat(notifications.attempts(a))
+        .extracting(NotificationService.Attempt::kind)
+        .containsExactly("AUTOMATIC");
   }
 
   @Test

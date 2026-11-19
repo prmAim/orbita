@@ -2526,11 +2526,20 @@ class CopyLifecycleIT {
 
   static class TelegramSimulator implements TelegramTransport {
     final List<String> messages = new ArrayList<>();
+    final Deque<Result> results = new ArrayDeque<>();
+    String lastText;
 
     @Override
     public Result send(String text) {
+      lastText = text;
       messages.add(text);
-      return Result.success();
+      return results.isEmpty() ? Result.success() : results.remove();
+    }
+
+    void reset() {
+      messages.clear();
+      results.clear();
+      lastText = null;
     }
   }
 

@@ -5,6 +5,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import java.lang.reflect.*;
 import java.math.BigDecimal;
 import java.sql.*;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Locale;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicReference;
@@ -24,26 +26,98 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DelegatingDataSource;
 import ru.orbita.broker.BrokerGateway;
 import ru.orbita.control.ControlService;
+import ru.orbita.notifications.NotificationService;
+import ru.orbita.notifications.TelegramTransport;
 
 @SpringBootTest(
     properties = {
       "orbita.source-account=source",
       "orbita.mirror-account=mirror",
+      "orbita.telegram.enabled=false",
       "orbita.worker.enabled=false"
     })
 @Import({CopyLifecycleIT.Fixture.class, CapitalTimingIT.JdbcTiming.class})
 class CapitalTimingIT {
   @Autowired ControlService control;
+  @Autowired NotificationService notifications;
   @Autowired CopyService copies;
   @Autowired CopyLifecycleIT.Simulator broker;
   @Autowired CopyLifecycleIT.MutableClock clock;
   @Autowired JdbcTemplate database;
+  @Autowired CopyLifecycleIT.TelegramSimulator telegram;
   @Autowired CommitDelay delay;
 
   @BeforeEach
   void reset() {
     delay.reset();
     CopyLifecycleIT.reset(database, broker, clock);
+    telegram.reset();
+  }
+
+  @Test
+  void delayedRecalculationErrorKeepsItsTimeIdAndDeadlineAndRecoveryIsIndependent() {
+    control.markReconciled();
+    control.start();
+    clock.now = clock.now.plusSeconds(1);
+    Instant pauseStartedAt = clock.instant();
+    broker.failCapital = true;
+    control.mandatoryRecalculation();
+
+    var firstError =
+        notifications.list(200).stream()
+            .filter(event -> event.category().equals("RECALCULATION_ERROR"))
+            .findFirst()
+            .orElseThrow();
+    String originalText = firstError.text();
+    telegram.results.add(
+        TelegramTransport.Result.failure("Имитатор: задержка доставки", Duration.ofMinutes(2)));
+    notifications.deliverDue();
+    var pending = notifications.get(firstError.id());
+    Instant retryAt = pending.nextAttemptAt();
+    assertThat(pending.status()).isEqualTo("PENDING");
+    assertThat(retryAt).isEqualTo(pauseStartedAt.plus(Duration.ofMinutes(2)));
+
+    clock.now = pauseStartedAt.plusSeconds(61);
+    broker.failCapital = false;
+    control.mandatoryRecalculation();
+
+    assertThat(control.status().recalculationPaused()).isFalse();
+    var annotated = notifications.get(firstError.id());
+    assertThat(annotated.status()).isEqualTo("PENDING");
+    assertThat(annotated.nextAttemptAt()).isEqualTo(retryAt);
+    String originalPrefix =
+        originalText.substring(0, originalText.indexOf("\nИдентификатор уведомления:"));
+    assertThat(annotated.text())
+        .startsWith(originalPrefix)
+        .contains(
+            "Пересчёт восстановлен; начало " + NotificationService.formatTime(pauseStartedAt),
+            "окончание " + NotificationService.formatTime(clock.instant()),
+            firstError.id().toString());
+
+    var recovery =
+        notifications.list(200).stream()
+            .filter(event -> event.category().equals("RECALCULATION_RECOVERED"))
+            .findFirst()
+            .orElseThrow();
+    assertThat(recovery.id()).isNotEqualTo(firstError.id());
+    notifications.deliverDue();
+    assertThat(telegram.lastText).isEqualTo(recovery.text());
+    assertThat(notifications.get(firstError.id()).nextAttemptAt()).isEqualTo(retryAt);
+
+    clock.now = retryAt;
+    notifications.deliverDue();
+    assertThat(notifications.get(firstError.id()).status()).isEqualTo("DELIVERED");
+    assertThat(telegram.lastText).isEqualTo(notifications.get(firstError.id()).text());
+    assertThat(telegram.lastText)
+        .contains(
+            NotificationService.formatTime(pauseStartedAt),
+            "Пересчёт восстановлен; начало " + NotificationService.formatTime(pauseStartedAt),
+            "окончание " + NotificationService.formatTime(pauseStartedAt.plusSeconds(61)),
+            firstError.id().toString());
+    assertThat(notifications.attempts(firstError.id()))
+        .extracting(NotificationService.Attempt::payload)
+        .containsExactly(originalText, annotated.text());
+    assertThat(telegram.messages).containsExactly(originalText, recovery.text(), annotated.text());
   }
 
   @ParameterizedTest

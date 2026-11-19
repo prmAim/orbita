@@ -90,7 +90,8 @@ public class NotificationService implements NotificationPublisher {
     Claim claim = transactions.execute(status -> claim(id, "MANUAL"));
     if (claim != null) {
       deliver(claim);
-      deliverDue();
+      Claim overdue = transactions.execute(status -> claim(id, "AUTOMATIC"));
+      if (overdue != null) deliver(overdue);
     }
     return get(id);
   }
@@ -99,9 +100,55 @@ public class NotificationService implements NotificationPublisher {
     return MOSCOW.format(at);
   }
 
+  /** Adds a pause end to its first undelivered error message while keeping the outbox schedule. */
+  @Transactional
+  public boolean annotateFirstUndelivered(
+      String category, Instant pauseStartedAt, Instant pauseEndedAt, String ownerText) {
+    if (category == null || category.isBlank())
+      throw new IllegalArgumentException("Category required");
+    if (pauseStartedAt == null || pauseEndedAt == null || pauseEndedAt.isBefore(pauseStartedAt))
+      throw new IllegalArgumentException("Pause interval is invalid");
+    if (ownerText == null || ownerText.isBlank() || ownerText.length() > 1000)
+      throw new IllegalArgumentException("Annotation must contain 1 to 1000 characters");
+
+    var rows =
+        db.query(
+            EVENT
+                + "where n.category=? and n.occurred_at>=? and n.occurred_at<=? "
+                + "order by n.occurred_at,n.id limit 1 for update of n",
+            (rs, n) -> view(rs),
+            category,
+            Timestamp.from(pauseStartedAt),
+            Timestamp.from(pauseEndedAt));
+    if (rows.isEmpty()) return false;
+    var event = rows.getFirst();
+    if (event.resolvedAt() != null
+        || !(event.status().equals("PENDING") || event.status().equals("SENDING"))) return false;
+    if (event.text().contains(ownerText)) return true;
+    String marker = "\nИдентификатор уведомления:";
+    if (!event.text().contains(marker)) return false;
+    String updated = event.text().replace(marker, "\n" + ownerText + marker);
+    return db.update(
+            "update journal_entry set detail=? where id=(select journal_id from notification where id=?)",
+            updated,
+            event.id())
+        == 1;
+  }
+
   private Claim claim(UUID requested, String kind) {
     Instant now = clock.instant();
-    String scope = requested == null ? "n.status='PENDING' and n.next_attempt_at<=?" : "n.id=?";
+    String scope;
+    Object[] parameters;
+    if (requested == null) {
+      scope = "n.status='PENDING' and n.next_attempt_at<=?";
+      parameters = new Object[] {Timestamp.from(now)};
+    } else if (kind.equals("AUTOMATIC")) {
+      scope = "n.id=? and n.status='PENDING' and n.next_attempt_at<=?";
+      parameters = new Object[] {requested, Timestamp.from(now)};
+    } else {
+      scope = "n.id=?";
+      parameters = new Object[] {requested};
+    }
     var rows =
         db.query(
             EVENT
@@ -109,7 +156,7 @@ public class NotificationService implements NotificationPublisher {
                 + scope
                 + " order by n.occurred_at,n.id limit 1 for update of n skip locked",
             (rs, n) -> view(rs),
-            requested == null ? Timestamp.from(now) : requested);
+            parameters);
     if (rows.isEmpty()) return null;
     var event = rows.getFirst();
     if (!event.status().equals("PENDING")

@@ -411,11 +411,8 @@ public class ControlService {
           state.retryAt = null;
           state.lastError = null;
           Instant now = clock.instant();
-          if (state.recalculationPaused && state.failedAttempts > 0)
-            notifications.publish(
-                "RECALCULATION_RECOVERED",
-                null,
-                now,
+          if (state.recalculationPaused && state.failedAttempts > 0) {
+            String recoveryText =
                 "Пересчёт восстановлен; начало "
                     + NotificationService.formatTime(state.pauseStartedAt)
                     + ", окончание "
@@ -423,7 +420,11 @@ public class ControlService {
                     + ", длительность "
                     + Duration.between(state.pauseStartedAt, now)
                     + ", ошибок "
-                    + state.failedAttempts);
+                    + state.failedAttempts;
+            notificationService.annotateFirstUndelivered(
+                "RECALCULATION_ERROR", state.pauseStartedAt, now, recoveryText);
+            notifications.publish("RECALCULATION_RECOVERED", null, now, recoveryText);
+          }
           state.recalculationPaused = false;
           state.pauseStartedAt = null;
           state.failedAttempts = 0;
