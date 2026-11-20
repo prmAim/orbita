@@ -79,18 +79,25 @@ public class NotificationService implements NotificationPublisher {
 
   public void deliverDue() {
     if (!readiness.initialized()) return;
-    recoverInterrupted();
+    Claim recovered = recoverInterrupted(null);
+    if (recovered != null) {
+      deliver(recovered);
+      return;
+    }
     Claim claim = transactions.execute(status -> claim(null, "AUTOMATIC"));
     if (claim != null) deliver(claim);
   }
 
   public View retryNow(UUID id) {
     if (!readiness.initialized()) return get(id);
-    recoverInterrupted();
+    Claim recovered = recoverInterrupted(id);
+    if (recovered != null) {
+      deliver(recovered);
+      return get(id);
+    }
     Claim claim = transactions.execute(status -> claim(id, "MANUAL"));
     if (claim != null) {
-      deliver(claim);
-      Claim overdue = transactions.execute(status -> claim(id, "AUTOMATIC"));
+      Claim overdue = deliver(claim);
       if (overdue != null) deliver(overdue);
     }
     return get(id);
@@ -176,18 +183,18 @@ public class NotificationService implements NotificationPublisher {
     return new Claim(event.id(), attempt, kind, event.text());
   }
 
-  private void deliver(Claim claim) {
+  private Claim deliver(Claim claim) {
     TelegramTransport.Result result;
     try {
       result = transport.send(claim.text());
     } catch (RuntimeException exception) {
       result = TelegramTransport.Result.noResponse();
     }
-    complete(claim, result);
+    return complete(claim, result);
   }
 
-  private void complete(Claim claim, TelegramTransport.Result result) {
-    transactions.executeWithoutResult(
+  private Claim complete(Claim claim, TelegramTransport.Result result) {
+    return transactions.execute(
         status -> {
           var rows =
               db.query(
@@ -195,7 +202,7 @@ public class NotificationService implements NotificationPublisher {
                   (rs, n) -> view(rs),
                   claim.id(),
                   claim.attempt());
-          if (rows.isEmpty()) return;
+          if (rows.isEmpty()) return null;
           View event = rows.getFirst();
           Instant now = clock.instant();
           String currentText =
@@ -251,17 +258,26 @@ public class NotificationService implements NotificationPublisher {
               timestamp(blocked),
               result.detail(),
               claim.id());
+          return automatic ? null : claim(claim.id(), "AUTOMATIC");
         });
   }
 
   /** A process can die after Telegram received a message. Retain the ID and record uncertainty. */
-  public void recoverInterrupted() {
-    transactions.executeWithoutResult(
+  private Claim recoverInterrupted(UUID requested) {
+    return transactions.execute(
         status -> {
           Instant now = clock.instant();
-          var stale =
+          Timestamp cutoff = Timestamp.from(now.minusSeconds(10));
+          String requestedScope = requested == null ? "" : " and id=?";
+          Object[] selectedParameters =
+              requested == null
+                  ? new Object[] {Timestamp.from(now), cutoff}
+                  : new Object[] {Timestamp.from(now), cutoff, requested};
+          var overdueManual =
               db.query(
-                  "select id,claim_id,claim_kind,automatic_failures,next_attempt_at from notification where status='SENDING' and claim_started_at<=? for update skip locked",
+                  "select id,claim_id,claim_kind,automatic_failures,next_attempt_at from notification where status='SENDING' and claim_kind='MANUAL' and next_attempt_at<=? and claim_started_at<=?"
+                      + requestedScope
+                      + " order by occurred_at,id limit 1 for update",
                   (rs, n) ->
                       new Stale(
                           rs.getObject(1, UUID.class),
@@ -269,20 +285,48 @@ public class NotificationService implements NotificationPublisher {
                           rs.getString(3),
                           rs.getInt(4),
                           instant(rs, 5)),
-                  Timestamp.from(now.minusSeconds(10)));
-          for (var row : stale) {
-            Instant next =
-                row.kind().equals("MANUAL") ? row.next() : now.plus(interval(row.failures()));
-            db.update(
-                "update notification_attempt set completed_at=?,result='NO_RESPONSE',detail='результат не дождался ответа' where id=? and completed_at is null",
-                Timestamp.from(now),
-                row.attempt());
-            db.update(
-                "update notification set status='PENDING',next_attempt_at=?,claim_id=null,claim_started_at=null,claim_kind=null,last_result='результат не дождался ответа',version=version+1 where id=?",
-                timestamp(next),
-                row.id());
+                  selectedParameters);
+          if (!overdueManual.isEmpty()) {
+            Stale row = overdueManual.getFirst();
+            recover(row, now);
+            return claim(row.id(), "AUTOMATIC");
           }
+
+          Object[] staleParameters =
+              requested == null
+                  ? new Object[] {cutoff, Timestamp.from(now)}
+                  : new Object[] {cutoff, Timestamp.from(now), requested};
+          var stale =
+              db.query(
+                  "select id,claim_id,claim_kind,automatic_failures,next_attempt_at from notification where status='SENDING' and claim_started_at<=?"
+                      + " and (claim_kind is distinct from 'MANUAL' or next_attempt_at is null or next_attempt_at>?)"
+                      + requestedScope
+                      + " order by occurred_at,id for update skip locked",
+                  (rs, n) ->
+                      new Stale(
+                          rs.getObject(1, UUID.class),
+                          rs.getObject(2, UUID.class),
+                          rs.getString(3),
+                          rs.getInt(4),
+                          instant(rs, 5)),
+                  staleParameters);
+          for (var row : stale) {
+            recover(row, now);
+          }
+          return null;
         });
+  }
+
+  private void recover(Stale row, Instant now) {
+    Instant next = row.kind().equals("MANUAL") ? row.next() : now.plus(interval(row.failures()));
+    db.update(
+        "update notification_attempt set completed_at=?,result='NO_RESPONSE',detail='результат не дождался ответа' where id=? and completed_at is null",
+        Timestamp.from(now),
+        row.attempt());
+    db.update(
+        "update notification set status='PENDING',next_attempt_at=?,claim_id=null,claim_started_at=null,claim_kind=null,last_result='результат не дождался ответа',version=version+1 where id=?",
+        timestamp(next),
+        row.id());
   }
 
   /** Resolve exactly one block. Undelivered notification gets both facts under its original ID. */
