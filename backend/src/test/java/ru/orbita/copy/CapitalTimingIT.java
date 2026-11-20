@@ -25,6 +25,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.context.annotation.Role;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jdbc.datasource.DelegatingDataSource;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -33,6 +34,7 @@ import ru.orbita.broker.BrokerGateway;
 import ru.orbita.control.ControlService;
 import ru.orbita.notifications.NotificationService;
 import ru.orbita.notifications.TelegramTransport;
+import ru.orbita.runtime.ApplicationReadiness;
 
 @SpringBootTest(
     properties = {
@@ -52,6 +54,7 @@ class CapitalTimingIT {
   @Autowired CopyLifecycleIT.TelegramSimulator telegram;
   @Autowired TransactionTemplate transactions;
   @Autowired CommitDelay delay;
+  @Autowired ApplicationReadiness readiness;
 
   @BeforeEach
   void reset() {
@@ -436,6 +439,117 @@ class CapitalTimingIT {
                   Long.class))
           .isEqualTo(restartJournalId)
           .isGreaterThan(previousErrorJournalId);
+    }
+  }
+
+  @Test
+  void delayedErrorsFromCompletedV17PausesKeepTheirOwnRecoveryAndRetryDeadline() {
+    try (var postgres = new PostgreSQLContainer("postgres:17.11-alpine")) {
+      postgres.start();
+      Flyway.configure()
+          .dataSource(postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword())
+          .target("17")
+          .load()
+          .migrate();
+      var dataSource =
+          new DriverManagerDataSource(
+              postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword());
+      var legacyDatabase = new JdbcTemplate(dataSource);
+
+      UUID firstErrorId = UUID.randomUUID();
+      UUID firstRecoveryId = UUID.randomUUID();
+      Instant firstStartedAt = Instant.parse("2026-11-19T10:00:00Z");
+      Instant firstEndedAt = Instant.parse("2026-11-19T10:01:01Z");
+      String firstOwnerText =
+          "первая ошибка; обязательный пересчёт приостановлен\n"
+              + "19.11.2026 13:00:00 МСК\nИдентификатор уведомления: "
+              + firstErrorId;
+      String firstResolution =
+          "Пересчёт восстановлен; начало 19.11.2026 13:00:00 МСК, окончание "
+              + "19.11.2026 13:01:01 МСК, длительность PT1M1S, ошибок 1";
+      String firstRecoveryText =
+          firstResolution
+              + "\n19.11.2026 13:01:01 МСК\nИдентификатор уведомления: "
+              + firstRecoveryId;
+      insertLegacyNotification(
+          legacyDatabase, firstErrorId, "RECALCULATION_ERROR", firstStartedAt, firstOwnerText);
+      insertLegacyNotification(
+          legacyDatabase,
+          firstRecoveryId,
+          "RECALCULATION_RECOVERED",
+          firstEndedAt,
+          firstRecoveryText);
+
+      UUID secondErrorId = UUID.randomUUID();
+      UUID secondRecoveryId = UUID.randomUUID();
+      Instant secondStartedAt = Instant.parse("2026-11-19T09:00:00Z");
+      Instant secondEndedAt = Instant.parse("2026-11-19T09:00:30Z");
+      String secondOwnerText =
+          "вторая ошибка; обязательный пересчёт приостановлен\n"
+              + "19.11.2026 12:00:00 МСК\nИдентификатор уведомления: "
+              + secondErrorId;
+      String secondResolution =
+          "Пересчёт восстановлен; начало 19.11.2026 12:00:00 МСК, окончание "
+              + "19.11.2026 12:00:30 МСК, длительность PT30S, ошибок 1";
+      String secondRecoveryText =
+          secondResolution
+              + "\n19.11.2026 12:00:30 МСК\nИдентификатор уведомления: "
+              + secondRecoveryId;
+      insertLegacyNotification(
+          legacyDatabase, secondErrorId, "RECALCULATION_ERROR", secondStartedAt, secondOwnerText);
+      insertLegacyNotification(
+          legacyDatabase,
+          secondRecoveryId,
+          "RECALCULATION_RECOVERED",
+          secondEndedAt,
+          secondRecoveryText);
+
+      Instant firstRetryAt = Instant.parse("2026-11-20T11:00:00Z");
+      Instant secondRetryAt = Instant.parse("2026-11-20T12:00:00Z");
+      legacyDatabase.update(
+          "update notification set next_attempt_at=? where id in (?,?)",
+          Timestamp.from(firstRetryAt),
+          firstErrorId,
+          firstRecoveryId);
+      legacyDatabase.update(
+          "update notification set next_attempt_at=? where id in (?,?)",
+          Timestamp.from(secondRetryAt),
+          secondErrorId,
+          secondRecoveryId);
+      Flyway.configure()
+          .dataSource(postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword())
+          .load()
+          .migrate();
+
+      clock.now = Instant.parse("2026-11-20T10:00:00Z");
+      var localNotifications =
+          new NotificationService(
+              legacyDatabase,
+              new TransactionTemplate(new DataSourceTransactionManager(dataSource)),
+              telegram,
+              clock,
+              readiness);
+      localNotifications.deliverDue();
+
+      var first = localNotifications.get(firstErrorId);
+      var second = localNotifications.get(secondErrorId);
+      assertThat(first.text())
+          .startsWith(firstOwnerText.substring(0, firstOwnerText.indexOf("\nИдентификатор")))
+          .contains(firstResolution, firstErrorId.toString());
+      assertThat(first.resolvedAt()).isEqualTo(firstEndedAt);
+      assertThat(first.resolutionText()).isEqualTo(firstResolution);
+      assertThat(first.retryAnnotatedNotificationOnCompletion()).isTrue();
+      assertThat(first.nextAttemptAt()).isEqualTo(firstRetryAt);
+      assertThat(second.text())
+          .startsWith(secondOwnerText.substring(0, secondOwnerText.indexOf("\nИдентификатор")))
+          .contains(secondResolution, secondErrorId.toString());
+      assertThat(second.resolvedAt()).isEqualTo(secondEndedAt);
+      assertThat(second.resolutionText()).isEqualTo(secondResolution);
+      assertThat(second.retryAnnotatedNotificationOnCompletion()).isTrue();
+      assertThat(second.nextAttemptAt()).isEqualTo(secondRetryAt);
+      assertThat(localNotifications.get(firstRecoveryId).text()).isEqualTo(firstRecoveryText);
+      assertThat(localNotifications.get(secondRecoveryId).text()).isEqualTo(secondRecoveryText);
+      assertThat(telegram.messages).isEmpty();
     }
   }
 

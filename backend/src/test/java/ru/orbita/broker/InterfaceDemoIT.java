@@ -6,6 +6,7 @@ import java.math.BigDecimal;
 import java.net.*;
 import java.net.http.*;
 import java.nio.file.*;
+import java.sql.Timestamp;
 import java.time.*;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
@@ -109,6 +110,91 @@ class InterfaceDemoIT {
                   Boolean.class))
           .isTrue();
       ledger.cleanup();
+    }
+  }
+
+  @Test
+  void removeManifestCapturedOnV17AfterUpgradeToV19PreservesLaterControlColumns() {
+    try (var postgres = new PostgreSQLContainer("postgres:17.11-alpine")) {
+      postgres.start();
+      Flyway.configure()
+          .dataSource(postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword())
+          .target("17")
+          .load()
+          .migrate();
+      var database =
+          new DriverManagerDataSource(
+              postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword());
+      var db = new JdbcTemplate(database);
+      String ownerJournal = "Запись владельца, созданная до демонстрации";
+      Long ownerJournalId =
+          db.queryForObject(
+              "insert into journal_entry(occurred_at,category,instrument,detail) values(?,?,?,?) returning id",
+              Long.class,
+              Timestamp.from(Instant.parse("2026-11-19T10:00:00Z")),
+              "OWNER_NOTE",
+              "",
+              ownerJournal);
+      db.execute("create schema orbita_demo_preview");
+      db.execute(
+          "create table orbita_demo_preview.batch(singleton boolean primary key check(singleton),version integer not null check(version=2),created_at timestamptz not null default clock_timestamp(),retained boolean not null,captured boolean not null default false,restored_at timestamptz,control_before jsonb not null,connectivity_before jsonb not null)");
+      db.execute(
+          "create table orbita_demo_preview.baseline(relation text not null,row_id text not null,row_snapshot jsonb,primary key(relation,row_id))");
+      db.execute(
+          "create table orbita_demo_preview.owned(relation text not null,row_id text not null,row_snapshot jsonb,primary key(relation,row_id))");
+      db.execute("create table orbita_demo_preview.instrument(instrument_id text primary key)");
+      db.update(
+          "insert into orbita_demo_preview.batch(singleton,version,retained,captured,control_before,connectivity_before) select true,2,false,true,to_jsonb(c),to_jsonb(b) from control_state c cross join broker_connectivity b where c.id=1 and b.singleton");
+      String demoInstrument = "[ТЕСТ] legacy V17 preview";
+      db.update(
+          "insert into instrument_state(instrument_id,paused) values(?,true)", demoInstrument);
+      db.update(
+          "insert into orbita_demo_preview.instrument(instrument_id) values(?)", demoInstrument);
+      db.update(
+          "insert into orbita_demo_preview.owned(relation,row_id) values('instrument_state',?)",
+          demoInstrument);
+      assertThat(
+              db.queryForObject(
+                  "select version from flyway_schema_history where success order by installed_rank desc limit 1",
+                  String.class))
+          .isEqualTo("17");
+      Flyway.configure()
+          .dataSource(postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword())
+          .load()
+          .migrate();
+      UUID notificationId = UUID.randomUUID();
+      long journalBoundary = ownerJournalId + 17;
+      db.update(
+          "update control_state set recalculation_error_notification_id=?,recalculation_pause_journal_boundary=? where id=1",
+          notificationId,
+          journalBoundary);
+
+      InterfaceDemoLedger.cleanup(db);
+
+      assertThat(
+              db.queryForObject(
+                  "select recalculation_error_notification_id from control_state where id=1",
+                  UUID.class))
+          .isEqualTo(notificationId);
+      assertThat(
+              db.queryForObject(
+                  "select recalculation_pause_journal_boundary from control_state where id=1",
+                  Long.class))
+          .isEqualTo(journalBoundary);
+      assertThat(
+              db.queryForObject(
+                  "select detail from journal_entry where id=?", String.class, ownerJournalId))
+          .isEqualTo(ownerJournal);
+      assertThat(
+              db.queryForObject(
+                  "select count(*) from instrument_state where instrument_id=?",
+                  Integer.class,
+                  demoInstrument))
+          .isZero();
+      assertThat(
+              db.queryForObject(
+                  "select to_regnamespace('orbita_demo_preview') is null", Boolean.class))
+          .isTrue();
     }
   }
 
