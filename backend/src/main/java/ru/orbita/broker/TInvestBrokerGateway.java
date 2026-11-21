@@ -1,16 +1,20 @@
 package ru.orbita.broker;
 
 import java.math.BigDecimal;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
+import ru.orbita.persistence.PostgresTimestampPrecision;
 import ru.tinkoff.piapi.contract.v1.*;
 import ru.ttech.piapi.core.connector.ServiceStubFactory;
 import ru.ttech.piapi.core.connector.exception.ServiceRuntimeException;
@@ -597,11 +601,14 @@ public final class TInvestBrokerGateway implements BrokerGateway {
   private History readHistory(String accountId, Instant from, Instant through) {
     if (from == null || through == null || from.isAfter(through))
       throw new IllegalArgumentException("Ordered history interval required");
+    boolean sourceHistory = accountId.equals(sourceAccount);
     var result = new java.util.LinkedHashMap<String, SourceExecution>();
     var gaps = new ArrayList<String>();
     var metadata = new java.util.HashMap<String, Instrument>();
     var sourceCandidates = new LinkedHashMap<String, SourceHistoryCandidate>();
     var conflictedTrades = new HashSet<String>();
+    var operationFingerprints = new LinkedHashMap<String, String>();
+    var conflictedOperations = new HashSet<String>();
     Instant window = from;
     do {
       Instant end =
@@ -656,7 +663,18 @@ public final class TInvestBrokerGateway implements BrokerGateway {
             gaps.add("History executed operation has no individual trades: " + item.getId());
             continue;
           }
+          String operationFingerprint =
+              sourceHistory && !item.getId().isBlank() ? operationFingerprint(item) : "";
+          if (sourceHistory && !item.getId().isBlank()) {
+            var previousOperation =
+                operationFingerprints.putIfAbsent(item.getId(), operationFingerprint);
+            if (previousOperation != null && !previousOperation.equals(operationFingerprint)) {
+              conflictedOperations.add(item.getId());
+              gaps.add("Conflicting source operation identity: " + item.getId());
+            }
+          }
           for (var trade : item.getTradesInfo().getTradesList()) {
+            if (sourceHistory && conflictedOperations.contains(item.getId())) continue;
             try {
               if (conflictedTrades.contains(trade.getNum())) continue;
               if (trade.getNum().isBlank()
@@ -686,7 +704,9 @@ public final class TInvestBrokerGateway implements BrokerGateway {
               var previous = result.putIfAbsent(trade.getNum(), execution);
               if (previous == null) {
                 sourceCandidates.put(
-                    trade.getNum(), new SourceHistoryCandidate(item.getId(), execution));
+                    trade.getNum(),
+                    new SourceHistoryCandidate(
+                        item.getId(), execution, null, operationFingerprint));
               } else if (!previous.instrumentId().equals(execution.instrumentId())
                   || previous.side() != execution.side()
                   || previous.lots().compareTo(execution.lots()) != 0
@@ -698,9 +718,14 @@ public final class TInvestBrokerGateway implements BrokerGateway {
                 conflictedTrades.add(trade.getNum());
               } else {
                 var sourceCandidate = sourceCandidates.get(trade.getNum());
-                if (sourceCandidate != null
-                    && !sourceCandidate.operationId().equals(item.getId()))
+                if (sourceHistory
+                    && sourceCandidate != null
+                    && !sourceCandidate.operationId().equals(item.getId())) {
                   sourceCandidates.remove(trade.getNum());
+                  conflictedTrades.add(trade.getNum());
+                  result.remove(trade.getNum());
+                  gaps.add("Conflicting source operation identity for trade " + trade.getNum());
+                }
               }
             } catch (BrokerPersistenceFailure failure) {
               throw failure;
@@ -718,6 +743,15 @@ public final class TInvestBrokerGateway implements BrokerGateway {
       } while (true);
       window = end;
     } while (window.isBefore(through));
+    var conflictedOperationTrades =
+        sourceCandidates.entrySet().stream()
+            .filter(entry -> conflictedOperations.contains(entry.getValue().operationId()))
+            .map(Map.Entry::getKey)
+            .toList();
+    for (String tradeId : conflictedOperationTrades) {
+      sourceCandidates.remove(tradeId);
+      result.remove(tradeId);
+    }
     return new History(
         new ArrayList<>(result.values()),
         gaps,
@@ -736,11 +770,12 @@ public final class TInvestBrokerGateway implements BrokerGateway {
     for (var historyCandidate : candidates) {
       var candidate = historyCandidate.execution();
       String operationId = historyCandidate.operationId();
+      boolean alreadyAccepted = historyCandidate.acceptedExecution() != null;
       if (!sourceAccount.equals(candidate.accountId())
           || operationId == null
           || operationId.isBlank()
           || candidate.executedAt() == null
-          || candidate.executedAt().isBefore(earliest)
+          || (!alreadyAccepted && candidate.executedAt().isBefore(earliest))
           || candidate.executedAt().isAfter(now)) {
         gaps.add("Source history candidate is incomplete or outside the recent lookup window");
         continue;
@@ -752,6 +787,23 @@ public final class TInvestBrokerGateway implements BrokerGateway {
     for (var entry : groups.entrySet()) {
       String orderId = entry.getKey();
       var operationTrades = entry.getValue();
+      var fingerprints =
+          operationTrades.stream()
+              .map(SourceHistoryCandidate::operationFingerprint)
+              .filter(Objects::nonNull)
+              .filter(fingerprint -> !fingerprint.isBlank())
+              .distinct()
+              .toList();
+      boolean fingerprintMissing =
+          operationTrades.stream()
+              .anyMatch(
+                  candidate ->
+                      candidate.operationFingerprint() == null
+                          || candidate.operationFingerprint().isBlank());
+      if (fingerprints.size() > 1 || (fingerprintMissing && !fingerprints.isEmpty())) {
+        gaps.add("Conflicting source operation identity: " + orderId);
+        continue;
+      }
       var first = operationTrades.getFirst().execution();
       if (operationTrades.stream()
           .anyMatch(
@@ -777,7 +829,8 @@ public final class TInvestBrokerGateway implements BrokerGateway {
                         .newSyncService(OrdersServiceGrpc::newBlockingStub)
                         .callSyncMethod(
                             stub ->
-                                stub.withDeadlineAfter(5, TimeUnit.SECONDS).getOrderState(payload)));
+                                stub.withDeadlineAfter(5, TimeUnit.SECONDS)
+                                    .getOrderState(payload)));
         if (!state.getOrderId().equals(orderId)
             || !state.getInstrumentUid().equals(first.instrumentId())
             || state.getDirection() != direction(first.side())
@@ -805,8 +858,7 @@ public final class TInvestBrokerGateway implements BrokerGateway {
           BigDecimal lots = BigDecimal.valueOf(stage.getQuantity());
           var matches =
               unmatched.stream()
-                  .filter(
-                      candidate -> candidate.execution().lots().compareTo(lots) == 0)
+                  .filter(candidate -> candidate.execution().lots().compareTo(lots) == 0)
                   .filter(candidate -> candidate.execution().price().compareTo(price) == 0)
                   .filter(candidate -> candidate.execution().executedAt().equals(executedAt))
                   .filter(
@@ -821,20 +873,37 @@ public final class TInvestBrokerGateway implements BrokerGateway {
             break;
           }
           var operation = matches.getFirst().execution();
+          var accepted = matches.getFirst().acceptedExecution();
           unmatched.remove(matches.getFirst());
           stageLots = Math.addExact(stageLots, stage.getQuantity());
-          resolved.add(
-              new SourceExecution(
-                  sourceAccount,
-                  stage.getTradeId(),
-                  orderId,
-                  state.getInstrumentUid(),
-                  first.side(),
-                  lots,
-                  price,
-                  stage.getPrice().getCurrency(),
-                  executedAt,
-                  operation.receivedAt()));
+          if (accepted != null) {
+            if (!accepted.accountId().equals(sourceAccount)
+                || !accepted.tradeId().equals(stage.getTradeId())
+                || !accepted.sourceOrderId().equals(orderId)
+                || !accepted.instrumentId().equals(state.getInstrumentUid())
+                || accepted.side() != first.side()
+                || accepted.lots().compareTo(lots) != 0
+                || accepted.price().compareTo(price) != 0
+                || !accepted.currency().equalsIgnoreCase(stage.getPrice().getCurrency())
+                || !PostgresTimestampPrecision.normalize(accepted.executedAt())
+                    .equals(PostgresTimestampPrecision.normalize(executedAt))) {
+              unambiguous = false;
+              break;
+            }
+          } else {
+            resolved.add(
+                new SourceExecution(
+                    sourceAccount,
+                    stage.getTradeId(),
+                    orderId,
+                    state.getInstrumentUid(),
+                    first.side(),
+                    lots,
+                    price,
+                    stage.getPrice().getCurrency(),
+                    executedAt,
+                    operation.receivedAt()));
+          }
         }
         long operationLots =
             operationTrades.stream()
@@ -1117,6 +1186,15 @@ public final class TInvestBrokerGateway implements BrokerGateway {
         .setUnits(units)
         .setNano(scaled.subtract(BigDecimal.valueOf(units)).movePointRight(9).intValueExact())
         .build();
+  }
+
+  private static String operationFingerprint(OperationItem item) {
+    try {
+      return HexFormat.of()
+          .formatHex(MessageDigest.getInstance("SHA-256").digest(item.toByteArray()));
+    } catch (NoSuchAlgorithmException unavailable) {
+      throw new IllegalStateException("SHA-256 is required by the Java runtime", unavailable);
+    }
   }
 
   static Instant instant(com.google.protobuf.Timestamp timestamp) {

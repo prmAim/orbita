@@ -283,7 +283,20 @@ public interface BrokerGateway extends AutoCloseable {
     }
   }
 
-  record SourceHistoryCandidate(String operationId, SourceExecution execution) {}
+  record SourceHistoryCandidate(
+      String operationId,
+      SourceExecution execution,
+      SourceExecution acceptedExecution,
+      String operationFingerprint) {
+    public SourceHistoryCandidate(String operationId, SourceExecution execution) {
+      this(operationId, execution, null, "");
+    }
+
+    public SourceHistoryCandidate(
+        String operationId, SourceExecution execution, SourceExecution acceptedExecution) {
+      this(operationId, execution, acceptedExecution, "");
+    }
+  }
 
   record History(
       List<SourceExecution> executions,

@@ -53,6 +53,11 @@ public class DurableSourceFeedJournal implements SourceFeedJournal {
     return copies.remembered(account, trade);
   }
 
+  @Override
+  public AliasLookup sourceExecutionAlias(BrokerGateway.SourceExecution rawExecution) {
+    return copies.sourceExecutionAlias(rawExecution);
+  }
+
   public List<BrokerGateway.SourceExecution> pendingTimestampRecovery() {
     return tx.execute(
         _ ->
@@ -129,6 +134,21 @@ public class DurableSourceFeedJournal implements SourceFeedJournal {
 
   public void acceptRecovered(BrokerGateway.SourceExecution execution) {
     copies.acceptRecovered(execution);
+  }
+
+  @Override
+  public boolean acceptRecovered(
+      BrokerGateway.SourceExecution rawExecution,
+      BrokerGateway.SourceExecution canonicalExecution) {
+    return copies.acceptRecovered(rawExecution, canonicalExecution);
+  }
+
+  @Override
+  public boolean acceptRecovered(
+      BrokerGateway.SourceExecution rawExecution,
+      BrokerGateway.SourceExecution canonicalExecution,
+      String canonicalTradeId) {
+    return copies.acceptRecovered(rawExecution, canonicalExecution, canonicalTradeId);
   }
 
   public void skip(BrokerGateway.SourceExecution execution, String reason) {

@@ -498,9 +498,9 @@ public class TradingService implements UnsentIntentStop {
     BigDecimal reserved = BigDecimal.ZERO;
     for (var reservation :
         em.createQuery(
-                "from CopyIntent i where i.currency=:currency and i.reservedMoney>0",
+                "from CopyIntent i where upper(i.currency)=:currency and i.reservedMoney>0",
                 CopyIntent.class)
-            .setParameter("currency", currency)
+            .setParameter("currency", currency.toUpperCase(Locale.ROOT))
             .getResultList()) {
       BigDecimal reflected =
           resources.bankReflectedReservations().getOrDefault(reservation.id, BigDecimal.ZERO);

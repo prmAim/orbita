@@ -137,7 +137,7 @@ function Assert-GenerateBaseline {
     if($LASTEXITCODE -ne 0){throw 'Cannot qualify the selected schema before Generate; no harness was started'}
     try {$baseline=($result -join "`n") | ConvertFrom-Json} catch {throw 'Invalid schema qualification result; no harness was started'}
     if($baseline.manifest){throw 'Remove the existing preview before regeneration. A version 1 preview must be removed on schema 15 before upgrading.'}
-    if($baseline.schema -cne '19'){throw 'Generate requires the updated application and qualified schema 19. Remove an old version 1 preview on schema 15 before upgrading.'}
+    if($baseline.schema -cne '20'){throw 'Generate requires the updated application and qualified schema 20. Remove an old version 1 preview on schema 15 before upgrading.'}
 }
 
 if(-not(Test-Path -LiteralPath $ComposeOverride -PathType Leaf)){throw 'Compose override does not exist'}

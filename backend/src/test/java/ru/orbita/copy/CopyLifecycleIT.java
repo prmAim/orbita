@@ -7,11 +7,20 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import io.grpc.Status;
+import io.grpc.stub.StreamObserver;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.time.*;
 import java.util.*;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
@@ -23,9 +32,11 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.testcontainers.postgresql.PostgreSQLContainer;
 import ru.orbita.broker.BrokerGateway;
 import ru.orbita.broker.BrokerGateway.*;
+import ru.orbita.broker.BrokerTlsTestSupport;
 import ru.orbita.control.ControlService;
 import ru.orbita.notifications.TelegramTransport;
 import ru.orbita.web.OwnerCredentials;
+import ru.tinkoff.piapi.contract.v1.*;
 
 @SpringBootTest(
     properties = {
@@ -60,6 +71,7 @@ class CopyLifecycleIT {
   @Autowired MockMvc mvc;
   @Autowired OwnerCredentials ownerCredentials;
   @Autowired TelegramSimulator telegram;
+  @TempDir Path temporaryDirectory;
 
   @org.junit.jupiter.api.BeforeEach
   void clean() {
@@ -70,7 +82,8 @@ class CopyLifecycleIT {
   static void reset(
       org.springframework.jdbc.core.JdbcTemplate db, Simulator broker, MutableClock clock) {
     db.execute(
-        "truncate broker_fill,copy_intent,source_execution,incoming_receipt,mirror_position,mirror_trade_receipt,instrument_state,journal_entry,notification_attempt,notification restart identity cascade");
+        "truncate broker_fill,copy_intent,source_execution_alias,source_execution,incoming_receipt,mirror_position,mirror_trade_receipt,instrument_state,journal_entry,notification_attempt,notification restart identity cascade");
+    db.update("insert into broker_connectivity(singleton) values(true) on conflict do nothing");
     db.update(
         "update control_state set mode='NOT_STARTED',coefficient=null,ratio_numerator=null,ratio_denominator=null,active_capital_candidate_id=null,observation_boundary=null,resume_boundary=null,observation_boundary_trusted=false,resume_boundary_trusted=false,observation_activated=false,automatic_boundary=null,permit_limit=null,permit_issued_at=null,permit_id=null,permit_epoch=0,first_acceptance=true,live_accepted=false,reconciled=false,feed_ready=false,shadow_version=null,shadow_buy_checked=false,shadow_sell_checked=false,recalculation_paused=false,attempt_id=null,attempt_kind=null,generation=0,completed_due=null,retry_at=null,last_error=null,pause_started_at=null,recalculation_error_notification_id=null,recalculation_pause_journal_boundary=null,failed_attempts=0 where id=1");
     clock.now = Instant.parse("2026-11-15T10:00:00Z");
@@ -351,6 +364,1460 @@ class CopyLifecycleIT {
     control.issuePermit(new BigDecimal("2000"));
     assertThat(control.status().permitLimit()).isEqualByComparingTo("2000");
     assertThat(broker.posts).isEqualTo(1);
+  }
+
+  @Test
+  void recentHistoryRetriesTransientStateFailureThenReplaysAfterFeedRestartAndSixtySeconds()
+      throws Exception {
+    runningAtFive();
+    clock.now = clock.now.plusSeconds(1).plusNanos(123_456_789);
+    var executedAt = clock.instant();
+    var postgresTimestamp = Instant.parse("2026-11-15T10:00:01.123457Z");
+    var historyVisible = new AtomicBoolean();
+    var stateVerified = new AtomicBoolean();
+    var historyReads = new AtomicInteger();
+    var stateAttempts = new AtomicInteger();
+    var stateAttemptNumbers = new LinkedBlockingQueue<Integer>();
+    var operationId = new AtomicReference<>("operation-17");
+    var rawTradeId = new AtomicReference<>("operation-trade-17");
+    var stateRequests = new LinkedBlockingQueue<GetOrderStateRequest>();
+    var stream =
+        new OrdersStreamServiceGrpc.OrdersStreamServiceImplBase() {
+          volatile StreamObserver<TradesStreamResponse> live;
+          final LinkedBlockingQueue<Integer> subscriptions = new LinkedBlockingQueue<>();
+          int count;
+
+          @Override
+          public void tradesStream(
+              TradesStreamRequest request, StreamObserver<TradesStreamResponse> out) {
+            live = out;
+            out.onNext(
+                TradesStreamResponse.newBuilder()
+                    .setSubscription(
+                        SubscriptionResponse.newBuilder()
+                            .setStatus(ResultSubscriptionStatus.RESULT_SUBSCRIPTION_STATUS_OK)
+                            .addAccounts("source"))
+                    .build());
+            subscriptions.add(++count);
+          }
+        };
+    var instruments =
+        new InstrumentsServiceGrpc.InstrumentsServiceImplBase() {
+          @Override
+          public void getInstrumentBy(
+              InstrumentRequest request, StreamObserver<InstrumentResponse> out) {
+            out.onNext(
+                InstrumentResponse.newBuilder()
+                    .setInstrument(
+                        ru.tinkoff.piapi.contract.v1.Instrument.newBuilder()
+                            .setUid("instrument")
+                            .setLot(10)
+                            .setCurrency("rub")
+                            .setMinPriceIncrement(Quotation.newBuilder().setNano(10000000)))
+                    .build());
+            out.onCompleted();
+          }
+        };
+    var operations =
+        new OperationsServiceGrpc.OperationsServiceImplBase() {
+          @Override
+          public void getOperationsByCursor(
+              GetOperationsByCursorRequest request,
+              StreamObserver<GetOperationsByCursorResponse> out) {
+            historyReads.incrementAndGet();
+            var page = GetOperationsByCursorResponse.newBuilder();
+            if (historyVisible.get())
+              page.addItems(
+                  OperationItem.newBuilder()
+                      .setId(operationId.get())
+                      .setBrokerAccountId("source")
+                      .setInstrumentUid("instrument")
+                      .setType(OperationType.OPERATION_TYPE_BUY)
+                      .setTradesInfo(
+                          OperationItemTrades.newBuilder()
+                              .addTrades(
+                                  OperationItemTrade.newBuilder()
+                                      .setNum(rawTradeId.get())
+                                      .setQuantity(30)
+                                      .setDate(
+                                          com.google.protobuf.Timestamp.newBuilder()
+                                              .setSeconds(executedAt.getEpochSecond())
+                                              .setNanos(executedAt.getNano()))
+                                      .setPrice(
+                                          MoneyValue.newBuilder()
+                                              .setCurrency("rub")
+                                              .setUnits(101)
+                                              .setNano(500000000))))
+                      .build());
+            out.onNext(page.build());
+            out.onCompleted();
+          }
+        };
+    var orders =
+        new OrdersServiceGrpc.OrdersServiceImplBase() {
+          @Override
+          public void getOrderState(GetOrderStateRequest request, StreamObserver<OrderState> out) {
+            int attempt = stateAttempts.incrementAndGet();
+            stateAttemptNumbers.add(attempt);
+            stateRequests.add(request);
+            if (attempt == 1) {
+              out.onError(Status.UNAVAILABLE.asRuntimeException());
+              return;
+            }
+            out.onNext(
+                OrderState.newBuilder()
+                    .setOrderId(stateVerified.get() ? "operation-17" : "transient-mismatch")
+                    .setInstrumentUid("instrument")
+                    .setDirection(OrderDirection.ORDER_DIRECTION_BUY)
+                    .setLotsRequested(3)
+                    .setLotsExecuted(3)
+                    .setExecutionReportStatus(
+                        OrderExecutionReportStatus.EXECUTION_REPORT_STATUS_FILL)
+                    .addStages(
+                        OrderStage.newBuilder()
+                            .setTradeId("canonical-trade-17")
+                            .setQuantity(3)
+                            .setExecutionTime(
+                                com.google.protobuf.Timestamp.newBuilder()
+                                    .setSeconds(executedAt.getEpochSecond())
+                                    .setNanos(executedAt.getNano()))
+                            .setPrice(
+                                MoneyValue.newBuilder()
+                                    .setCurrency("RUB")
+                                    .setUnits(101)
+                                    .setNano(500000000)))
+                    .build());
+            out.onCompleted();
+          }
+        };
+    var journal = new FeedJournalProbe(feed);
+
+    try (var simulator =
+        BrokerTlsTestSupport.open(temporaryDirectory, stream, instruments, operations, orders)) {
+      try (var gateway =
+              BrokerTlsTestSupport.gateway(
+                  simulator.port(), clock, BrokerTlsTestSupport.NO_EVENTS);
+          var observation = gateway.observe(journal)) {
+        assertThat(stream.subscriptions.poll(10, TimeUnit.SECONDS)).isEqualTo(1);
+        assertThat(journal.recoveryOutcomes.poll(10, TimeUnit.SECONDS)).isTrue();
+
+        historyVisible.set(true);
+        stream.live.onError(Status.UNAVAILABLE.asRuntimeException());
+        assertThat(stream.subscriptions.poll(10, TimeUnit.SECONDS)).isEqualTo(2);
+        assertThat(journal.recoveryOutcomes.poll(10, TimeUnit.SECONDS)).isFalse();
+        assertThat(stateAttemptNumbers.poll(10, TimeUnit.SECONDS)).isEqualTo(1);
+        assertThat(stateRequests).hasSize(1);
+        assertThat(journal.gapReasons)
+            .anyMatch(
+                reason ->
+                    reason.contains(
+                        "GetOrderState source history unavailable or invalid: operation-17"));
+
+        stateVerified.set(true);
+        var heartbeatAt = clock.instant();
+        stream.live.onNext(
+            TradesStreamResponse.newBuilder()
+                .setPing(
+                    Ping.newBuilder()
+                        .setTime(
+                            com.google.protobuf.Timestamp.newBuilder()
+                                .setSeconds(heartbeatAt.getEpochSecond())
+                                .setNanos(heartbeatAt.getNano())))
+                .build());
+        assertThat(stateAttemptNumbers.poll(5, TimeUnit.SECONDS))
+            .as("operations-only lookup should retry after a healthy heartbeat")
+            .isEqualTo(2);
+        assertThat(journal.recoveryOutcomes.poll(10, TimeUnit.SECONDS)).isTrue();
+        assertThat(stream.subscriptions).isEmpty();
+        // The feed gap is durable; model the independent reconciliation required after recovery.
+        control.markReconciled();
+        copies.retryPending();
+        assertThat(stateRequests)
+            .hasSize(2)
+            .first()
+            .satisfies(
+                request -> {
+                  assertThat(request.getAccountId()).isEqualTo("source");
+                  assertThat(request.getOrderId()).isEqualTo("operation-17");
+                });
+        assertThat(feed.remembered("source", "canonical-trade-17"))
+            .hasValueSatisfying(
+                execution -> {
+                  assertThat(execution.sourceOrderId()).isEqualTo("operation-17");
+                  assertThat(execution.instrumentId()).isEqualTo("instrument");
+                  assertThat(execution.side()).isEqualTo(Side.BUY);
+                  assertThat(execution.lots()).isEqualByComparingTo("3");
+                  assertThat(execution.price()).isEqualByComparingTo("101.50");
+                  assertThat(execution.currency()).isEqualTo("RUB");
+                  assertThat(execution.executedAt()).isEqualTo(postgresTimestamp);
+                });
+        var canonicalRows =
+            db.queryForList(
+                "select concat(trade_id,'|',source_order_id,'|',disposition,'|',coalesce(accepted_sequence::text,'null'),'|',executed_at::text) from source_execution where trade_id='canonical-trade-17'",
+                String.class);
+        assertThat(
+                db.queryForObject(
+                    "select count(*) from source_execution where trade_id='canonical-trade-17' and source_order_id='operation-17' and disposition='ACCEPTED' and accepted_sequence>0",
+                    Integer.class))
+            .as("canonical persisted execution: %s", canonicalRows)
+            .isEqualTo(1);
+        assertThat(
+                db.queryForObject(
+                    "select currency from source_execution where trade_id='canonical-trade-17'",
+                    String.class))
+            .isEqualTo("RUB");
+
+        operationId.set("operation-other-17");
+        rawTradeId.set("unrelated-operation-trade-17");
+        stream.live.onError(Status.UNAVAILABLE.asRuntimeException());
+        assertThat(stream.subscriptions.poll(10, TimeUnit.SECONDS)).isEqualTo(3);
+        assertThat(journal.recoveryOutcomes.poll(10, TimeUnit.SECONDS)).isFalse();
+        assertThat(stateRequests)
+            .hasSize(3)
+            .last()
+            .satisfies(
+                request -> {
+                  assertThat(request.getAccountId()).isEqualTo("source");
+                  assertThat(request.getOrderId()).isEqualTo("operation-other-17");
+                });
+        assertThat(journal.gapReasons)
+            .anyMatch(
+                reason ->
+                    reason.contains(
+                        "GetOrderState source history identity/count mismatch: operation-other-17"));
+        assertThat(control.status().reconciled()).isFalse();
+        assertThat(
+                db.queryForObject(
+                    "select count(*) from source_execution where disposition='ACCEPTED' and accepted_sequence>0",
+                    Integer.class))
+            .isEqualTo(1);
+        assertThat(broker.posts).isZero();
+
+        operationId.set("operation-17");
+        rawTradeId.set("operation-trade-17");
+        stream.live.onError(Status.UNAVAILABLE.asRuntimeException());
+        assertThat(stream.subscriptions.poll(10, TimeUnit.SECONDS)).isEqualTo(4);
+        assertThat(journal.recoveryOutcomes.poll(10, TimeUnit.SECONDS))
+            .as("recovery gap reasons: %s", journal.gapReasons)
+            .isTrue();
+        assertThat(stateRequests).hasSize(3);
+      }
+
+      var boundary = feed.observationBoundary();
+      assertThat(
+              db.update(
+                  "update source_execution set currency='rub' where trade_id='canonical-trade-17'"))
+          .isEqualTo(1);
+      clock.now = executedAt.plusSeconds(61);
+      assertThat(clock.instant()).isAfter(executedAt.plusSeconds(60));
+      assertThat(feed.observationBoundary()).isEqualTo(boundary);
+      var restartedJournal = new FeedJournalProbe(feed);
+      try (var gateway =
+              BrokerTlsTestSupport.gateway(
+                  simulator.port(), clock, BrokerTlsTestSupport.NO_EVENTS);
+          var observation = gateway.observe(restartedJournal)) {
+        assertThat(stream.subscriptions.poll(10, TimeUnit.SECONDS)).isEqualTo(5);
+        assertThat(restartedJournal.recoveryOutcomes.poll(10, TimeUnit.SECONDS)).isTrue();
+      }
+      assertThat(historyReads).hasValue(6);
+      assertThat(stateRequests).hasSize(3);
+      assertThat(
+              db.queryForObject(
+                  "select count(*) from source_execution where trade_id='canonical-trade-17' and source_order_id='operation-17' and disposition='ACCEPTED' and accepted_sequence>0",
+                  Integer.class))
+          .isEqualTo(1);
+      assertThat(feed.remembered("source", "canonical-trade-17"))
+          .hasValueSatisfying(
+              execution -> {
+                assertThat(execution.tradeId()).isEqualTo("canonical-trade-17");
+                assertThat(execution.sourceOrderId()).isEqualTo("operation-17");
+                assertThat(execution.executedAt()).isEqualTo(postgresTimestamp);
+                assertThat(execution.currency()).isEqualTo("RUB");
+              });
+      assertThat(broker.posts).isZero();
+    }
+  }
+
+  @Test
+  void duplicateExecutionWithCurrencyCaseDifferenceKeepsOneCanonicalRow() {
+    runningAtFive();
+    control.recalculate();
+    clock.now = clock.now.plusSeconds(1);
+    var executedAt = clock.instant();
+    var lowerCurrency =
+        new SourceExecution(
+            "source",
+            "currency-case-execution",
+            "currency-case-order",
+            "instrument",
+            Side.BUY,
+            BigDecimal.ONE,
+            new BigDecimal("100"),
+            "rub",
+            executedAt,
+            executedAt);
+    var upperCurrency =
+        new SourceExecution(
+            "source",
+            "currency-case-execution",
+            "currency-case-order",
+            "instrument",
+            Side.BUY,
+            BigDecimal.ONE,
+            new BigDecimal("100"),
+            "RUB",
+            executedAt,
+            executedAt);
+
+    assertThat(copies.accept(lowerCurrency).disposition()).isEqualTo("ACCEPTED");
+    assertThat(copies.accept(upperCurrency).disposition()).isEqualTo("ACCEPTED");
+
+    assertThat(
+            db.queryForObject(
+                "select count(*) from instrument_state where instrument_id='instrument' and paused",
+                Integer.class))
+        .isZero();
+    assertThat(
+            db.queryForObject(
+                "select count(*) from source_execution where account_id='source' and trade_id='currency-case-execution'",
+                Integer.class))
+        .isEqualTo(1);
+    assertThat(
+            db.queryForObject(
+                "select currency from source_execution where account_id='source' and trade_id='currency-case-execution'",
+                String.class))
+        .isEqualTo("RUB");
+  }
+
+  @Test
+  void uppercaseCurrencyIntentCountsLegacyLowercaseReservation() {
+    runningAtFive();
+    broker.mirrorCapital = new BigDecimal("100000");
+    control.recalculate();
+    broker.fillEveryPost = false;
+    clock.now = clock.now.plusSeconds(1);
+    var firstTime = clock.instant();
+    copies.accept(
+        new SourceExecution(
+            "source",
+            "lowercase-reservation-source",
+            "lowercase-reservation-order",
+            "instrument",
+            Side.BUY,
+            BigDecimal.ONE,
+            new BigDecimal("100"),
+            "rub",
+            firstTime,
+            firstTime));
+    broker.partialNext = 0;
+    trading.tick();
+    assertThat(broker.posts).isEqualTo(1);
+    assertThat(
+            db.queryForObject(
+                "select currency from copy_intent where source_order_id='lowercase-reservation-order'",
+                String.class))
+        .isEqualTo("RUB");
+    assertThat(copies.intents())
+        .filteredOn(intent -> intent.sourceOrderId().equals("lowercase-reservation-order"))
+        .singleElement()
+        .satisfies(intent -> assertThat(intent.reservedMoney()).isPositive());
+    assertThat(
+            db.update(
+                "update copy_intent set currency='rub' where source_order_id='lowercase-reservation-order'"))
+        .isEqualTo(1);
+
+    broker.availableMoney = new BigDecimal("150");
+    clock.now = clock.now.plusSeconds(1);
+    var secondTime = clock.instant();
+    copies.accept(
+        new SourceExecution(
+            "source",
+            "uppercase-reservation-source",
+            "uppercase-reservation-order",
+            "other",
+            Side.BUY,
+            BigDecimal.ONE,
+            new BigDecimal("100"),
+            "RUB",
+            secondTime,
+            secondTime));
+    trading.tick();
+
+    assertThat(broker.posts).isEqualTo(1);
+    assertThat(copies.intents())
+        .filteredOn(intent -> intent.sourceOrderId().equals("lowercase-reservation-order"))
+        .singleElement()
+        .satisfies(intent -> assertThat(intent.reservedMoney()).isPositive());
+    assertThat(copies.intents())
+        .filteredOn(intent -> intent.sourceOrderId().equals("uppercase-reservation-order"))
+        .singleElement()
+        .satisfies(intent -> assertThat(intent.status()).isNotEqualTo("ACTIVE"));
+  }
+
+  @Test
+  void recoveredAliasUpdatesReceivedRawExecutionWithoutCreatingAnotherEvent() {
+    runningAtFive();
+    control.recalculate();
+    clock.now = clock.now.plusSeconds(1);
+    Instant executedAt = clock.instant();
+    Instant receivedAt = executedAt;
+    var pendingRaw =
+        new SourceExecution(
+            "source",
+            "operation-pending-trade",
+            "operation-pending-order",
+            "instrument",
+            Side.BUY,
+            new BigDecimal("3"),
+            new BigDecimal("100"),
+            "RUB",
+            null,
+            receivedAt);
+    feed.firstReceived("source", pendingRaw.tradeId(), receivedAt);
+    feed.remember(pendingRaw);
+    assertThat(copies.remembered("source", pendingRaw.tradeId()))
+        .hasValueSatisfying(event -> assertThat(event.executedAt()).isNull());
+
+    var rawHistory =
+        new SourceExecution(
+            "source",
+            pendingRaw.tradeId(),
+            "",
+            "instrument",
+            Side.BUY,
+            new BigDecimal("3"),
+            new BigDecimal("100"),
+            "RUB",
+            executedAt,
+            receivedAt);
+    var canonical =
+        new SourceExecution(
+            "source",
+            "canonical-pending-trade",
+            "operation-pending-order",
+            "instrument",
+            Side.BUY,
+            new BigDecimal("3"),
+            new BigDecimal("100"),
+            "RUB",
+            executedAt,
+            receivedAt);
+
+    assertThat(copies.acceptRecovered(rawHistory, canonical, "canonical-pending-trade")).isTrue();
+    assertThat(
+            db.queryForObject(
+                "select count(*) from source_execution where trade_id in ('operation-pending-trade','canonical-pending-trade')",
+                Integer.class))
+        .isEqualTo(1);
+    assertThat(copies.remembered("source", "operation-pending-trade"))
+        .hasValueSatisfying(
+            event -> {
+              assertThat(event.tradeId()).isEqualTo("operation-pending-trade");
+              assertThat(event.executedAt()).isEqualTo(executedAt);
+              assertThat(event.sourceOrderId()).isEqualTo("operation-pending-order");
+            });
+    assertThat(
+            db.queryForObject(
+                "select count(*) from incoming_receipt where id=?",
+                Integer.class,
+                CopyService.key("source", "operation-pending-trade")))
+        .isEqualTo(1);
+    assertThat(
+            db.queryForObject(
+                "select count(*) from incoming_receipt where id=?",
+                Integer.class,
+                CopyService.key("source", "canonical-pending-trade")))
+        .isZero();
+    assertThat(
+            db.queryForObject(
+                "select count(*) from source_execution_alias where account_id='source' and alias_trade_id in ('operation-pending-trade','canonical-pending-trade') and execution_trade_id='operation-pending-trade' and canonical_trade_id='canonical-pending-trade'",
+                Integer.class))
+        .isEqualTo(2);
+    assertThat(copies.sourceExecutionAlias(rawHistory).canonicalTradeId())
+        .isEqualTo("canonical-pending-trade");
+    assertThat(copies.sourceExecutionAlias(canonical).execution())
+        .extracting(SourceExecution::tradeId)
+        .isEqualTo("operation-pending-trade");
+  }
+
+  @Test
+  void acceptedRawExecutionCanReceiveCanonicalStageAliasWithoutDuplicatePosition() {
+    runningAtFive();
+    control.recalculate();
+    clock.now = clock.now.plusSeconds(1);
+    Instant executedAt = clock.instant();
+    var acceptedRaw =
+        new SourceExecution(
+            "source",
+            "stream-trade-accepted-alias",
+            "operation-accepted-alias",
+            "instrument",
+            Side.BUY,
+            new BigDecimal("3"),
+            new BigDecimal("100"),
+            "RUB",
+            executedAt,
+            executedAt);
+    assertThat(copies.accept(acceptedRaw).disposition()).isEqualTo("ACCEPTED");
+    int intentCount = copies.intents().size();
+    var copiedLots = copies.positions().stream().map(position -> position.copiedLots()).toList();
+
+    var rawHistory =
+        new SourceExecution(
+            "source",
+            acceptedRaw.tradeId(),
+            "",
+            acceptedRaw.instrumentId(),
+            acceptedRaw.side(),
+            acceptedRaw.lots(),
+            acceptedRaw.price(),
+            acceptedRaw.currency(),
+            acceptedRaw.executedAt(),
+            acceptedRaw.receivedAt());
+    var canonical =
+        new SourceExecution(
+            "source",
+            "canonical-stage-accepted-alias",
+            acceptedRaw.sourceOrderId(),
+            acceptedRaw.instrumentId(),
+            acceptedRaw.side(),
+            acceptedRaw.lots(),
+            acceptedRaw.price(),
+            acceptedRaw.currency(),
+            acceptedRaw.executedAt(),
+            acceptedRaw.receivedAt());
+
+    assertThat(copies.acceptRecovered(rawHistory, canonical, canonical.tradeId())).isTrue();
+    assertThat(
+            db.queryForObject(
+                "select count(*) from source_execution where trade_id in ('stream-trade-accepted-alias','canonical-stage-accepted-alias') and disposition='ACCEPTED' and accepted_sequence>0",
+                Integer.class))
+        .isEqualTo(1);
+    assertThat(
+            db.queryForObject(
+                "select count(*) from source_execution_alias where account_id='source' and alias_trade_id in ('stream-trade-accepted-alias','canonical-stage-accepted-alias') and execution_trade_id='stream-trade-accepted-alias' and canonical_trade_id='canonical-stage-accepted-alias'",
+                Integer.class))
+        .isEqualTo(2);
+    assertThat(copies.sourceExecutionAlias(rawHistory).canonicalTradeId())
+        .isEqualTo(canonical.tradeId());
+    assertThat(copies.sourceExecutionAlias(rawHistory).execution().tradeId())
+        .isEqualTo(acceptedRaw.tradeId());
+    assertThat(copies.intents()).hasSize(intentCount);
+    assertThat(copies.positions().stream().map(position -> position.copiedLots()).toList())
+        .isEqualTo(copiedLots);
+    assertThat(broker.posts).isZero();
+  }
+
+  @Test
+  void rejectedRecoveredAliasPreservesReceivedRawEventAndReceipt() {
+    clock.now = clock.now.plusSeconds(1);
+    Instant receivedAt = clock.instant();
+    Instant executedAt = receivedAt.plusSeconds(1);
+    var incompatibleCanonical =
+        new SourceExecution(
+            "source",
+            "canonical-skipped-target",
+            "other-source-order",
+            "instrument",
+            Side.BUY,
+            BigDecimal.ONE,
+            new BigDecimal("100"),
+            "RUB",
+            executedAt,
+            receivedAt);
+    assertThat(copies.accept(incompatibleCanonical).disposition()).isEqualTo("SKIPPED");
+
+    var pendingRaw =
+        new SourceExecution(
+            "source",
+            "raw-received-conflict",
+            "expected-source-order",
+            "instrument",
+            Side.BUY,
+            BigDecimal.ONE,
+            new BigDecimal("100"),
+            "RUB",
+            null,
+            receivedAt);
+    feed.firstReceived("source", pendingRaw.tradeId(), receivedAt);
+    feed.remember(pendingRaw);
+
+    var rawHistory =
+        new SourceExecution(
+            "source",
+            pendingRaw.tradeId(),
+            "",
+            "instrument",
+            Side.BUY,
+            BigDecimal.ONE,
+            new BigDecimal("100"),
+            "RUB",
+            executedAt,
+            receivedAt);
+    var canonicalHistory =
+        new SourceExecution(
+            "source",
+            "canonical-skipped-target",
+            "expected-source-order",
+            "instrument",
+            Side.BUY,
+            BigDecimal.ONE,
+            new BigDecimal("100"),
+            "RUB",
+            executedAt,
+            receivedAt);
+    String rawReceiptId = CopyService.key("source", pendingRaw.tradeId());
+    String canonicalReceiptId = CopyService.key("source", canonicalHistory.tradeId());
+
+    assertThat(copies.remembered("source", pendingRaw.tradeId()))
+        .hasValueSatisfying(
+            event -> {
+              assertThat(event.executedAt()).isNull();
+              assertThat(event.sourceOrderId()).isEqualTo("expected-source-order");
+            });
+    assertThat(
+            db.queryForObject(
+                "select first_received from incoming_receipt where id=?",
+                Instant.class,
+                rawReceiptId))
+        .isEqualTo(receivedAt);
+    assertThat(
+            db.queryForObject(
+                "select count(*) from incoming_receipt where id=?",
+                Integer.class,
+                canonicalReceiptId))
+        .isZero();
+
+    assertThat(copies.acceptRecovered(rawHistory, canonicalHistory, canonicalHistory.tradeId()))
+        .isFalse();
+
+    assertThat(copies.remembered("source", pendingRaw.tradeId()))
+        .hasValueSatisfying(
+            event -> {
+              assertThat(event.executedAt()).isNull();
+              assertThat(event.sourceOrderId()).isEqualTo("expected-source-order");
+            });
+    assertThat(
+            db.queryForObject(
+                "select disposition from source_execution where account_id='source' and trade_id=?",
+                String.class,
+                pendingRaw.tradeId()))
+        .isEqualTo("RECEIVED");
+    assertThat(
+            db.queryForObject(
+                "select first_received from incoming_receipt where id=?",
+                Instant.class,
+                rawReceiptId))
+        .isEqualTo(receivedAt);
+    assertThat(
+            db.queryForObject(
+                "select count(*) from incoming_receipt where id=?",
+                Integer.class,
+                canonicalReceiptId))
+        .isZero();
+    assertThat(
+            db.queryForObject(
+                "select count(*) from source_execution_alias where account_id='source' and alias_trade_id=?",
+                Integer.class,
+                pendingRaw.tradeId()))
+        .isZero();
+  }
+
+  @Test
+  void skippedSourceHistoryReplayKeepsTerminalDispositionWithoutGapOrAdmission() throws Exception {
+    runningAtFive();
+    control.recalculate();
+    clock.now = clock.now.plusSeconds(1);
+    Instant executedAt = clock.instant();
+    String tradeId = "terminal-skipped-history-trade";
+    String orderId = "terminal-skipped-history-order";
+    control.stop();
+
+    var skippedExecution =
+        new SourceExecution(
+            "source",
+            tradeId,
+            orderId,
+            "instrument",
+            Side.BUY,
+            new BigDecimal("3"),
+            new BigDecimal("100"),
+            "RUB",
+            executedAt,
+            executedAt);
+    feed.firstReceived("source", tradeId, executedAt);
+    assertThat(copies.accept(skippedExecution).disposition()).isEqualTo("SKIPPED");
+    String receiptId = CopyService.key("source", tradeId);
+    Instant firstReceipt =
+        db.queryForObject(
+            "select first_received from incoming_receipt where id=?", Instant.class, receiptId);
+
+    var subscriptions = new LinkedBlockingQueue<StreamObserver<TradesStreamResponse>>();
+    var stream =
+        new OrdersStreamServiceGrpc.OrdersStreamServiceImplBase() {
+          @Override
+          public void tradesStream(
+              TradesStreamRequest request, StreamObserver<TradesStreamResponse> out) {
+            out.onNext(
+                TradesStreamResponse.newBuilder()
+                    .setSubscription(
+                        SubscriptionResponse.newBuilder()
+                            .setStatus(ResultSubscriptionStatus.RESULT_SUBSCRIPTION_STATUS_OK)
+                            .addAccounts("source"))
+                    .build());
+            subscriptions.add(out);
+          }
+        };
+    var instruments =
+        new InstrumentsServiceGrpc.InstrumentsServiceImplBase() {
+          @Override
+          public void getInstrumentBy(
+              InstrumentRequest request, StreamObserver<InstrumentResponse> out) {
+            out.onNext(
+                InstrumentResponse.newBuilder()
+                    .setInstrument(
+                        ru.tinkoff.piapi.contract.v1.Instrument.newBuilder()
+                            .setUid("instrument")
+                            .setLot(10)
+                            .setCurrency("RUB")
+                            .setMinPriceIncrement(Quotation.newBuilder().setNano(10000000)))
+                    .build());
+            out.onCompleted();
+          }
+        };
+    var operations =
+        new OperationsServiceGrpc.OperationsServiceImplBase() {
+          @Override
+          public void getOperationsByCursor(
+              GetOperationsByCursorRequest request,
+              StreamObserver<GetOperationsByCursorResponse> out) {
+            var historyTrade =
+                OperationItemTrade.newBuilder()
+                    .setNum(tradeId)
+                    .setQuantity(30)
+                    .setDate(
+                        com.google.protobuf.Timestamp.newBuilder()
+                            .setSeconds(executedAt.getEpochSecond())
+                            .setNanos(executedAt.getNano()))
+                    .setPrice(MoneyValue.newBuilder().setCurrency("RUB").setUnits(100));
+            out.onNext(
+                GetOperationsByCursorResponse.newBuilder()
+                    .addItems(
+                        OperationItem.newBuilder()
+                            .setId("unstable-terminal-operation-id")
+                            .setBrokerAccountId("source")
+                            .setInstrumentUid("instrument")
+                            .setType(OperationType.OPERATION_TYPE_BUY)
+                            .setTradesInfo(
+                                OperationItemTrades.newBuilder().addTrades(historyTrade)))
+                    .build());
+            out.onCompleted();
+          }
+        };
+
+    var probe = new FeedJournalProbe(feed, clock);
+    try (var simulator =
+        BrokerTlsTestSupport.open(temporaryDirectory, stream, instruments, operations)) {
+      try (var gateway =
+              BrokerTlsTestSupport.gateway(
+                  simulator.port(), clock, BrokerTlsTestSupport.NO_EVENTS);
+          var observation = gateway.observe(probe)) {
+        assertThat(subscriptions.poll(10, TimeUnit.SECONDS)).isNotNull();
+        assertThat(probe.gapReasons.poll(10, TimeUnit.SECONDS))
+            .isEqualTo("Source subscription awaiting acknowledgement and history recovery");
+        var recoveryOutcome = probe.recoveryOutcomes.poll(10, TimeUnit.SECONDS);
+        assertThat(recoveryOutcome)
+            .withFailMessage(
+                "Expected exact terminal replay to recover without a gap; observed gaps: %s",
+                probe.gapReasons)
+            .as("exact history replay of a terminal skipped event should complete without a gap")
+            .isTrue();
+      }
+    }
+
+    assertThat(probe.gapReasons).isEmpty();
+    assertThat(
+            db.queryForObject(
+                "select count(*) from source_execution where account_id='source' and trade_id=?",
+                Integer.class,
+                tradeId))
+        .isEqualTo(1);
+    assertThat(
+            db.queryForObject(
+                "select disposition from source_execution where account_id='source' and trade_id=?",
+                String.class,
+                tradeId))
+        .isEqualTo("SKIPPED");
+    assertThat(
+            db.queryForObject(
+                "select source_order_id from source_execution where account_id='source' and trade_id=?",
+                String.class,
+                tradeId))
+        .isEqualTo(orderId);
+    assertThat(
+            db.queryForObject(
+                "select accepted_sequence from source_execution where account_id='source' and trade_id=?",
+                Long.class,
+                tradeId))
+        .isZero();
+    assertThat(
+            db.queryForObject(
+                "select first_received from incoming_receipt where id=?", Instant.class, receiptId))
+        .isEqualTo(firstReceipt);
+    assertThat(copies.intents()).isEmpty();
+    assertThat(copies.positions()).isEmpty();
+    assertThat(broker.posts).isZero();
+  }
+
+  @org.junit.jupiter.params.ParameterizedTest(name = "skipAfterRecovery={0}")
+  @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+  void distinctHistoryIdsReplayOneSkippedExecution(boolean skipAfterRecovery) {
+    runningAtFive();
+    control.recalculate();
+    clock.now = clock.now.plusSeconds(1);
+    Instant executed = clock.instant();
+    var raw = historyExecution("raw", "", executed);
+    var stage = historyExecution("stage", "order", executed);
+    String target = skipAfterRecovery ? raw.tradeId() : stage.tradeId();
+    var receiptWindow = new ru.orbita.broker.SourceFeedJournal.TimeWindow(executed, executed);
+    feed.firstReceived("source", target, executed, receiptWindow);
+    if (skipAfterRecovery) {
+      control.requireReconciliation("Synthetic feed gap");
+      feed.remember(historyExecution(target, "order", null));
+    } else {
+      control.stop();
+    }
+
+    assertThat(feed.acceptRecovered(raw, stage, stage.tradeId())).isTrue();
+    if (skipAfterRecovery) {
+      assertThat(db.queryForObject("select disposition from source_execution", String.class))
+          .isEqualTo("RECEIVED");
+      control.stop();
+      copies.retryPending();
+    }
+    var terminalFact = db.queryForMap("select * from source_execution");
+    assertThat(terminalFact)
+        .containsEntry("trade_id", target)
+        .containsEntry("source_order_id", "order")
+        .containsEntry("disposition", "SKIPPED")
+        .containsEntry("accepted_sequence", 0L);
+    var journalBefore = copies.journal(0, 200);
+    assertThat(journalBefore).filteredOn(e -> e.category().equals("SOURCE_SKIPPED")).hasSize(1);
+    var aliasesBefore =
+        db.queryForList("select * from source_execution_alias order by alias_trade_id");
+    assertThat(aliasesBefore).hasSize(2);
+
+    for (var replay : List.of(raw, stage)) {
+      var alias = feed.sourceExecutionAlias(replay);
+      assertThat(alias.status()).isEqualTo(ru.orbita.broker.SourceFeedJournal.AliasStatus.MATCH);
+      assertThat(alias.execution().tradeId()).isEqualTo(target);
+      assertThat(alias.canonicalTradeId()).isEqualTo(stage.tradeId());
+      assertThat(feed.acceptRecovered(replay, alias.execution(), alias.canonicalTradeId()))
+          .isTrue();
+    }
+    var conflictingOrder = historyExecution("stage", "other-order", executed);
+    assertThat(feed.sourceExecutionAlias(conflictingOrder).status())
+        .isEqualTo(ru.orbita.broker.SourceFeedJournal.AliasStatus.CONFLICT);
+    assertThat(feed.acceptRecovered(raw, conflictingOrder, "stage")).isFalse();
+    assertThat(feed.acceptRecovered(historyExecution("unproven-raw", "", executed), stage, "stage"))
+        .isFalse();
+    assertThat(db.queryForMap("select * from source_execution")).isEqualTo(terminalFact);
+    assertThat(db.queryForList("select * from source_execution_alias order by alias_trade_id"))
+        .isEqualTo(aliasesBefore);
+    assertThat(copies.journal(0, 200)).isEqualTo(journalBefore);
+    assertThat(db.queryForObject("select first_received from incoming_receipt", Instant.class))
+        .isEqualTo(executed);
+    assertThat(feed.receiptTimeWindow("source", target)).contains(receiptWindow);
+    assertThat(copies.intents()).isEmpty();
+    assertThat(copies.positions()).isEmpty();
+    assertThat(broker.posts).isZero();
+  }
+
+  @Test
+  void conflictingRecoveryIdentityLeavesReceivedSourceAndReceiptIntact() {
+    var time = clock.instant();
+    var raw = historyExecution("raw", "", time);
+    var canonical = historyExecution("stage", "order", time);
+    assertThat(feed.acceptRecovered(raw, canonical, "unrelated-stage")).isFalse();
+    assertThat(db.queryForList("select id from source_execution")).isEmpty();
+    assertThat(db.queryForList("select id from journal_entry where category='SOURCE_SKIPPED'"))
+        .isEmpty();
+
+    feed.firstReceived("source", "stage", time);
+    feed.remember(historyExecution("stage", "original-order", null));
+    var before = db.queryForMap("select * from source_execution");
+    assertThat(feed.acceptRecovered(raw, canonical, "stage")).isFalse();
+    assertThat(db.queryForMap("select * from source_execution")).isEqualTo(before);
+    assertThat(db.queryForObject("select first_received from incoming_receipt", Instant.class))
+        .isEqualTo(time);
+    assertThat(db.queryForList("select alias_trade_id from source_execution_alias")).isEmpty();
+    assertThat(copies.intents()).isEmpty();
+  }
+
+  private SourceExecution historyExecution(String trade, String order, Instant executed) {
+    return new SourceExecution(
+        "source",
+        trade,
+        order,
+        "instrument",
+        Side.BUY,
+        BigDecimal.ONE,
+        new BigDecimal("100"),
+        "RUB",
+        executed,
+        clock.instant());
+  }
+
+  @Test
+  void conflictingStreamReplayOfKnownRawAliasStaysGapWithoutDuplicateExecution() throws Exception {
+    runningAtFive();
+    control.recalculate();
+    clock.now = clock.now.plusSeconds(1);
+    Instant executedAt = clock.instant();
+    var canonical =
+        new SourceExecution(
+            "source",
+            "canonical-stage-stream-conflict",
+            "operation-stream-conflict",
+            "instrument",
+            Side.BUY,
+            new BigDecimal("3"),
+            new BigDecimal("100"),
+            "RUB",
+            executedAt,
+            executedAt);
+    assertThat(copies.accept(canonical).disposition()).isEqualTo("ACCEPTED");
+    var rawAlias =
+        new SourceExecution(
+            "source",
+            "operation-stream-conflict-trade",
+            "",
+            "instrument",
+            Side.BUY,
+            new BigDecimal("3"),
+            new BigDecimal("100"),
+            "RUB",
+            executedAt,
+            executedAt);
+    assertThat(copies.acceptRecovered(rawAlias, canonical, canonical.tradeId())).isTrue();
+    int intentCount = copies.intents().size();
+
+    var subscriptions = new LinkedBlockingQueue<StreamObserver<TradesStreamResponse>>();
+    var stream =
+        new OrdersStreamServiceGrpc.OrdersStreamServiceImplBase() {
+          @Override
+          public void tradesStream(
+              TradesStreamRequest request, StreamObserver<TradesStreamResponse> out) {
+            out.onNext(
+                TradesStreamResponse.newBuilder()
+                    .setSubscription(
+                        SubscriptionResponse.newBuilder()
+                            .setStatus(ResultSubscriptionStatus.RESULT_SUBSCRIPTION_STATUS_OK)
+                            .addAccounts("source"))
+                    .build());
+            subscriptions.add(out);
+          }
+        };
+    var instruments =
+        new InstrumentsServiceGrpc.InstrumentsServiceImplBase() {
+          @Override
+          public void getInstrumentBy(
+              InstrumentRequest request, StreamObserver<InstrumentResponse> out) {
+            out.onNext(
+                InstrumentResponse.newBuilder()
+                    .setInstrument(
+                        ru.tinkoff.piapi.contract.v1.Instrument.newBuilder()
+                            .setUid("instrument")
+                            .setLot(10)
+                            .setCurrency("rub")
+                            .setMinPriceIncrement(Quotation.newBuilder().setNano(10000000)))
+                    .build());
+            out.onCompleted();
+          }
+        };
+    var operations =
+        new OperationsServiceGrpc.OperationsServiceImplBase() {
+          @Override
+          public void getOperationsByCursor(
+              GetOperationsByCursorRequest request,
+              StreamObserver<GetOperationsByCursorResponse> out) {
+            out.onNext(GetOperationsByCursorResponse.getDefaultInstance());
+            out.onCompleted();
+          }
+        };
+
+    try (var simulator =
+        BrokerTlsTestSupport.open(temporaryDirectory, stream, instruments, operations)) {
+      var probe = new FeedJournalProbe(feed);
+      try (var gateway =
+              BrokerTlsTestSupport.gateway(
+                  simulator.port(), clock, BrokerTlsTestSupport.NO_EVENTS);
+          var observation = gateway.observe(probe)) {
+        var live = subscriptions.poll(10, TimeUnit.SECONDS);
+        assertThat(live).isNotNull();
+        assertThat(probe.gapReasons.poll(10, TimeUnit.SECONDS))
+            .isEqualTo("Source subscription awaiting acknowledgement and history recovery");
+        assertThat(probe.recoveryOutcomes.poll(10, TimeUnit.SECONDS)).isTrue();
+        live.onNext(
+            TradesStreamResponse.newBuilder()
+                .setOrderTrades(
+                    OrderTrades.newBuilder()
+                        .setAccountId("source")
+                        .setOrderId("operation-stream-conflict")
+                        .setInstrumentUid("instrument")
+                        .setDirection(OrderDirection.ORDER_DIRECTION_BUY)
+                        .addTrades(
+                            OrderTrade.newBuilder()
+                                .setTradeId("operation-stream-conflict-trade")
+                                .setQuantity(30)
+                                .setPrice(Quotation.newBuilder().setUnits(101))
+                                .setDateTime(
+                                    com.google.protobuf.Timestamp.newBuilder()
+                                        .setSeconds(executedAt.getEpochSecond())
+                                        .setNanos(executedAt.getNano())))
+                        .build())
+                .build());
+        live.onNext(
+            TradesStreamResponse.newBuilder()
+                .setOrderTrades(
+                    OrderTrades.newBuilder()
+                        .setAccountId("source")
+                        .setOrderId("operation-stream-conflict")
+                        .setInstrumentUid("instrument")
+                        .setDirection(OrderDirection.ORDER_DIRECTION_BUY)
+                        .addTrades(OrderTrade.newBuilder().setQuantity(30))
+                        .build())
+                .build());
+        var observedGaps = new ArrayList<String>();
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        boolean invalidFrameBarrierSeen = false;
+        while (System.nanoTime() < deadline) {
+          long remaining = deadline - System.nanoTime();
+          var reason = probe.gapReasons.poll(remaining, TimeUnit.NANOSECONDS);
+          if (reason == null) break;
+          observedGaps.add(reason);
+          if (reason.equals("Incomplete source trade identity/quantity/price")) {
+            invalidFrameBarrierSeen = true;
+            break;
+          }
+        }
+        assertThat(invalidFrameBarrierSeen)
+            .as("Observed gaps before FIFO barrier: %s", observedGaps)
+            .isTrue();
+        assertThat(
+                db.queryForObject(
+                    "select count(*) from source_execution where trade_id in ('canonical-stage-stream-conflict','operation-stream-conflict-trade')",
+                    Integer.class))
+            .isEqualTo(1);
+        assertThat(observedGaps)
+            .anyMatch(
+                reason -> reason.contains("Conflicting durable source execution alias for trade"));
+        assertThat(copies.intents()).hasSize(intentCount);
+        assertThat(control.status().reconciled()).isFalse();
+        assertThat(broker.posts).isZero();
+      }
+    }
+  }
+
+  @Test
+  void pendingRawR67TradeRecoversExactHistoryStageAndKeepsFirstReceipt() throws Exception {
+    runningAtFive();
+    control.recalculate();
+    clock.now = clock.now.plusSeconds(1);
+    Instant executedAt = clock.instant();
+    var persistedAt =
+        java.sql.Timestamp.from(
+            ru.orbita.persistence.PostgresTimestampPrecision.normalize(executedAt));
+    String rawTradeId = "r67-exact-raw-trade";
+    String orderId = "r67-exact-order";
+    var historyVisible = new AtomicBoolean();
+    var subscriptions = new LinkedBlockingQueue<StreamObserver<TradesStreamResponse>>();
+    var stream =
+        new OrdersStreamServiceGrpc.OrdersStreamServiceImplBase() {
+          @Override
+          public void tradesStream(
+              TradesStreamRequest request, StreamObserver<TradesStreamResponse> out) {
+            out.onNext(
+                TradesStreamResponse.newBuilder()
+                    .setSubscription(
+                        SubscriptionResponse.newBuilder()
+                            .setStatus(ResultSubscriptionStatus.RESULT_SUBSCRIPTION_STATUS_OK)
+                            .addAccounts("source"))
+                    .build());
+            subscriptions.add(out);
+          }
+        };
+    var instruments =
+        new InstrumentsServiceGrpc.InstrumentsServiceImplBase() {
+          @Override
+          public void getInstrumentBy(
+              InstrumentRequest request, StreamObserver<InstrumentResponse> out) {
+            out.onNext(
+                InstrumentResponse.newBuilder()
+                    .setInstrument(
+                        ru.tinkoff.piapi.contract.v1.Instrument.newBuilder()
+                            .setUid("instrument")
+                            .setLot(10)
+                            .setCurrency("RUB")
+                            .setMinPriceIncrement(Quotation.newBuilder().setNano(10000000)))
+                    .build());
+            out.onCompleted();
+          }
+        };
+    var operations =
+        new OperationsServiceGrpc.OperationsServiceImplBase() {
+          @Override
+          public void getOperationsByCursor(
+              GetOperationsByCursorRequest request,
+              StreamObserver<GetOperationsByCursorResponse> out) {
+            var page = GetOperationsByCursorResponse.newBuilder();
+            if (historyVisible.get())
+              page.addItems(
+                  OperationItem.newBuilder()
+                      .setId(orderId)
+                      .setBrokerAccountId("source")
+                      .setInstrumentUid("instrument")
+                      .setType(OperationType.OPERATION_TYPE_BUY)
+                      .setTradesInfo(
+                          OperationItemTrades.newBuilder()
+                              .addTrades(
+                                  OperationItemTrade.newBuilder()
+                                      .setNum(rawTradeId)
+                                      .setQuantity(30)
+                                      .setDate(
+                                          com.google.protobuf.Timestamp.newBuilder()
+                                              .setSeconds(executedAt.getEpochSecond())
+                                              .setNanos(executedAt.getNano()))
+                                      .setPrice(
+                                          MoneyValue.newBuilder()
+                                              .setCurrency("RUB")
+                                              .setUnits(100))))
+                      .build());
+            out.onNext(page.build());
+            out.onCompleted();
+          }
+        };
+    var stateRequests = new LinkedBlockingQueue<GetOrderStateRequest>();
+    var orders =
+        new OrdersServiceGrpc.OrdersServiceImplBase() {
+          @Override
+          public void getOrderState(GetOrderStateRequest request, StreamObserver<OrderState> out) {
+            stateRequests.add(request);
+            out.onNext(
+                OrderState.newBuilder()
+                    .setOrderId(orderId)
+                    .setInstrumentUid("instrument")
+                    .setDirection(OrderDirection.ORDER_DIRECTION_BUY)
+                    .setLotsRequested(3)
+                    .setLotsExecuted(3)
+                    .setExecutionReportStatus(
+                        OrderExecutionReportStatus.EXECUTION_REPORT_STATUS_FILL)
+                    .addStages(
+                        OrderStage.newBuilder()
+                            .setTradeId(rawTradeId)
+                            .setQuantity(3)
+                            .setExecutionTime(
+                                com.google.protobuf.Timestamp.newBuilder()
+                                    .setSeconds(executedAt.getEpochSecond())
+                                    .setNanos(executedAt.getNano()))
+                            .setPrice(MoneyValue.newBuilder().setCurrency("RUB").setUnits(100)))
+                    .build());
+            out.onCompleted();
+          }
+        };
+
+    try (var simulator =
+        BrokerTlsTestSupport.open(temporaryDirectory, stream, instruments, operations, orders)) {
+      var probe = new FeedJournalProbe(feed, clock);
+      try (var gateway =
+              BrokerTlsTestSupport.gateway(
+                  simulator.port(), clock, BrokerTlsTestSupport.NO_EVENTS);
+          var observation = gateway.observe(probe)) {
+        var live = subscriptions.poll(10, TimeUnit.SECONDS);
+        assertThat(live).isNotNull();
+        assertThat(probe.recoveryOutcomes.poll(10, TimeUnit.SECONDS)).isTrue();
+
+        historyVisible.set(true);
+        live.onNext(
+            TradesStreamResponse.newBuilder()
+                .setOrderTrades(
+                    OrderTrades.newBuilder()
+                        .setAccountId("source")
+                        .setOrderId(orderId)
+                        .setInstrumentUid("instrument")
+                        .setDirection(OrderDirection.ORDER_DIRECTION_BUY)
+                        .addTrades(
+                            OrderTrade.newBuilder()
+                                .setTradeId(rawTradeId)
+                                .setQuantity(30)
+                                .setPrice(Quotation.newBuilder().setUnits(100)))
+                        .build())
+                .build());
+
+        assertThat(probe.readSuccesses.poll(10, TimeUnit.SECONDS)).isTrue();
+        var recoveredAfterHistory = probe.recoveryOutcomes.poll(10, TimeUnit.SECONDS);
+        assertThat(recoveredAfterHistory)
+            .as("exact history stage should resolve the persisted R67 receipt")
+            .isTrue();
+        assertThat(stateRequests)
+            .as("the exact raw trade and source order identity are already known from the stream")
+            .isEmpty();
+        assertThat(control.status().reconciled())
+            .as("the initial subscription gap requires the fixture to reconcile before admission")
+            .isFalse();
+        control.markReconciled();
+        copies.retryPending();
+        var sourceRows =
+            db.queryForList(
+                "select source_order_id,disposition,accepted_sequence,executed_at from source_execution where account_id='source' and trade_id=?",
+                rawTradeId);
+        var receiptRows =
+            db.queryForList(
+                "select first_received from incoming_receipt where id=?",
+                CopyService.key("source", rawTradeId));
+        var acceptedRowCount =
+            db.queryForObject(
+                "select count(*) from source_execution where account_id='source' and trade_id=? and source_order_id=? and disposition='ACCEPTED' and accepted_sequence>0 and executed_at=?",
+                Integer.class,
+                rawTradeId,
+                orderId,
+                persistedAt);
+        assertThat(acceptedRowCount)
+            .as(
+                "expected one accepted exact R67 row; source rows=%s, receipts=%s, recovery=%s, remaining recoveries=%s, gaps=%s",
+                sourceRows,
+                receiptRows,
+                recoveredAfterHistory,
+                probe.recoveryOutcomes,
+                probe.gapReasons)
+            .isEqualTo(1);
+        assertThat(
+                db.queryForObject(
+                    "select count(*) from source_execution where account_id='source' and trade_id=?",
+                    Integer.class,
+                    rawTradeId))
+            .isEqualTo(1);
+        assertThat(
+                db.queryForObject(
+                    "select first_received from incoming_receipt where id=?",
+                    java.sql.Timestamp.class,
+                    CopyService.key("source", rawTradeId)))
+            .isEqualTo(persistedAt);
+        assertThat(
+                db.queryForObject("select feed_ready from control_state where id=1", Boolean.class))
+            .isTrue();
+        assertThat(probe.gapReasons)
+            .noneMatch(reason -> reason.contains("known source history execution"));
+      }
+    }
+  }
+
+  @Test
+  void equalHistoryFillsCompetingForCanonicalStagesStayInGapWithoutAdmission() throws Exception {
+    runningAtFive();
+    control.recalculate();
+    clock.now = clock.now.plusSeconds(1);
+    var executedAt = clock.instant();
+    var first = source("ambiguous-fingerprint-1", Side.BUY, 3, executedAt);
+    var second = source("ambiguous-fingerprint-2", Side.BUY, 3, executedAt);
+
+    assertThat(copies.accept(first).disposition()).isEqualTo("ACCEPTED");
+    assertThat(copies.accept(second).disposition()).isEqualTo("ACCEPTED");
+
+    var subscriptions = new LinkedBlockingQueue<Integer>();
+    var stream =
+        new OrdersStreamServiceGrpc.OrdersStreamServiceImplBase() {
+          volatile StreamObserver<TradesStreamResponse> live;
+          int count;
+
+          @Override
+          public void tradesStream(
+              TradesStreamRequest request, StreamObserver<TradesStreamResponse> out) {
+            live = out;
+            out.onNext(
+                TradesStreamResponse.newBuilder()
+                    .setSubscription(
+                        SubscriptionResponse.newBuilder()
+                            .setStatus(ResultSubscriptionStatus.RESULT_SUBSCRIPTION_STATUS_OK)
+                            .addAccounts("source"))
+                    .build());
+            subscriptions.add(++count);
+          }
+        };
+    var instruments =
+        new InstrumentsServiceGrpc.InstrumentsServiceImplBase() {
+          @Override
+          public void getInstrumentBy(
+              InstrumentRequest request, StreamObserver<InstrumentResponse> out) {
+            out.onNext(
+                InstrumentResponse.newBuilder()
+                    .setInstrument(
+                        ru.tinkoff.piapi.contract.v1.Instrument.newBuilder()
+                            .setUid("instrument")
+                            .setLot(10)
+                            .setCurrency("RUB")
+                            .setMinPriceIncrement(Quotation.newBuilder().setNano(10000000)))
+                    .build());
+            out.onCompleted();
+          }
+        };
+    var operations =
+        new OperationsServiceGrpc.OperationsServiceImplBase() {
+          @Override
+          public void getOperationsByCursor(
+              GetOperationsByCursorRequest request,
+              StreamObserver<GetOperationsByCursorResponse> out) {
+            out.onNext(
+                GetOperationsByCursorResponse.newBuilder()
+                    .addItems(
+                        OperationItem.newBuilder()
+                            .setId("operation-ambiguous")
+                            .setBrokerAccountId("source")
+                            .setInstrumentUid("instrument")
+                            .setType(OperationType.OPERATION_TYPE_BUY)
+                            .setTradesInfo(
+                                OperationItemTrades.newBuilder()
+                                    .addTrades(
+                                        OperationItemTrade.newBuilder()
+                                            .setNum("operation-trade-ambiguous")
+                                            .setQuantity(30)
+                                            .setDate(
+                                                com.google.protobuf.Timestamp.newBuilder()
+                                                    .setSeconds(executedAt.getEpochSecond())
+                                                    .setNanos(executedAt.getNano()))
+                                            .setPrice(
+                                                MoneyValue.newBuilder()
+                                                    .setCurrency("RUB")
+                                                    .setUnits(100)))
+                                    .addTrades(
+                                        OperationItemTrade.newBuilder()
+                                            .setNum("operation-trade-ambiguous-2")
+                                            .setQuantity(30)
+                                            .setDate(
+                                                com.google.protobuf.Timestamp.newBuilder()
+                                                    .setSeconds(executedAt.getEpochSecond())
+                                                    .setNanos(executedAt.getNano()))
+                                            .setPrice(
+                                                MoneyValue.newBuilder()
+                                                    .setCurrency("RUB")
+                                                    .setUnits(100)))))
+                    .build());
+            out.onCompleted();
+          }
+        };
+    var stateRequests = new LinkedBlockingQueue<GetOrderStateRequest>();
+    var orders =
+        new OrdersServiceGrpc.OrdersServiceImplBase() {
+          @Override
+          public void getOrderState(GetOrderStateRequest request, StreamObserver<OrderState> out) {
+            stateRequests.add(request);
+            out.onNext(
+                OrderState.newBuilder()
+                    .setOrderId("operation-ambiguous")
+                    .setInstrumentUid("instrument")
+                    .setDirection(OrderDirection.ORDER_DIRECTION_BUY)
+                    .setLotsRequested(6)
+                    .setLotsExecuted(6)
+                    .setExecutionReportStatus(
+                        OrderExecutionReportStatus.EXECUTION_REPORT_STATUS_FILL)
+                    .addStages(
+                        OrderStage.newBuilder()
+                            .setTradeId("canonical-trade-ambiguous")
+                            .setQuantity(3)
+                            .setExecutionTime(
+                                com.google.protobuf.Timestamp.newBuilder()
+                                    .setSeconds(executedAt.getEpochSecond())
+                                    .setNanos(executedAt.getNano()))
+                            .setPrice(MoneyValue.newBuilder().setCurrency("RUB").setUnits(100)))
+                    .addStages(
+                        OrderStage.newBuilder()
+                            .setTradeId("canonical-trade-ambiguous-2")
+                            .setQuantity(3)
+                            .setExecutionTime(
+                                com.google.protobuf.Timestamp.newBuilder()
+                                    .setSeconds(executedAt.getEpochSecond())
+                                    .setNanos(executedAt.getNano()))
+                            .setPrice(MoneyValue.newBuilder().setCurrency("RUB").setUnits(100)))
+                    .build());
+            out.onCompleted();
+          }
+        };
+
+    try (var simulator =
+        BrokerTlsTestSupport.open(temporaryDirectory, stream, instruments, operations, orders)) {
+      var probe = new FeedJournalProbe(feed);
+      try (var gateway =
+              BrokerTlsTestSupport.gateway(
+                  simulator.port(), clock, BrokerTlsTestSupport.NO_EVENTS);
+          var observation = gateway.observe(probe)) {
+        assertThat(subscriptions.poll(10, TimeUnit.SECONDS)).isEqualTo(1);
+        assertThat(probe.recoveryOutcomes.poll(10, TimeUnit.SECONDS)).isFalse();
+        assertThat(stateRequests)
+            .singleElement()
+            .satisfies(
+                request -> {
+                  assertThat(request.getAccountId()).isEqualTo("source");
+                  assertThat(request.getOrderId()).isEqualTo("operation-ambiguous");
+                });
+        assertThat(
+                db.queryForObject(
+                    "select count(*) from source_execution where trade_id in ('operation-trade-ambiguous','operation-trade-ambiguous-2','canonical-trade-ambiguous','canonical-trade-ambiguous-2')",
+                    Integer.class))
+            .isZero();
+        assertThat(
+                db.queryForObject(
+                    "select count(*) from source_execution where trade_id in ('ambiguous-fingerprint-1','ambiguous-fingerprint-2') and disposition='ACCEPTED' and accepted_sequence>0",
+                    Integer.class))
+            .isEqualTo(2);
+        assertThat(control.status().reconciled()).isFalse();
+        assertThat(probe.gapReasons)
+            .contains("Ambiguous or conflicting GetOrderState source history: operation-ambiguous");
+
+        stream.live.onNext(
+            TradesStreamResponse.newBuilder()
+                .setOrderTrades(
+                    OrderTrades.newBuilder()
+                        .setAccountId("source")
+                        .setOrderId("operation-ambiguous")
+                        .setInstrumentUid("instrument")
+                        .setDirection(OrderDirection.ORDER_DIRECTION_BUY)
+                        .addTrades(
+                            OrderTrade.newBuilder()
+                                .setTradeId("operation-trade-ambiguous")
+                                .setQuantity(30)
+                                .setPrice(Quotation.newBuilder().setUnits(100)))
+                        .build())
+                .build());
+        assertThat(probe.readSuccesses.poll(10, TimeUnit.SECONDS)).isTrue();
+        assertThat(probe.rememberedExecutions.poll(10, TimeUnit.SECONDS))
+            .extracting(SourceExecution::tradeId)
+            .isEqualTo("operation-trade-ambiguous");
+        assertThat(probe.recoveryOutcomes.poll(10, TimeUnit.SECONDS)).isFalse();
+        assertThat(stateRequests)
+            .hasSize(2)
+            .last()
+            .satisfies(
+                request -> assertThat(request.getOrderId()).isEqualTo("operation-ambiguous"));
+        assertThat(
+                db.queryForObject(
+                    "select count(*) from source_execution where trade_id='operation-trade-ambiguous' and disposition='RECEIVED' and executed_at is null and accepted_sequence=0",
+                    Integer.class))
+            .isEqualTo(1);
+        assertThat(
+                db.queryForObject(
+                    "select count(*) from source_execution where trade_id in ('canonical-trade-ambiguous','canonical-trade-ambiguous-2','operation-trade-ambiguous-2')",
+                    Integer.class))
+            .isZero();
+        assertThat(copies.intents()).hasSize(2);
+        assertThat(
+                db.queryForObject("select feed_ready from control_state where id=1", Boolean.class))
+            .isFalse();
+        assertThat(
+                db.queryForObject("select last_error from control_state where id=1", String.class))
+            .isNotBlank();
+        assertThat(broker.posts).isZero();
+      }
+    }
   }
 
   @Test
@@ -2519,6 +3986,159 @@ class CopyLifecycleIT {
     assertThat(copies.intents())
         .hasSize(2)
         .allSatisfy(i -> assertThat(i.status()).isEqualTo("WAITING"));
+  }
+
+  private static final class FeedJournalProbe implements ru.orbita.broker.SourceFeedJournal {
+    private final DurableSourceFeedJournal delegate;
+    private final MutableClock receiptClock;
+    private final LinkedBlockingQueue<Boolean> recoveryOutcomes = new LinkedBlockingQueue<>();
+    private final LinkedBlockingQueue<Boolean> readSuccesses = new LinkedBlockingQueue<>();
+    private final LinkedBlockingQueue<SourceExecution> rememberedExecutions =
+        new LinkedBlockingQueue<>();
+    private final LinkedBlockingQueue<String> gapReasons = new LinkedBlockingQueue<>();
+
+    private FeedJournalProbe(DurableSourceFeedJournal delegate) {
+      this(delegate, null);
+    }
+
+    private FeedJournalProbe(DurableSourceFeedJournal delegate, MutableClock receiptClock) {
+      this.delegate = delegate;
+      this.receiptClock = receiptClock;
+    }
+
+    @Override
+    public Instant observationBoundary() {
+      return delegate.observationBoundary();
+    }
+
+    @Override
+    public Optional<String> sourceOrderId(String accountId, String tradeId) {
+      return delegate.sourceOrderId(accountId, tradeId);
+    }
+
+    @Override
+    public Optional<SourceExecution> remembered(String accountId, String tradeId) {
+      return delegate.remembered(accountId, tradeId);
+    }
+
+    @Override
+    public ru.orbita.broker.SourceFeedJournal.AliasLookup sourceExecutionAlias(
+        SourceExecution rawExecution) {
+      return delegate.sourceExecutionAlias(rawExecution);
+    }
+
+    @Override
+    public List<SourceExecution> pendingTimestampRecovery() {
+      return delegate.pendingTimestampRecovery();
+    }
+
+    @Override
+    public Instant firstReceived(String accountId, String tradeId, Instant receivedAt) {
+      return delegate.firstReceived(accountId, tradeId, receivedAt);
+    }
+
+    @Override
+    public Instant firstReceived(
+        String accountId,
+        String tradeId,
+        Instant receivedAt,
+        ru.orbita.broker.SourceFeedJournal.TimeWindow capturedWindow) {
+      return delegate.firstReceived(accountId, tradeId, receivedAt, capturedWindow);
+    }
+
+    @Override
+    public Optional<ru.orbita.broker.SourceFeedJournal.TimeWindow> receiptTimeWindow(
+        String accountId, String tradeId) {
+      return delegate.receiptTimeWindow(accountId, tradeId);
+    }
+
+    @Override
+    public Optional<ru.orbita.broker.SourceFeedJournal.TimeWindow> currentTimeWindow() {
+      return delegate.currentTimeWindow();
+    }
+
+    @Override
+    public Optional<ru.orbita.broker.SourceFeedJournal.TimeWindow> arrivalTimeWindow(
+        long arrivedNanos, String clockDomain) {
+      if (receiptClock != null)
+        receiptClock.receiptInstants.put(arrivedNanos, receiptClock.instant());
+      return delegate.arrivalTimeWindow(arrivedNanos, clockDomain);
+    }
+
+    @Override
+    public void remember(SourceExecution execution) {
+      delegate.remember(execution);
+      rememberedExecutions.add(execution);
+    }
+
+    @Override
+    public void accept(SourceExecution execution) {
+      delegate.accept(execution);
+    }
+
+    @Override
+    public void acceptRecovered(SourceExecution execution) {
+      delegate.acceptRecovered(execution);
+    }
+
+    @Override
+    public boolean acceptRecovered(
+        SourceExecution rawExecution, SourceExecution canonicalExecution) {
+      return delegate.acceptRecovered(rawExecution, canonicalExecution);
+    }
+
+    @Override
+    public boolean acceptRecovered(
+        SourceExecution rawExecution, SourceExecution canonicalExecution, String canonicalTradeId) {
+      return delegate.acceptRecovered(rawExecution, canonicalExecution, canonicalTradeId);
+    }
+
+    @Override
+    public void skip(SourceExecution execution, String reason) {
+      delegate.skip(execution, reason);
+    }
+
+    @Override
+    public void gap(String reason) {
+      delegate.gap(reason);
+      gapReasons.add(reason);
+      if (isSourceRecoveryGap(reason)) recoveryOutcomes.add(false);
+    }
+
+    @Override
+    public void connectionLost(ru.orbita.broker.BrokerConnectivityEvents.Cause cause) {
+      delegate.connectionLost(cause);
+    }
+
+    @Override
+    public void readSucceeded() {
+      delegate.readSucceeded();
+      readSuccesses.add(true);
+    }
+
+    @Override
+    public void persistenceUnavailable() {
+      delegate.persistenceUnavailable();
+    }
+
+    private static boolean isSourceRecoveryGap(String reason) {
+      return reason.startsWith("Source order identity unresolved for history trade ")
+          || reason.startsWith("Ambiguous accepted source history fingerprint for trade ")
+          || reason.startsWith("GetOrderState source history")
+          || reason.startsWith("Conflicting known source history execution for trade ")
+          || reason.startsWith("Ambiguous or conflicting GetOrderState source history:");
+    }
+
+    @Override
+    public void recovered() {
+      delegate.recovered();
+      recoveryOutcomes.add(true);
+    }
+
+    @Override
+    public boolean supportsMirrorOrders() {
+      return false;
+    }
   }
 
   @TestConfiguration(proxyBeanMethods = false)

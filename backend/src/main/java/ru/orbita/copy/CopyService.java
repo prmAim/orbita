@@ -7,11 +7,13 @@ import java.util.*;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 import ru.orbita.broker.BrokerGateway.SourceExecution;
+import ru.orbita.broker.SourceFeedJournal;
 import ru.orbita.control.ControlService;
 import ru.orbita.control.OrbitaProperties;
 import ru.orbita.control.TimeAuthority;
 import ru.orbita.journal.JournalEntry;
 import ru.orbita.notifications.NotificationPublisher;
+import ru.orbita.persistence.PostgresTimestampPrecision;
 
 /**
  * Durable execution-input seam: receipt, acceptance and each lot decision are independent facts.
@@ -54,6 +56,97 @@ public class CopyService {
     return accept(source, true);
   }
 
+  public boolean acceptRecovered(SourceExecution raw, SourceExecution canonical) {
+    return acceptRecovered(raw, canonical, canonical.tradeId());
+  }
+
+  public boolean acceptRecovered(
+      SourceExecution raw, SourceExecution canonical, String canonicalTradeId) {
+    validate(canonical);
+    if (!aliasPairMatches(raw, canonical) || canonicalTradeId == null || canonicalTradeId.isBlank())
+      return false;
+    return tx.execute(
+        _ -> {
+          control.lockForSourceRecovery();
+          String fingerprint = aliasFingerprint(raw);
+          var rawAlias = findAlias(raw.accountId(), raw.tradeId());
+          var stageAlias = findAlias(raw.accountId(), canonicalTradeId);
+          if (!aliasMatches(rawAlias, canonicalTradeId, fingerprint)
+              || !aliasMatches(stageAlias, canonicalTradeId, fingerprint)) return false;
+
+          var rawEvent = em.find(SourceExecutionEntity.class, key(raw.accountId(), raw.tradeId()));
+          var stageEvent =
+              em.find(SourceExecutionEntity.class, key(raw.accountId(), canonicalTradeId));
+          if (rawAlias == null && stageAlias == null && rawEvent == null && stageEvent == null) {
+            if (!canonical.tradeId().equals(canonicalTradeId)
+                || !aliasTargetsAgree(raw.accountId(), canonicalTradeId, canonicalTradeId))
+              return false;
+            accept(canonical, true);
+            saveRecoveryAliases(raw, canonicalTradeId, canonicalTradeId, fingerprint);
+            return true;
+          }
+          String targetTradeId =
+              rawAlias != null
+                  ? rawAlias.executionTradeId
+                  : stageAlias != null
+                      ? stageAlias.executionTradeId
+                      : rawEvent != null
+                              && "RECEIVED".equals(rawEvent.disposition)
+                              && stageEvent != null
+                          ? stageEvent.tradeId
+                          : rawEvent != null ? rawEvent.tradeId : stageEvent.tradeId;
+          var targetEvent =
+              em.find(SourceExecutionEntity.class, key(raw.accountId(), targetTradeId));
+          if (targetEvent == null
+              || !(canonical.tradeId().equals(canonicalTradeId)
+                  || (rawAlias != null && canonical.tradeId().equals(targetTradeId)))
+              || !aliasEventMatches(targetEvent, canonical)
+              || !aliasTargetsAgree(raw.accountId(), canonicalTradeId, targetTradeId)) return false;
+
+          boolean mergeRawEvent = rawEvent != null && rawEvent != targetEvent;
+          if (mergeRawEvent
+              && (!"RECEIVED".equals(rawEvent.disposition)
+                  || rawEvent.acceptedSequence != 0
+                  || !aliasEventMatches(rawEvent, canonical))) return false;
+          if (stageEvent != null && stageEvent != targetEvent) return false;
+          if ("SKIPPED".equals(targetEvent.disposition))
+            return !mergeRawEvent
+                && ((rawAlias != null && stageAlias != null)
+                    || (targetTradeId.equals(raw.tradeId())
+                        && targetTradeId.equals(canonicalTradeId)))
+                && targetEvent.acceptedSequence == 0
+                && targetEvent.executedAt != null
+                && same(targetEvent, canonical);
+          if (!"ACCEPTED".equals(targetEvent.disposition)
+              && !"RECEIVED".equals(targetEvent.disposition)) return false;
+
+          if (mergeRawEvent) {
+            mergeReceiptId(
+                key(raw.accountId(), rawEvent.tradeId),
+                key(targetEvent.accountId, targetEvent.tradeId));
+            em.remove(rawEvent);
+            em.flush();
+          }
+          if ("RECEIVED".equals(targetEvent.disposition) && targetEvent.sourceOrderId.isBlank())
+            targetEvent.sourceOrderId = canonical.sourceOrderId();
+          var acceptedExecution =
+              new SourceExecution(
+                  canonical.accountId(),
+                  targetEvent.tradeId,
+                  canonical.sourceOrderId(),
+                  canonical.instrumentId(),
+                  canonical.side(),
+                  canonical.lots(),
+                  canonical.price(),
+                  canonical.currency(),
+                  canonical.executedAt(),
+                  targetEvent.receivedAt);
+          accept(acceptedExecution, true);
+          saveRecoveryAliases(raw, targetTradeId, canonicalTradeId, fingerprint);
+          return true;
+        });
+  }
+
   private Decision accept(SourceExecution source, boolean recoveryWindowProven) {
     validate(source);
     return tx.execute(
@@ -65,6 +158,7 @@ public class CopyService {
           String id = key(source.accountId(), source.tradeId());
           SourceExecutionEntity event = em.find(SourceExecutionEntity.class, id);
           if (event != null) {
+            event.currency = normalizeCurrency(event.currency);
             if (event.executedAt == null
                 && source.executedAt() != null
                 && sameExceptTime(event, source)) {
@@ -75,10 +169,10 @@ public class CopyService {
                     || (receipt != null
                         && receipt.firstEarliest != null
                         && current.isPresent()
-                        && !current
-                            .get()
-                            .latest()
-                            .isAfter(receipt.firstEarliest.plusSeconds(60)))) {
+                        && !PostgresTimestampPrecision.normalize(current.get().latest())
+                            .isAfter(
+                                PostgresTimestampPrecision.normalize(
+                                    receipt.firstEarliest.plusSeconds(60))))) {
                   event.executedAt = source.executedAt();
                   calculate(event, gate);
                 }
@@ -100,7 +194,7 @@ public class CopyService {
           event.side = source.side().name();
           event.lots = source.lots();
           event.price = source.price();
-          event.currency = source.currency();
+          event.currency = normalizeCurrency(source.currency());
           event.executedAt = source.executedAt();
           event.receivedAt = source.receivedAt();
           if (event.executedAt != null) {
@@ -110,7 +204,10 @@ public class CopyService {
                         Instant.class)
                     .setParameter("instrument", event.instrumentId)
                     .getSingleResult();
-            event.requiresRecovery = latest != null && event.executedAt.isBefore(latest);
+            event.requiresRecovery =
+                latest != null
+                    && PostgresTimestampPrecision.normalize(event.executedAt)
+                        .isBefore(PostgresTimestampPrecision.normalize(latest));
           }
           em.persist(event);
           if (event.requiresRecovery)
@@ -144,7 +241,9 @@ public class CopyService {
   private void calculate(SourceExecutionEntity event, ControlService.Gate gate) {
     Instant now = clock.instant();
     if (event.executedAt == null) return;
-    if (gate.boundary() == null || !event.executedAt.isAfter(gate.boundary())) {
+    Instant executedAt = PostgresTimestampPrecision.normalize(event.executedAt);
+    Instant boundary = PostgresTimestampPrecision.normalize(gate.boundary());
+    if (boundary == null || !executedAt.isAfter(boundary)) {
       skip(event, "Исполнение до границы наблюдения или возобновления");
       return;
     }
@@ -155,7 +254,12 @@ public class CopyService {
     if (gate.exactCoefficient() == null || gate.recalculationPaused() || !gate.reconciled()) return;
     TradePolicy.Age age =
         time.bound()
-            .map(bound -> TradePolicy.ageRange(event.executedAt, bound.earliest(), bound.latest()))
+            .map(
+                bound ->
+                    TradePolicy.ageRange(
+                        executedAt,
+                        PostgresTimestampPrecision.normalize(bound.earliest()),
+                        PostgresTimestampPrecision.normalize(bound.latest())))
             .orElse(TradePolicy.Age.WAIT_FOR_TIME);
     if (age == TradePolicy.Age.WAIT_FOR_TIME) return;
     if (age != TradePolicy.Age.ALLOWED) {
@@ -290,19 +394,172 @@ public class CopyService {
     return tx.execute(
         _ ->
             Optional.ofNullable(em.find(SourceExecutionEntity.class, key(account, trade)))
-                .map(
-                    e ->
-                        new SourceExecution(
-                            e.accountId,
-                            e.tradeId,
-                            e.sourceOrderId,
-                            e.instrumentId,
-                            ru.orbita.broker.BrokerGateway.Side.valueOf(e.side),
-                            e.lots,
-                            e.price,
-                            e.currency,
-                            e.executedAt,
-                            e.receivedAt)));
+                .map(CopyService::sourceExecution));
+  }
+
+  public SourceFeedJournal.AliasLookup sourceExecutionAlias(SourceExecution raw) {
+    return tx.execute(
+        _ -> {
+          var alias =
+              em.find(
+                  SourceExecutionAliasEntity.class,
+                  new SourceExecutionAliasId(raw.accountId(), raw.tradeId()));
+          if (alias == null)
+            return new SourceFeedJournal.AliasLookup(
+                SourceFeedJournal.AliasStatus.NONE, null, null);
+          if (!alias.fingerprint.equals(aliasFingerprint(raw)))
+            return new SourceFeedJournal.AliasLookup(
+                SourceFeedJournal.AliasStatus.CONFLICT, null, null);
+          var stageAlias = findAlias(raw.accountId(), alias.canonicalTradeId);
+          if (stageAlias == null
+              || !stageAlias.canonicalTradeId.equals(alias.canonicalTradeId)
+              || !stageAlias.executionTradeId.equals(alias.executionTradeId)
+              || !stageAlias.fingerprint.equals(alias.fingerprint)
+              || !aliasTargetsAgree(
+                  raw.accountId(), alias.canonicalTradeId, alias.executionTradeId))
+            return new SourceFeedJournal.AliasLookup(
+                SourceFeedJournal.AliasStatus.CONFLICT, null, null);
+          var canonical =
+              em.find(SourceExecutionEntity.class, key(raw.accountId(), alias.executionTradeId));
+          if (canonical == null
+              || canonical.sourceOrderId == null
+              || canonical.sourceOrderId.isBlank()
+              || !aliasEventMatches(canonical, raw)
+              || !("ACCEPTED".equals(canonical.disposition)
+                  || "RECEIVED".equals(canonical.disposition)
+                  || ("SKIPPED".equals(canonical.disposition)
+                      && canonical.acceptedSequence == 0
+                      && canonical.executedAt != null)))
+            return new SourceFeedJournal.AliasLookup(
+                SourceFeedJournal.AliasStatus.CONFLICT, null, null);
+          return new SourceFeedJournal.AliasLookup(
+              SourceFeedJournal.AliasStatus.MATCH,
+              sourceExecution(canonical),
+              alias.canonicalTradeId);
+        });
+  }
+
+  private SourceExecutionAliasEntity findAlias(String account, String aliasTradeId) {
+    return em.find(
+        SourceExecutionAliasEntity.class, new SourceExecutionAliasId(account, aliasTradeId));
+  }
+
+  private boolean aliasMatches(
+      SourceExecutionAliasEntity alias, String canonicalTradeId, String fingerprint) {
+    return alias == null
+        || (alias.canonicalTradeId.equals(canonicalTradeId)
+            && alias.fingerprint.equals(fingerprint));
+  }
+
+  private boolean aliasTargetsAgree(
+      String account, String canonicalTradeId, String executionTradeId) {
+    var targets =
+        em.createQuery(
+                "select distinct a.executionTradeId from SourceExecutionAliasEntity a where a.id.accountId=:account and a.canonicalTradeId=:canonicalTradeId",
+                String.class)
+            .setParameter("account", account)
+            .setParameter("canonicalTradeId", canonicalTradeId)
+            .setMaxResults(2)
+            .getResultList();
+    return targets.stream().allMatch(executionTradeId::equals);
+  }
+
+  private void saveRecoveryAliases(
+      SourceExecution raw, String targetTradeId, String canonicalTradeId, String fingerprint) {
+    saveAlias(raw.accountId(), raw.tradeId(), targetTradeId, canonicalTradeId, fingerprint);
+    if (!canonicalTradeId.equals(raw.tradeId()))
+      saveAlias(raw.accountId(), canonicalTradeId, targetTradeId, canonicalTradeId, fingerprint);
+  }
+
+  private void saveAlias(
+      String account,
+      String aliasTradeId,
+      String executionTradeId,
+      String canonicalTradeId,
+      String fingerprint) {
+    if (findAlias(account, aliasTradeId) != null) return;
+    em.persist(
+        new SourceExecutionAliasEntity(
+            account, aliasTradeId, executionTradeId, canonicalTradeId, fingerprint));
+  }
+
+  private void mergeReceiptId(String fromId, String toId) {
+    if (fromId.equals(toId)) return;
+    var from = em.find(IncomingReceipt.class, fromId);
+    if (from == null) return;
+    var to = em.find(IncomingReceipt.class, toId);
+    if (to == null) {
+      var replacement = new IncomingReceipt(toId, from.firstReceived);
+      replacement.firstEarliest = from.firstEarliest;
+      replacement.firstLatest = from.firstLatest;
+      em.remove(from);
+      em.flush();
+      em.persist(replacement);
+      return;
+    }
+    if (from.firstReceived.isBefore(to.firstReceived)) {
+      to.firstReceived = from.firstReceived;
+      to.firstEarliest = from.firstEarliest;
+      to.firstLatest = from.firstLatest;
+    }
+    em.remove(from);
+  }
+
+  private static boolean aliasEventMatches(SourceExecutionEntity event, SourceExecution execution) {
+    return event.accountId.equals(execution.accountId())
+        && (knownOrderMatches(execution.sourceOrderId(), event.sourceOrderId)
+            || ("RECEIVED".equals(event.disposition) && event.sourceOrderId.isBlank()))
+        && event.instrumentId.equals(execution.instrumentId())
+        && event.side.equals(execution.side().name())
+        && event.lots.compareTo(execution.lots()) == 0
+        && event.price.compareTo(execution.price()) == 0
+        && event.currency.equalsIgnoreCase(execution.currency())
+        && (event.executedAt == null
+            || Objects.equals(
+                PostgresTimestampPrecision.normalize(event.executedAt),
+                PostgresTimestampPrecision.normalize(execution.executedAt())));
+  }
+
+  private static boolean aliasPairMatches(SourceExecution raw, SourceExecution canonical) {
+    return raw != null
+        && raw.accountId().equals(canonical.accountId())
+        && !raw.tradeId().isBlank()
+        && knownOrderMatches(raw.sourceOrderId(), canonical.sourceOrderId())
+        && raw.instrumentId().equals(canonical.instrumentId())
+        && raw.side() == canonical.side()
+        && raw.lots().compareTo(canonical.lots()) == 0
+        && raw.price().compareTo(canonical.price()) == 0
+        && raw.currency().equalsIgnoreCase(canonical.currency())
+        && Objects.equals(
+            PostgresTimestampPrecision.normalize(raw.executedAt()),
+            PostgresTimestampPrecision.normalize(canonical.executedAt()));
+  }
+
+  private static boolean knownOrderMatches(String incoming, String stored) {
+    return incoming != null && (incoming.isBlank() || incoming.equals(stored));
+  }
+
+  private static String aliasFingerprint(SourceExecution execution) {
+    try {
+      var digest = java.security.MessageDigest.getInstance("SHA-256");
+      var values =
+          List.of(
+              execution.accountId(),
+              execution.instrumentId(),
+              execution.side().name(),
+              execution.lots().stripTrailingZeros().toPlainString(),
+              execution.price().stripTrailingZeros().toPlainString(),
+              execution.currency().toUpperCase(Locale.ROOT),
+              execution.executedAt() == null ? "" : execution.executedAt().toString());
+      for (String value : values) {
+        byte[] encoded = value.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        digest.update(java.nio.ByteBuffer.allocate(Integer.BYTES).putInt(encoded.length).array());
+        digest.update(encoded);
+      }
+      return HexFormat.of().formatHex(digest.digest());
+    } catch (java.security.NoSuchAlgorithmException impossible) {
+      throw new IllegalStateException("SHA-256 is unavailable", impossible);
+    }
   }
 
   public void skipSource(SourceExecution source, String reason) {
@@ -327,6 +584,20 @@ public class CopyService {
     return new Decision(event.id, event.disposition, event.coefficient, event.newLots);
   }
 
+  private static SourceExecution sourceExecution(SourceExecutionEntity e) {
+    return new SourceExecution(
+        e.accountId,
+        e.tradeId,
+        e.sourceOrderId,
+        e.instrumentId,
+        ru.orbita.broker.BrokerGateway.Side.valueOf(e.side),
+        e.lots,
+        e.price,
+        e.currency,
+        e.executedAt,
+        e.receivedAt);
+  }
+
   private void validate(SourceExecution e) {
     if (!Objects.equals(properties.sourceAccount(), e.accountId())
         || e.tradeId() == null
@@ -346,7 +617,10 @@ public class CopyService {
   }
 
   private static boolean same(SourceExecutionEntity e, SourceExecution other) {
-    return sameExceptTime(e, other) && Objects.equals(e.executedAt, other.executedAt());
+    return sameExceptTime(e, other)
+        && Objects.equals(
+            PostgresTimestampPrecision.normalize(e.executedAt),
+            PostgresTimestampPrecision.normalize(other.executedAt()));
   }
 
   private static boolean sameExceptTime(SourceExecutionEntity e, SourceExecution other) {
@@ -355,6 +629,10 @@ public class CopyService {
         && e.side.equals(other.side().name())
         && e.lots.compareTo(other.lots()) == 0
         && e.price.compareTo(other.price()) == 0
-        && e.currency.equals(other.currency());
+        && e.currency.equalsIgnoreCase(other.currency());
+  }
+
+  private static String normalizeCurrency(String currency) {
+    return currency.toUpperCase(Locale.ROOT);
   }
 }
