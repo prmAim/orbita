@@ -4024,20 +4024,44 @@ class CopyLifecycleIT {
   void failedDurableBrokerObservationStopsTheWholeDispatchTickBeforeAnotherReadyIntent() {
     runningAtFive();
     clock.now = clock.now.plusSeconds(1);
-    copies.accept(source("observer-first", Side.BUY, 1, clock.instant()));
+    copies.accept(source("observer-first", "failing-probe", Side.BUY, 1, clock.instant()));
     clock.now = clock.now.plusSeconds(1);
-    copies.accept(source("observer-second", Side.BUY, 1, clock.instant()));
-    var first = new java.util.concurrent.atomic.AtomicBoolean(true);
-    broker.resourcesHook =
-        () -> {
-          if (first.getAndSet(false))
-            throw new ru.orbita.broker.BrokerPersistenceFailure(
-                "fixture observation",
-                new org.springframework.dao.DataAccessResourceFailureException(
-                    "fixture unavailable database"));
+    copies.accept(source("observer-second", "ready-peer", Side.BUY, 1, clock.instant()));
+    var serialRefresh = new java.util.concurrent.CountDownLatch(1);
+    var probesCompleted = new java.util.concurrent.CountDownLatch(2);
+    var readyReads = new java.util.concurrent.atomic.AtomicInteger();
+    var persistenceFault =
+        new ru.orbita.broker.BrokerPersistenceFailure(
+            "fixture observation",
+            new org.springframework.dao.DataAccessResourceFailureException(
+                "fixture unavailable database"));
+    tradingTarget().readinessTaskCompletedHook = probesCompleted::countDown;
+    broker.resourcesRequestHook =
+        request -> {
+          try {
+            if (request.instrumentId().equals("failing-probe")) {
+              if (!serialRefresh.await(3, TimeUnit.SECONDS))
+                throw new AssertionError("Ready peer did not reach serial resource refresh");
+              throw persistenceFault;
+            }
+            if (readyReads.incrementAndGet() == 2) {
+              serialRefresh.countDown();
+              if (!probesCompleted.await(3, TimeUnit.SECONDS))
+                throw new AssertionError("Readiness probes did not finish before dispatch");
+            }
+          } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(interrupted);
+          }
         };
-    org.assertj.core.api.Assertions.assertThatThrownBy(trading::dispatchReady)
-        .isInstanceOf(ru.orbita.broker.BrokerPersistenceFailure.class);
+    try {
+      org.assertj.core.api.Assertions.assertThatThrownBy(trading::dispatchReady)
+          .isSameAs(persistenceFault);
+    } finally {
+      serialRefresh.countDown();
+      broker.resourcesRequestHook = null;
+      tradingTarget().readinessTaskCompletedHook = () -> {};
+    }
     assertThat(broker.posts).isZero();
     assertThat(copies.intents())
         .hasSize(2)
