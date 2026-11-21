@@ -54,6 +54,15 @@ public class DurableSourceFeedJournal implements SourceFeedJournal {
   }
 
   @Override
+  public <T> T withStreamAdmission(java.util.function.Supplier<T> admission) {
+    return tx.execute(
+        _ -> {
+          control.lockForSourceRecovery();
+          return admission.get();
+        });
+  }
+
+  @Override
   public AliasLookup sourceExecutionAlias(BrokerGateway.SourceExecution rawExecution) {
     return copies.sourceExecutionAlias(rawExecution);
   }

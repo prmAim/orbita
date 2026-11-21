@@ -8,6 +8,7 @@ import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -229,54 +230,84 @@ final class SourceExecutionFeed implements AutoCloseable {
               instrument.currency(),
               executed,
               arrivedAt);
-      var alias = journal.sourceExecutionAlias(incoming);
-      if (alias.status() != SourceFeedJournal.AliasStatus.NONE) {
-        if (alias.status() == SourceFeedJournal.AliasStatus.CONFLICT
-            || !samePersistedHistoryExecution(incoming, alias.execution())) {
-          journal.gap("Conflicting durable source execution alias for trade " + trade.getTradeId());
-        }
-        continue;
-      }
-      var previous = journal.remembered(source, trade.getTradeId());
-      Instant received =
-          journal.firstReceived(source, trade.getTradeId(), arrivedAt, capturedWindow);
-      var execution =
-          new BrokerGateway.SourceExecution(
-              incoming.accountId(),
-              incoming.tradeId(),
-              incoming.sourceOrderId(),
-              incoming.instrumentId(),
-              incoming.side(),
-              incoming.lots(),
-              incoming.price(),
-              incoming.currency(),
-              incoming.executedAt(),
-              received);
-      if (executed == null) {
-        if (previous.isPresent() && previous.get().executedAt() != null) continue;
-        journal.remember(execution);
-        pending.putIfAbsent(execution.tradeId(), execution);
+      var timestampUpdate =
+          journal.withStreamAdmission(() -> recordStreamExecution(incoming, capturedWindow));
+      if (timestampUpdate.isEmpty()) continue;
+      var observation = timestampUpdate.get();
+      if (observation.executedAt() == null) {
+        pending.putIfAbsent(incoming.tradeId(), observation);
         recover();
-      } else if (previous.isPresent() && previous.get().executedAt() == null) {
-        switch (searchWindow(execution)) {
-          case WITHIN -> {
-            journal.acceptRecovered(execution);
-            pending.remove(execution.tradeId());
-          }
-          case EXPIRED -> {
-            journal.skip(previous.get(), "Source timestamp recovery expired");
-            pending.remove(execution.tradeId());
-          }
-          case UNKNOWN ->
-              journal.gap(
-                  "Original timestamp recovery window cannot be established "
-                      + execution.tradeId());
-        }
-      } else {
-        journal.remember(execution);
-        journal.accept(execution);
-      }
+      } else pending.remove(incoming.tradeId());
     }
+  }
+
+  /** Returns a pending or resolved timestamp observation after its durable admission. */
+  private Optional<BrokerGateway.SourceExecution> recordStreamExecution(
+      BrokerGateway.SourceExecution incoming, SourceFeedJournal.TimeWindow capturedWindow) {
+    var alias = journal.sourceExecutionAlias(incoming);
+    if (alias.status() != SourceFeedJournal.AliasStatus.NONE) {
+      if (alias.status() == SourceFeedJournal.AliasStatus.CONFLICT
+          || !sameStreamReplay(incoming, alias.execution())) {
+        journal.gap("Conflicting durable source execution alias for trade " + incoming.tradeId());
+        return Optional.empty();
+      }
+      return Optional.of(alias.execution());
+    }
+    var previous = journal.remembered(source, incoming.tradeId());
+    if (incoming.executedAt() == null
+        && previous.isPresent()
+        && previous.get().executedAt() != null) {
+      if (!sameStreamReplay(incoming, previous.get())) {
+        journal.gap("Conflicting known source stream execution for trade " + incoming.tradeId());
+        return Optional.empty();
+      }
+      return previous;
+    }
+    Instant received =
+        journal.firstReceived(source, incoming.tradeId(), incoming.receivedAt(), capturedWindow);
+    var execution =
+        new BrokerGateway.SourceExecution(
+            incoming.accountId(),
+            incoming.tradeId(),
+            incoming.sourceOrderId(),
+            incoming.instrumentId(),
+            incoming.side(),
+            incoming.lots(),
+            incoming.price(),
+            incoming.currency(),
+            incoming.executedAt(),
+            received);
+    if (execution.executedAt() == null) {
+      journal.remember(execution);
+      return Optional.of(execution);
+    } else if (previous.isPresent() && previous.get().executedAt() == null) {
+      switch (searchWindow(execution)) {
+        case WITHIN -> {
+          journal.acceptRecovered(execution);
+          return Optional.of(execution);
+        }
+        case EXPIRED -> {
+          journal.skip(previous.get(), "Source timestamp recovery expired");
+          return Optional.of(execution);
+        }
+        case UNKNOWN ->
+            journal.gap(
+                "Original timestamp recovery window cannot be established " + execution.tradeId());
+      }
+    } else {
+      journal.remember(execution);
+      journal.accept(execution);
+    }
+    return Optional.empty();
+  }
+
+  private static boolean sameStreamReplay(
+      BrokerGateway.SourceExecution incoming, BrokerGateway.SourceExecution stored) {
+    return incoming.executedAt() == null
+        ? stored.executedAt() != null
+            && incoming.sourceOrderId().equals(stored.sourceOrderId())
+            && sameHistoryFieldsExceptTime(incoming, stored)
+        : samePersistedHistoryExecution(incoming, stored);
   }
 
   private void recover() {
@@ -294,6 +325,7 @@ final class SourceExecutionFeed implements AutoCloseable {
       journal.skip(execution, "Source timestamp recovery expired");
       pending.remove(execution.tradeId());
     }
+    if (historyRetryPending && System.nanoTime() - historyRetryAtNanos < 0) return;
     var history = gateway.history(boundary, clock.instant());
     boolean complete = history.complete();
     for (String gap : history.gaps()) journal.gap(gap);
@@ -305,7 +337,7 @@ final class SourceExecutionFeed implements AutoCloseable {
         new LinkedHashMap<String, java.util.List<BrokerGateway.SourceHistoryCandidate>>();
     var unresolvedByOperationId =
         new LinkedHashMap<String, java.util.List<BrokerGateway.SourceHistoryCandidate>>();
-    boolean retryableHistoryFailure = false;
+    boolean retryableHistoryFailure = history.retryableFailure();
     Instant lookupThrough = clock.instant();
     Instant lookupFrom = lookupThrough.minusSeconds(60);
     resolvedHistoryByOperationId
@@ -427,11 +459,10 @@ final class SourceExecutionFeed implements AutoCloseable {
       } else {
         resolution = cached.resolution();
       }
+      retryableHistoryFailure |= resolution.retryableFailure();
       for (String gap : resolution.gaps()) {
         journal.gap(gap);
         complete = false;
-        if (gap.startsWith("GetOrderState source history unavailable or invalid: "))
-          retryableHistoryFailure = true;
       }
       if (resolution.gaps().isEmpty()
           && resolution.executions().size() != entry.getValue().size()) {
@@ -728,7 +759,8 @@ final class SourceExecutionFeed implements AutoCloseable {
       if (nowNanos - (acknowledged ? lastFrameNanos : connectedAtNanos) > maximum) {
         if (acknowledged) journal.connectionLost(BrokerConnectivityEvents.Cause.HEARTBEAT_TIMEOUT);
         disconnect("Source acknowledgement/heartbeat deadline exceeded");
-      } else if (!pending.isEmpty() || (historyRetryPending && nowNanos >= historyRetryAtNanos))
+      } else if (acknowledged
+          && (!pending.isEmpty() || (historyRetryPending && nowNanos - historyRetryAtNanos >= 0)))
         recover();
     } catch (BrokerPersistenceFailure failure) {
       journal.persistenceUnavailable();

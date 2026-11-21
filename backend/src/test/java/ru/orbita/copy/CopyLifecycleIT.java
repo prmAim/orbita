@@ -1299,7 +1299,6 @@ class CopyLifecycleIT {
             "RUB",
             executedAt,
             executedAt);
-    assertThat(copies.acceptRecovered(rawAlias, canonical, canonical.tradeId())).isTrue();
     int intentCount = copies.intents().size();
 
     var subscriptions = new LinkedBlockingQueue<StreamObserver<TradesStreamResponse>>();
@@ -1358,25 +1357,40 @@ class CopyLifecycleIT {
         assertThat(probe.gapReasons.poll(10, TimeUnit.SECONDS))
             .isEqualTo("Source subscription awaiting acknowledgement and history recovery");
         assertThat(probe.recoveryOutcomes.poll(10, TimeUnit.SECONDS)).isTrue();
-        live.onNext(
-            TradesStreamResponse.newBuilder()
-                .setOrderTrades(
-                    OrderTrades.newBuilder()
-                        .setAccountId("source")
-                        .setOrderId("operation-stream-conflict")
-                        .setInstrumentUid("instrument")
-                        .setDirection(OrderDirection.ORDER_DIRECTION_BUY)
-                        .addTrades(
-                            OrderTrade.newBuilder()
-                                .setTradeId("operation-stream-conflict-trade")
-                                .setQuantity(30)
-                                .setPrice(Quotation.newBuilder().setUnits(101))
-                                .setDateTime(
-                                    com.google.protobuf.Timestamp.newBuilder()
-                                        .setSeconds(executedAt.getEpochSecond())
-                                        .setNanos(executedAt.getNano())))
-                        .build())
-                .build());
+        feed.withStreamAdmission(
+            () -> {
+              assertThat(copies.acceptRecovered(rawAlias, canonical, canonical.tradeId())).isTrue();
+              int recoveryPid = db.queryForObject("select pg_backend_pid()", Integer.class);
+              live.onNext(
+                  TradesStreamResponse.newBuilder()
+                      .setOrderTrades(
+                          OrderTrades.newBuilder()
+                              .setAccountId("source")
+                              .setOrderId("operation-stream-conflict")
+                              .setInstrumentUid("instrument")
+                              .setDirection(OrderDirection.ORDER_DIRECTION_BUY)
+                              .addTrades(
+                                  OrderTrade.newBuilder()
+                                      .setTradeId("operation-stream-conflict-trade")
+                                      .setQuantity(30)
+                                      .setPrice(Quotation.newBuilder().setUnits(101))
+                                      .setDateTime(
+                                          com.google.protobuf.Timestamp.newBuilder()
+                                              .setSeconds(executedAt.getEpochSecond())
+                                              .setNanos(executedAt.getNano())))
+                              .build())
+                      .build());
+              org.awaitility.Awaitility.await()
+                  .pollInSameThread()
+                  .atMost(Duration.ofSeconds(10))
+                  .until(
+                      () ->
+                          db.queryForObject(
+                              "select exists(select 1 from pg_locks where not granted and ? = any(pg_blocking_pids(pid)))",
+                              Boolean.class,
+                              recoveryPid));
+              return null;
+            });
         live.onNext(
             TradesStreamResponse.newBuilder()
                 .setOrderTrades(
@@ -1413,6 +1427,7 @@ class CopyLifecycleIT {
             .anyMatch(
                 reason -> reason.contains("Conflicting durable source execution alias for trade"));
         assertThat(copies.intents()).hasSize(intentCount);
+        assertThat(db.queryForList("select id from incoming_receipt")).isEmpty();
         assertThat(control.status().reconciled()).isFalse();
         assertThat(broker.posts).isZero();
       }
@@ -1538,7 +1553,7 @@ class CopyLifecycleIT {
         assertThat(probe.recoveryOutcomes.poll(10, TimeUnit.SECONDS)).isTrue();
 
         historyVisible.set(true);
-        live.onNext(
+        var missingTimeFrame =
             TradesStreamResponse.newBuilder()
                 .setOrderTrades(
                     OrderTrades.newBuilder()
@@ -1552,7 +1567,8 @@ class CopyLifecycleIT {
                                 .setQuantity(30)
                                 .setPrice(Quotation.newBuilder().setUnits(100)))
                         .build())
-                .build());
+                .build();
+        live.onNext(missingTimeFrame);
 
         assertThat(probe.readSuccesses.poll(10, TimeUnit.SECONDS)).isTrue();
         var recoveredAfterHistory = probe.recoveryOutcomes.poll(10, TimeUnit.SECONDS);
@@ -1562,6 +1578,46 @@ class CopyLifecycleIT {
         assertThat(stateRequests)
             .as("the exact raw trade and source order identity are already known from the stream")
             .isEmpty();
+        assertThat(probe.streamAdmissions.poll(10, TimeUnit.SECONDS)).isTrue();
+        var wrongOrder =
+            new SourceExecution(
+                "source",
+                rawTradeId,
+                "wrong-order",
+                "instrument",
+                Side.BUY,
+                new BigDecimal("3"),
+                new BigDecimal("100"),
+                "RUB",
+                null,
+                clock.instant());
+        var wrongNanos =
+            new SourceExecution(
+                "source",
+                rawTradeId,
+                orderId,
+                "instrument",
+                Side.BUY,
+                new BigDecimal("3"),
+                new BigDecimal("100"),
+                "RUB",
+                executedAt.plusNanos(1),
+                clock.instant());
+        assertThat(feed.sourceExecutionAlias(wrongOrder).status())
+            .isEqualTo(ru.orbita.broker.SourceFeedJournal.AliasStatus.CONFLICT);
+        assertThat(feed.sourceExecutionAlias(wrongNanos).status())
+            .isEqualTo(ru.orbita.broker.SourceFeedJournal.AliasStatus.CONFLICT);
+        var beforeReplay = db.queryForMap("select * from source_execution");
+        assertThat(beforeReplay).containsEntry("disposition", "RECEIVED");
+        var receiptBeforeReplay = db.queryForMap("select * from incoming_receipt");
+        var gapsBeforeReplay = List.copyOf(probe.gapReasons);
+        live.onNext(missingTimeFrame);
+        assertThat(probe.streamAdmissions.poll(10, TimeUnit.SECONDS)).isTrue();
+        assertThat(db.queryForMap("select * from source_execution")).isEqualTo(beforeReplay);
+        assertThat(db.queryForMap("select * from incoming_receipt")).isEqualTo(receiptBeforeReplay);
+        assertThat(probe.gapReasons).containsExactlyElementsOf(gapsBeforeReplay);
+        assertThat(probe.recoveryOutcomes).isEmpty();
+        assertThat(copies.intents()).isEmpty();
         assertThat(control.status().reconciled())
             .as("the initial subscription gap requires the fixture to reconcile before admission")
             .isFalse();
@@ -3993,6 +4049,7 @@ class CopyLifecycleIT {
     private final MutableClock receiptClock;
     private final LinkedBlockingQueue<Boolean> recoveryOutcomes = new LinkedBlockingQueue<>();
     private final LinkedBlockingQueue<Boolean> readSuccesses = new LinkedBlockingQueue<>();
+    private final LinkedBlockingQueue<Boolean> streamAdmissions = new LinkedBlockingQueue<>();
     private final LinkedBlockingQueue<SourceExecution> rememberedExecutions =
         new LinkedBlockingQueue<>();
     private final LinkedBlockingQueue<String> gapReasons = new LinkedBlockingQueue<>();
@@ -4019,6 +4076,13 @@ class CopyLifecycleIT {
     @Override
     public Optional<SourceExecution> remembered(String accountId, String tradeId) {
       return delegate.remembered(accountId, tradeId);
+    }
+
+    @Override
+    public <T> T withStreamAdmission(java.util.function.Supplier<T> admission) {
+      T result = delegate.withStreamAdmission(admission);
+      streamAdmissions.add(true);
+      return result;
     }
 
     @Override

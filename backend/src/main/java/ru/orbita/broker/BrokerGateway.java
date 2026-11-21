@@ -303,11 +303,21 @@ public interface BrokerGateway extends AutoCloseable {
       List<String> gaps,
       Instant fromInclusive,
       Instant throughInclusive,
-      List<SourceHistoryCandidate> sourceCandidates) {
+      List<SourceHistoryCandidate> sourceCandidates,
+      boolean retryableFailure) {
     public History {
       executions = List.copyOf(executions);
       gaps = List.copyOf(gaps);
       sourceCandidates = List.copyOf(sourceCandidates);
+    }
+
+    public History(
+        List<SourceExecution> executions,
+        List<String> gaps,
+        Instant fromInclusive,
+        Instant throughInclusive,
+        List<SourceHistoryCandidate> sourceCandidates) {
+      this(executions, gaps, fromInclusive, throughInclusive, sourceCandidates, false);
     }
 
     public History(
@@ -323,10 +333,15 @@ public interface BrokerGateway extends AutoCloseable {
     }
   }
 
-  record SourceHistoryResolution(List<SourceExecution> executions, List<String> gaps) {
+  record SourceHistoryResolution(
+      List<SourceExecution> executions, List<String> gaps, boolean retryableFailure) {
     public SourceHistoryResolution {
       executions = List.copyOf(executions);
       gaps = List.copyOf(gaps);
+    }
+
+    public SourceHistoryResolution(List<SourceExecution> executions, List<String> gaps) {
+      this(executions, gaps, false);
     }
   }
 

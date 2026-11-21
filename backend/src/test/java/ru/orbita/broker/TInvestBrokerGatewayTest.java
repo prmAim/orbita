@@ -390,6 +390,7 @@ class TInvestBrokerGatewayTest {
     var delivered = new java.util.concurrent.LinkedBlockingQueue<String>();
     var ready = new java.util.concurrent.LinkedBlockingQueue<Boolean>();
     var skipped = new java.util.concurrent.LinkedBlockingQueue<String>();
+    var terminalTradeIds = java.util.concurrent.ConcurrentHashMap.<String>newKeySet();
     var unqualifiedWindow = new java.util.concurrent.CountDownLatch(1);
     var stream =
         new OrdersStreamServiceGrpc.OrdersStreamServiceImplBase() {
@@ -485,7 +486,7 @@ class TInvestBrokerGatewayTest {
           public java.util.List<BrokerGateway.SourceExecution> pendingTimestampRecovery() {
             return remembered.values().stream()
                 .filter(e -> e.executedAt() == null)
-                .filter(e -> !skipped.contains(e.tradeId()))
+                .filter(e -> !terminalTradeIds.contains(e.tradeId()))
                 .toList();
           }
 
@@ -537,6 +538,7 @@ class TInvestBrokerGatewayTest {
 
           public void skip(BrokerGateway.SourceExecution execution, String reason) {
             if (delayedProvider) {
+              terminalTradeIds.add(execution.tradeId());
               skipped.add(execution.tradeId());
               remembered.put(execution.tradeId(), execution);
             } else throw new AssertionError(reason);
@@ -597,15 +599,32 @@ class TInvestBrokerGatewayTest {
 
   @Test
   void reconnectRecoversRecentExecutionCreatedDuringGapFromCanonicalOrderStages() throws Exception {
-    observeGapWithCanonicalStages(false);
+    observeGapWithCanonicalStages(HistoryScenario.SUCCESS);
   }
 
   @Test
   void twoOrdersClaimingOneCanonicalStageStayInGapWithoutAdmittingEitherTrade() throws Exception {
-    observeGapWithCanonicalStages(true);
+    observeGapWithCanonicalStages(HistoryScenario.CONFLICTING_ORDERS);
   }
 
-  private void observeGapWithCanonicalStages(boolean conflictingOrders) throws Exception {
+  @Test
+  void operationsPageFailureDuringOrderStateRetryRecoversOnTheSameSubscription() throws Exception {
+    observeGapWithCanonicalStages(HistoryScenario.TRANSIENT_PAGE_FAILURE);
+  }
+
+  @Test
+  void pendingTimestampExpiresWhileOrderStateRetriesRespectBackoff() throws Exception {
+    observeGapWithCanonicalStages(HistoryScenario.PENDING_TIMESTAMP);
+  }
+
+  private enum HistoryScenario {
+    SUCCESS,
+    CONFLICTING_ORDERS,
+    TRANSIENT_PAGE_FAILURE,
+    PENDING_TIMESTAMP
+  }
+
+  private void observeGapWithCanonicalStages(HistoryScenario scenario) throws Exception {
     var nextFrameRead = new java.util.concurrent.CountDownLatch(1);
     var at = new java.util.concurrent.atomic.AtomicReference<java.time.Instant>();
     var boundary = java.time.Instant.now().minusSeconds(60);
@@ -616,6 +635,10 @@ class TInvestBrokerGatewayTest {
     var gaps = new java.util.concurrent.LinkedBlockingQueue<String>();
     var recovered = new java.util.concurrent.LinkedBlockingQueue<Boolean>();
     var stateRequests = new java.util.concurrent.LinkedBlockingQueue<GetOrderStateRequest>();
+    var stateAttempts = new java.util.concurrent.LinkedBlockingQueue<Long>();
+    var pendingWindowChecked = new java.util.concurrent.CountDownLatch(1);
+    var expirePending = new java.util.concurrent.atomic.AtomicBoolean();
+    var skipped = new java.util.concurrent.LinkedBlockingQueue<String>();
     var stream =
         new OrdersStreamServiceGrpc.OrdersStreamServiceImplBase() {
           volatile StreamObserver<TradesStreamResponse> live;
@@ -658,12 +681,18 @@ class TInvestBrokerGatewayTest {
         };
     var operations =
         new OperationsServiceGrpc.OperationsServiceImplBase() {
+          int visibleReads;
+
           @Override
           public void getOperationsByCursor(
               GetOperationsByCursorRequest request,
               StreamObserver<GetOperationsByCursorResponse> out) {
             var page = GetOperationsByCursorResponse.newBuilder();
             if (operationsVisible.get()) {
+              if (++visibleReads == 2 && scenario == HistoryScenario.TRANSIENT_PAGE_FAILURE) {
+                out.onError(Status.UNAVAILABLE.asRuntimeException());
+                return;
+              }
               var item =
                   OperationItem.newBuilder()
                       .setId("source-order-17")
@@ -683,7 +712,7 @@ class TInvestBrokerGatewayTest {
                                               .setUnits(101)
                                               .setNano(500000000))));
               page.addItems(item);
-              if (conflictingOrders) {
+              if (scenario == HistoryScenario.CONFLICTING_ORDERS) {
                 item.setId("source-order-18");
                 item.getTradesInfoBuilder().getTradesBuilder(0).setNum("operation-trade-18");
                 page.addItems(item);
@@ -695,9 +724,18 @@ class TInvestBrokerGatewayTest {
         };
     var orders =
         new OrdersServiceGrpc.OrdersServiceImplBase() {
+          int attempts;
+
           @Override
           public void getOrderState(GetOrderStateRequest request, StreamObserver<OrderState> out) {
             stateRequests.add(request);
+            stateAttempts.add(System.nanoTime());
+            attempts++;
+            if ((scenario == HistoryScenario.TRANSIENT_PAGE_FAILURE && attempts == 1)
+                || (scenario == HistoryScenario.PENDING_TIMESTAMP && attempts <= 2)) {
+              out.onError(Status.UNAVAILABLE.asRuntimeException());
+              return;
+            }
             out.onNext(
                 OrderState.newBuilder()
                     .setOrderId(request.getOrderId())
@@ -747,6 +785,16 @@ class TInvestBrokerGatewayTest {
             return List.of();
           }
 
+          public java.util.Optional<TimeWindow> receiptTimeWindow(String account, String trade) {
+            return java.util.Optional.of(new TimeWindow(boundary, boundary));
+          }
+
+          public java.util.Optional<TimeWindow> currentTimeWindow() {
+            var now = boundary.plusSeconds(expirePending.get() ? 61 : 1);
+            pendingWindowChecked.countDown();
+            return java.util.Optional.of(new TimeWindow(now, now));
+          }
+
           public java.time.Instant firstReceived(
               String account, String trade, java.time.Instant received) {
             return received;
@@ -763,7 +811,7 @@ class TInvestBrokerGatewayTest {
           }
 
           public void skip(BrokerGateway.SourceExecution execution, String reason) {
-            throw new AssertionError(reason);
+            skipped.add(execution.tradeId());
           }
 
           public void gap(String reason) {
@@ -791,7 +839,7 @@ class TInvestBrokerGatewayTest {
 
       assertThat(stream.subscriptions.poll(10, java.util.concurrent.TimeUnit.SECONDS)).isEqualTo(2);
       assertThat(at.get()).isAfter(disconnectAt.get()).isBefore(reconnectAt.get());
-      if (conflictingOrders) {
+      if (scenario == HistoryScenario.CONFLICTING_ORDERS) {
         assertThat(gaps.poll(10, java.util.concurrent.TimeUnit.SECONDS))
             .isEqualTo("Source subscription awaiting acknowledgement and history recovery");
         assertThat(gaps.poll(10, java.util.concurrent.TimeUnit.SECONDS))
@@ -814,6 +862,33 @@ class TInvestBrokerGatewayTest {
         assertThat(recovered).isEmpty();
         return;
       }
+      if (scenario == HistoryScenario.PENDING_TIMESTAMP) {
+        assertThat(stateAttempts.poll(10, java.util.concurrent.TimeUnit.SECONDS)).isNotNull();
+        var secondAttempt = stateAttempts.poll(10, java.util.concurrent.TimeUnit.SECONDS);
+        assertThat(secondAttempt).isNotNull();
+        stream.live.onNext(
+            TradesStreamResponse.newBuilder()
+                .setOrderTrades(
+                    OrderTrades.newBuilder()
+                        .setAccountId("source")
+                        .setOrderId("other-order")
+                        .setInstrumentUid("instrument-1")
+                        .setDirection(OrderDirection.ORDER_DIRECTION_BUY)
+                        .addTrades(
+                            OrderTrade.newBuilder()
+                                .setTradeId("missing-timestamp")
+                                .setQuantity(10)
+                                .setPrice(Quotation.newBuilder().setUnits(1))))
+                .build());
+        assertThat(pendingWindowChecked.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+        expirePending.set(true);
+        assertThat(skipped.poll(5, java.util.concurrent.TimeUnit.SECONDS))
+            .isEqualTo("missing-timestamp");
+        var thirdAttempt = stateAttempts.poll(5, java.util.concurrent.TimeUnit.SECONDS);
+        assertThat(thirdAttempt).isNotNull();
+        assertThat(thirdAttempt - secondAttempt)
+            .isGreaterThanOrEqualTo(java.util.concurrent.TimeUnit.SECONDS.toNanos(2));
+      }
       var execution = accepted.poll(10, java.util.concurrent.TimeUnit.SECONDS);
       assertThat(execution).isNotNull();
       assertThat(execution.accountId()).isEqualTo("source");
@@ -831,6 +906,12 @@ class TInvestBrokerGatewayTest {
       assertThat(lookup.getOrderId()).isEqualTo("source-order-17");
       assertThat(recovered.poll(10, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
       assertThat(accepted).isEmpty();
+      assertThat(stream.subscriptions).isEmpty();
+      if (scenario == HistoryScenario.TRANSIENT_PAGE_FAILURE) {
+        assertThat(operations.visibleReads).isEqualTo(3);
+        assertThat(orders.attempts).isEqualTo(2);
+        assertThat(gaps).contains("History page unavailable");
+      }
     }
   }
 

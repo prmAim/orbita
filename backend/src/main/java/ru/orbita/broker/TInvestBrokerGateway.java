@@ -602,6 +602,7 @@ public final class TInvestBrokerGateway implements BrokerGateway {
     if (from == null || through == null || from.isAfter(through))
       throw new IllegalArgumentException("Ordered history interval required");
     boolean sourceHistory = accountId.equals(sourceAccount);
+    boolean retryableFailure = false;
     var result = new java.util.LinkedHashMap<String, SourceExecution>();
     var gaps = new ArrayList<String>();
     var metadata = new java.util.HashMap<String, Instrument>();
@@ -644,6 +645,7 @@ public final class TInvestBrokerGateway implements BrokerGateway {
         } catch (BrokerPersistenceFailure failure) {
           throw failure;
         } catch (RuntimeException failure) {
+          retryableFailure |= retryableRead(failure);
           gaps.add("History page unavailable");
           break;
         }
@@ -703,10 +705,11 @@ public final class TInvestBrokerGateway implements BrokerGateway {
                       clock.instant());
               var previous = result.putIfAbsent(trade.getNum(), execution);
               if (previous == null) {
-                sourceCandidates.put(
-                    trade.getNum(),
-                    new SourceHistoryCandidate(
-                        item.getId(), execution, null, operationFingerprint));
+                if (sourceHistory)
+                  sourceCandidates.put(
+                      trade.getNum(),
+                      new SourceHistoryCandidate(
+                          item.getId(), execution, null, operationFingerprint));
               } else if (!previous.instrumentId().equals(execution.instrumentId())
                   || previous.side() != execution.side()
                   || previous.lots().compareTo(execution.lots()) != 0
@@ -730,6 +733,7 @@ public final class TInvestBrokerGateway implements BrokerGateway {
             } catch (BrokerPersistenceFailure failure) {
               throw failure;
             } catch (RuntimeException incomplete) {
+              retryableFailure |= retryableRead(incomplete);
               gaps.add("Incomplete history execution: " + trade.getNum());
             }
           }
@@ -757,12 +761,14 @@ public final class TInvestBrokerGateway implements BrokerGateway {
         gaps,
         from,
         through,
-        new ArrayList<>(sourceCandidates.values()));
+        new ArrayList<>(sourceCandidates.values()),
+        retryableFailure);
   }
 
   @Override
   public SourceHistoryResolution resolveRecentSourceHistory(
       List<SourceHistoryCandidate> candidates) {
+    boolean retryableFailure = false;
     var groups = new LinkedHashMap<String, List<SourceHistoryCandidate>>();
     var gaps = new ArrayList<String>();
     Instant now = clock.instant();
@@ -922,10 +928,11 @@ public final class TInvestBrokerGateway implements BrokerGateway {
       } catch (BrokerPersistenceFailure failure) {
         throw failure;
       } catch (RuntimeException unavailableOrInvalid) {
+        retryableFailure |= retryableRead(unavailableOrInvalid);
         gaps.add("GetOrderState source history unavailable or invalid: " + orderId);
       }
     }
-    return new SourceHistoryResolution(executions, gaps);
+    return new SourceHistoryResolution(executions, gaps, retryableFailure);
   }
 
   @Override
@@ -1235,13 +1242,20 @@ public final class TInvestBrokerGateway implements BrokerGateway {
     return new RpcReceipt<>(reply, receivedAt, receivedNanos);
   }
 
+  private static io.grpc.Status.Code grpcCode(RuntimeException failure) {
+    if (failure instanceof ServiceRuntimeException sdk) return sdk.getErrorType();
+    return io.grpc.Status.fromThrowable(failure).getCode();
+  }
+
+  private static boolean retryableRead(RuntimeException failure) {
+    return switch (grpcCode(failure)) {
+      case UNAVAILABLE, DEADLINE_EXCEEDED, RESOURCE_EXHAUSTED -> true;
+      default -> false;
+    };
+  }
+
   private void recordTransportFailure(RuntimeException failure) {
-    io.grpc.Status.Code code =
-        failure instanceof ServiceRuntimeException sdk
-            ? sdk.getErrorType()
-            : failure instanceof io.grpc.StatusRuntimeException grpc
-                ? grpc.getStatus().getCode()
-                : null;
+    io.grpc.Status.Code code = grpcCode(failure);
     BrokerConnectivityEvents.Cause cause =
         code == io.grpc.Status.Code.UNAVAILABLE
             ? BrokerConnectivityEvents.Cause.TRANSPORT_UNAVAILABLE

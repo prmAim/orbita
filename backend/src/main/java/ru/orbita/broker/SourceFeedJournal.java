@@ -35,7 +35,12 @@ public interface SourceFeedJournal {
 
   Optional<BrokerGateway.SourceExecution> remembered(String accountId, String tradeId);
 
-  /** Resolves a raw history trade ID only when its durable per-trade fingerprint is exact. */
+  /** Serializes one stream trade's durable lookup, receipt and admission with history recovery. */
+  default <T> T withStreamAdmission(java.util.function.Supplier<T> admission) {
+    return admission.get();
+  }
+
+  /** Exact history identity, or a known-order stream replay missing only the recovered time. */
   default AliasLookup sourceExecutionAlias(BrokerGateway.SourceExecution rawExecution) {
     return new AliasLookup(AliasStatus.NONE, null, null);
   }

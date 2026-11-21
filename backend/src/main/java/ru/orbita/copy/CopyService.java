@@ -407,7 +407,11 @@ public class CopyService {
           if (alias == null)
             return new SourceFeedJournal.AliasLookup(
                 SourceFeedJournal.AliasStatus.NONE, null, null);
-          if (!alias.fingerprint.equals(aliasFingerprint(raw)))
+          boolean missingStreamTime =
+              raw.executedAt() == null
+                  && raw.sourceOrderId() != null
+                  && !raw.sourceOrderId().isBlank();
+          if (!missingStreamTime && !alias.fingerprint.equals(aliasFingerprint(raw)))
             return new SourceFeedJournal.AliasLookup(
                 SourceFeedJournal.AliasStatus.CONFLICT, null, null);
           var stageAlias = findAlias(raw.accountId(), alias.canonicalTradeId);
@@ -424,7 +428,9 @@ public class CopyService {
           if (canonical == null
               || canonical.sourceOrderId == null
               || canonical.sourceOrderId.isBlank()
-              || !aliasEventMatches(canonical, raw)
+              || !(missingStreamTime
+                  ? canonical.executedAt != null && sameExceptTime(canonical, raw)
+                  : aliasEventMatches(canonical, raw))
               || !("ACCEPTED".equals(canonical.disposition)
                   || "RECEIVED".equals(canonical.disposition)
                   || ("SKIPPED".equals(canonical.disposition)
