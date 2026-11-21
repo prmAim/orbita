@@ -4,7 +4,6 @@ import static org.assertj.core.api.Assertions.*;
 
 import java.math.BigDecimal;
 import java.nio.file.Path;
-import java.time.Clock;
 import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
@@ -17,16 +16,11 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
-import org.springframework.boot.WebApplicationType;
-import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.context.ConfigurableApplicationContext;
-import org.springframework.context.support.GenericApplicationContext;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
-import ru.orbita.OrbitaApplication;
-import ru.orbita.broker.BrokerConnectivityEvents;
 import ru.orbita.broker.BrokerGateway;
 import ru.orbita.broker.BrokerGateway.*;
 import ru.orbita.broker.OrderSdkEvidence;
@@ -44,15 +38,6 @@ class BuyResourceRejectionWholeChainIT {
     MANUAL,
     PROTECTED_POSITION_MISMATCH
   }
-
-  private static final BrokerConnectivityEvents NO_EVENTS =
-      new BrokerConnectivityEvents() {
-        public void connectionLost(Cause cause) {}
-
-        public void readSucceeded() {}
-
-        public void restoredCopyOpened() {}
-      };
 
   @TempDir Path directory;
   private WholeChainBrokerSimulator bank;
@@ -653,59 +638,7 @@ class BuyResourceRejectionWholeChainIT {
   }
 
   private ConfigurableApplicationContext start() {
-    return new SpringApplicationBuilder(OrbitaApplication.class)
-        .web(WebApplicationType.NONE)
-        .registerShutdownHook(false)
-        .initializers(
-            context -> {
-              var registry = (GenericApplicationContext) context;
-              registry.registerBean(
-                  "wholeChainGateway",
-                  BrokerGateway.class,
-                  () -> {
-                    try {
-                      return bank.gateway(clock, NO_EVENTS);
-                    } catch (Exception failure) {
-                      throw new IllegalStateException("Local TLS gateway setup failed", failure);
-                    }
-                  },
-                  definition -> {
-                    definition.setPrimary(true);
-                    definition.setDestroyMethodName("close");
-                  });
-              registry.registerBean(
-                  "wholeChainClock",
-                  Clock.class,
-                  () -> clock,
-                  definition -> definition.setPrimary(true));
-              registry.registerBean(
-                  "wholeChainClockEvidence",
-                  ClockEvidence.class,
-                  () ->
-                      new ClockEvidence() {
-                        public Optional<Bound> current() {
-                          return Optional.of(
-                              new Bound(
-                                  clock.instant(), clock.instant(), "synthetic whole-chain clock"));
-                        }
-
-                        public Optional<Bound> atReceipt(long received) {
-                          return current();
-                        }
-                      },
-                  definition -> definition.setPrimary(true));
-            })
-        .run(
-            "--spring.datasource.url=" + POSTGRES.getJdbcUrl(),
-            "--spring.datasource.username=" + POSTGRES.getUsername(),
-            "--spring.datasource.password=" + POSTGRES.getPassword(),
-            "--orbita.source-account=" + WholeChainBrokerSimulator.SOURCE,
-            "--orbita.mirror-account=" + WholeChainBrokerSimulator.MIRROR,
-            "--orbita.margin-disabled-confirmed=true",
-            "--orbita.worker.enabled=false",
-            "--orbita.broker.enabled=false",
-            "--orbita.telegram.enabled=false",
-            "--orbita.backup.enabled=false");
+    return WholeChainTestApplication.start(POSTGRES, bank, clock);
   }
 
   private void closeApplication() throws Exception {

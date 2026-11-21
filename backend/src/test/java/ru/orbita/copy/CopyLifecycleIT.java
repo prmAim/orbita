@@ -4448,7 +4448,7 @@ class CopyLifecycleIT {
   }
 
   static class MutableClock extends Clock {
-    Instant now = Instant.parse("2026-11-15T10:00:00Z");
+    volatile Instant now = Instant.parse("2026-11-15T10:00:00Z");
     boolean evidenceAvailable = true;
     volatile Runnable nextEvidence;
     final Map<Long, Instant> receiptInstants = new java.util.concurrent.ConcurrentHashMap<>();
