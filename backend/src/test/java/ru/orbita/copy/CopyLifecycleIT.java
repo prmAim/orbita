@@ -366,6 +366,152 @@ class CopyLifecycleIT {
     assertThat(broker.posts).isEqualTo(1);
   }
 
+  private static InstrumentsServiceGrpc.InstrumentsServiceImplBase rubInstrumentWithTenUnitLot() {
+    return new InstrumentsServiceGrpc.InstrumentsServiceImplBase() {
+      @Override
+      public void getInstrumentBy(
+          InstrumentRequest request, StreamObserver<InstrumentResponse> out) {
+        out.onNext(
+            InstrumentResponse.newBuilder()
+                .setInstrument(
+                    ru.tinkoff.piapi.contract.v1.Instrument.newBuilder()
+                        .setUid("instrument")
+                        .setLot(10)
+                        .setCurrency("rub")
+                        .setMinPriceIncrement(Quotation.newBuilder().setNano(10000000)))
+                .build());
+        out.onCompleted();
+      }
+    };
+  }
+
+  @Test
+  void firstDiscoveryOnSecondPageAfterSixtyOneSecondGapRemainsUnresolvedOnReplay()
+      throws Exception {
+    runningAtFive();
+    clock.now = clock.now.plusSeconds(1);
+    Instant disconnectedAt = clock.instant();
+    Instant tradedAt = disconnectedAt.plusMillis(500);
+    Instant reconnectedAt = disconnectedAt.plusSeconds(61);
+    String tradeId = "late-page-two-trade";
+    String secondPage = "source-page-two";
+    var historyTrade =
+        OperationItem.newBuilder()
+            .setId("history-operation")
+            .setBrokerAccountId("source")
+            .setInstrumentUid("instrument")
+            .setType(OperationType.OPERATION_TYPE_BUY)
+            .setTradesInfo(
+                OperationItemTrades.newBuilder()
+                    .addTrades(
+                        OperationItemTrade.newBuilder()
+                            .setNum(tradeId)
+                            .setQuantity(30)
+                            .setDate(
+                                com.google.protobuf.Timestamp.newBuilder()
+                                    .setSeconds(tradedAt.getEpochSecond())
+                                    .setNanos(tradedAt.getNano()))
+                            .setPrice(MoneyValue.newBuilder().setCurrency("rub").setUnits(101))))
+            .build();
+    var subscriptions = new LinkedBlockingQueue<StreamObserver<TradesStreamResponse>>();
+    var stream =
+        new OrdersStreamServiceGrpc.OrdersStreamServiceImplBase() {
+          @Override
+          public void tradesStream(
+              TradesStreamRequest request, StreamObserver<TradesStreamResponse> out) {
+            subscriptions.add(out);
+          }
+        };
+    var ack =
+        TradesStreamResponse.newBuilder()
+            .setSubscription(
+                SubscriptionResponse.newBuilder()
+                    .setStatus(ResultSubscriptionStatus.RESULT_SUBSCRIPTION_STATUS_OK)
+                    .addAccounts("source"))
+            .build();
+    var recoveryBarrier =
+        TradesStreamResponse.newBuilder()
+            .setOrderTrades(
+                OrderTrades.newBuilder()
+                    .setAccountId("source")
+                    .setOrderId("barrier")
+                    .setInstrumentUid("instrument")
+                    .setDirection(OrderDirection.ORDER_DIRECTION_BUY))
+            .build();
+    var historyVisible = new AtomicBoolean();
+    var cursors = new LinkedBlockingQueue<String>();
+    var operations =
+        new OperationsServiceGrpc.OperationsServiceImplBase() {
+          @Override
+          public void getOperationsByCursor(
+              GetOperationsByCursorRequest request,
+              StreamObserver<GetOperationsByCursorResponse> out) {
+            cursors.add(request.getCursor());
+            var page = GetOperationsByCursorResponse.newBuilder();
+            if (historyVisible.get()
+                && request.getAccountId().equals("source")
+                && request.hasFrom()
+                && request.hasTo()
+                && !Instant.ofEpochSecond(
+                        request.getFrom().getSeconds(), request.getFrom().getNanos())
+                    .isAfter(tradedAt)
+                && !Instant.ofEpochSecond(request.getTo().getSeconds(), request.getTo().getNanos())
+                    .isBefore(tradedAt)) {
+              if (request.getCursor().isEmpty()) page.setHasNext(true).setNextCursor(secondPage);
+              else if (request.getCursor().equals(secondPage)) page.addItems(historyTrade);
+            }
+            out.onNext(page.build());
+            out.onCompleted();
+          }
+        };
+    var journal = new FeedJournalProbe(feed);
+    try (var simulator =
+            BrokerTlsTestSupport.open(
+                temporaryDirectory, stream, operations, rubInstrumentWithTenUnitLot());
+        var gateway =
+            BrokerTlsTestSupport.gateway(simulator.port(), clock, BrokerTlsTestSupport.NO_EVENTS);
+        var observation = gateway.observe(journal)) {
+      var live = subscriptions.poll(10, TimeUnit.SECONDS);
+      assertThat(live).isNotNull();
+      live.onNext(ack);
+      assertThat(journal.recoveryOutcomes.poll(10, TimeUnit.SECONDS)).isTrue();
+      assertThat(cursors).containsExactly("");
+      cursors.clear();
+
+      for (int read = 1; read <= 2; read++) {
+        live.onError(Status.UNAVAILABLE.asRuntimeException());
+        live = subscriptions.poll(10, TimeUnit.SECONDS);
+        assertThat(live).isNotNull();
+        // The server releases its reconnection ACK only after the synthetic outage.
+        clock.now = reconnectedAt;
+        historyVisible.set(true);
+        live.onNext(ack);
+        assertThat(journal.recoveryOutcomes.poll(10, TimeUnit.SECONDS))
+            .as("history pass %s", read)
+            .isFalse();
+        // The next stream frame is processed only after the whole history pass finishes.
+        live.onNext(recoveryBarrier);
+        assertThat(journal.readSuccesses.poll(10, TimeUnit.SECONDS)).isTrue();
+        assertThat(journal.recoveryOutcomes).isEmpty();
+        assertThat(cursors).containsExactly("", secondPage);
+        cursors.clear();
+        assertThat(control.status().lastError())
+            .isEqualTo("Source order identity unresolved for history trade " + tradeId);
+        assertThat(control.status().reconciled()).isFalse();
+        assertThat(
+                db.queryForObject("select feed_ready from control_state where id=1", Boolean.class))
+            .isFalse();
+        assertThat(db.queryForObject("select count(*) from source_execution", Integer.class))
+            .isZero();
+        assertThat(db.queryForObject("select count(*) from source_execution_alias", Integer.class))
+            .isZero();
+        assertThat(copies.intents()).isEmpty();
+        trading.dispatchReady();
+        assertThat(broker.posts).isZero();
+      }
+    }
+  }
+
   @Test
   void recentHistoryRetriesTransientStateFailureThenReplaysAfterFeedRestartAndSixtySeconds()
       throws Exception {
@@ -401,23 +547,7 @@ class CopyLifecycleIT {
             subscriptions.add(++count);
           }
         };
-    var instruments =
-        new InstrumentsServiceGrpc.InstrumentsServiceImplBase() {
-          @Override
-          public void getInstrumentBy(
-              InstrumentRequest request, StreamObserver<InstrumentResponse> out) {
-            out.onNext(
-                InstrumentResponse.newBuilder()
-                    .setInstrument(
-                        ru.tinkoff.piapi.contract.v1.Instrument.newBuilder()
-                            .setUid("instrument")
-                            .setLot(10)
-                            .setCurrency("rub")
-                            .setMinPriceIncrement(Quotation.newBuilder().setNano(10000000)))
-                    .build());
-            out.onCompleted();
-          }
-        };
+    var instruments = rubInstrumentWithTenUnitLot();
     var operations =
         new OperationsServiceGrpc.OperationsServiceImplBase() {
           @Override
