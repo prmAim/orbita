@@ -482,6 +482,18 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
       long lots,
       BigDecimal price,
       Instant at) {
+    publishSourceHistory(instrument, tradeId, sourceOrderId, side, lots, price, at);
+    replaySource(tradeId);
+  }
+
+  public synchronized void publishSourceHistory(
+      String instrument,
+      String tradeId,
+      String sourceOrderId,
+      BrokerGateway.Side side,
+      long lots,
+      BigDecimal price,
+      Instant at) {
     checkInstrument(instrument);
     if (closed
         || tradeId == null
@@ -497,25 +509,26 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
     var execution =
         new Execution(SOURCE, instrument, tradeId, sourceOrderId, side, lots, price, at);
     addExecution(execution);
-    sendSource(execution);
   }
 
   private void sendSource(Execution execution) {
-    var frame =
-        TradesStreamResponse.newBuilder()
-            .setOrderTrades(
-                OrderTrades.newBuilder()
-                    .setAccountId(SOURCE)
-                    .setOrderId(execution.order())
-                    .setInstrumentUid(execution.instrument())
-                    .setDirection(direction(execution.side()))
-                    .addTrades(
-                        OrderTrade.newBuilder()
-                            .setTradeId(execution.id())
-                            .setQuantity(execution.lots())
-                            .setPrice(TInvestBrokerGateway.quotation(execution.price()))
-                            .setDateTime(TInvestBrokerGateway.timestamp(execution.at()))))
-            .build();
+    emitSourceFrame(
+        OrderTrades.newBuilder()
+            .setAccountId(SOURCE)
+            .setOrderId(execution.order())
+            .setInstrumentUid(execution.instrument())
+            .setDirection(direction(execution.side()))
+            .addTrades(
+                OrderTrade.newBuilder()
+                    .setTradeId(execution.id())
+                    .setQuantity(execution.lots())
+                    .setPrice(TInvestBrokerGateway.quotation(execution.price()))
+                    .setDateTime(TInvestBrokerGateway.timestamp(execution.at())))
+            .build());
+  }
+
+  public synchronized void emitSourceFrame(OrderTrades trades) {
+    var frame = TradesStreamResponse.newBuilder().setOrderTrades(trades).build();
     for (var out : streams) out.onNext(frame);
   }
 
