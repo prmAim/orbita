@@ -6,10 +6,13 @@ import java.math.BigDecimal;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import ru.orbita.persistence.PostgresTimestampPrecision;
 import ru.tinkoff.piapi.contract.v1.*;
 import ru.ttech.piapi.core.connector.ServiceStubFactory;
 
@@ -26,6 +29,19 @@ final class SourceExecutionFeed implements AutoCloseable {
       Executors.newSingleThreadScheduledExecutor(
           Thread.ofPlatform().daemon().name("orbita-source-feed").factory());
   private final Map<String, BrokerGateway.SourceExecution> pending = new LinkedHashMap<>();
+
+  private record CachedSourceHistory(
+      String fingerprint,
+      Instant latestExecution,
+      BrokerGateway.SourceHistoryResolution resolution) {}
+
+  private record ResolvedHistoryExecution(
+      BrokerGateway.SourceExecution raw,
+      BrokerGateway.SourceExecution canonical,
+      String canonicalTradeId) {}
+
+  private final Map<String, CachedSourceHistory> resolvedHistoryByOperationId =
+      new LinkedHashMap<>();
   private volatile ClientCallStreamObserver<TradesStreamRequest> call;
   private boolean acknowledged;
   private volatile boolean closed;
@@ -33,6 +49,9 @@ final class SourceExecutionFeed implements AutoCloseable {
   private volatile long lastFrameNanos;
   private long connectedAtNanos;
   private long generation;
+  private boolean historyRetryPending;
+  private long historyRetryAtNanos;
+  private int historyRetryFailures;
 
   SourceExecutionFeed(
       ServiceStubFactory factory,
@@ -192,16 +211,13 @@ final class SourceExecutionFeed implements AutoCloseable {
         journal.gap("Incomplete source trade identity/quantity/price");
         continue;
       }
-      var previous = journal.remembered(source, trade.getTradeId());
-      Instant received =
-          journal.firstReceived(source, trade.getTradeId(), arrivedAt, capturedWindow);
       Instant executed = null;
       try {
         if (trade.hasDateTime()) executed = TInvestBrokerGateway.instant(trade.getDateTime());
       } catch (IllegalArgumentException invalid) {
         /* Exact history recovery only. */
       }
-      var execution =
+      var incoming =
           new BrokerGateway.SourceExecution(
               source,
               trade.getTradeId(),
@@ -213,37 +229,91 @@ final class SourceExecutionFeed implements AutoCloseable {
               TInvestBrokerGateway.decimal(trade.getPrice().getUnits(), trade.getPrice().getNano()),
               instrument.currency(),
               executed,
-              received);
-      if (executed == null) {
-        if (previous.isPresent() && previous.get().executedAt() != null) continue;
-        journal.remember(execution);
-        pending.putIfAbsent(execution.tradeId(), execution);
+              arrivedAt);
+      var timestampUpdate =
+          journal.withStreamAdmission(() -> recordStreamExecution(incoming, capturedWindow));
+      if (timestampUpdate.isEmpty()) continue;
+      var observation = timestampUpdate.get();
+      if (observation.executedAt() == null) {
+        pending.putIfAbsent(incoming.tradeId(), observation);
         recover();
-      } else if (previous.isPresent() && previous.get().executedAt() == null) {
-        switch (searchWindow(execution)) {
-          case WITHIN -> {
-            journal.acceptRecovered(execution);
-            pending.remove(execution.tradeId());
-          }
-          case EXPIRED -> {
-            journal.skip(previous.get(), "Source timestamp recovery expired");
-            pending.remove(execution.tradeId());
-          }
-          case UNKNOWN ->
-              journal.gap(
-                  "Original timestamp recovery window cannot be established "
-                      + execution.tradeId());
-        }
-      } else {
-        journal.remember(execution);
-        journal.accept(execution);
-      }
+      } else pending.remove(incoming.tradeId());
     }
+  }
+
+  /** Returns a pending or resolved timestamp observation after its durable admission. */
+  private Optional<BrokerGateway.SourceExecution> recordStreamExecution(
+      BrokerGateway.SourceExecution incoming, SourceFeedJournal.TimeWindow capturedWindow) {
+    var alias = journal.sourceExecutionAlias(incoming);
+    if (alias.status() != SourceFeedJournal.AliasStatus.NONE) {
+      if (alias.status() == SourceFeedJournal.AliasStatus.CONFLICT
+          || !sameStreamReplay(incoming, alias.execution())) {
+        journal.gap("Conflicting durable source execution alias for trade " + incoming.tradeId());
+        return Optional.empty();
+      }
+      return Optional.of(alias.execution());
+    }
+    var previous = journal.remembered(source, incoming.tradeId());
+    if (incoming.executedAt() == null
+        && previous.isPresent()
+        && previous.get().executedAt() != null) {
+      if (!sameStreamReplay(incoming, previous.get())) {
+        journal.gap("Conflicting known source stream execution for trade " + incoming.tradeId());
+        return Optional.empty();
+      }
+      return previous;
+    }
+    Instant received =
+        journal.firstReceived(source, incoming.tradeId(), incoming.receivedAt(), capturedWindow);
+    var execution =
+        new BrokerGateway.SourceExecution(
+            incoming.accountId(),
+            incoming.tradeId(),
+            incoming.sourceOrderId(),
+            incoming.instrumentId(),
+            incoming.side(),
+            incoming.lots(),
+            incoming.price(),
+            incoming.currency(),
+            incoming.executedAt(),
+            received);
+    if (execution.executedAt() == null) {
+      journal.remember(execution);
+      return Optional.of(execution);
+    } else if (previous.isPresent() && previous.get().executedAt() == null) {
+      switch (searchWindow(execution)) {
+        case WITHIN -> {
+          journal.acceptRecovered(execution);
+          return Optional.of(execution);
+        }
+        case EXPIRED -> {
+          journal.skip(previous.get(), "Source timestamp recovery expired");
+          return Optional.of(execution);
+        }
+        case UNKNOWN ->
+            journal.gap(
+                "Original timestamp recovery window cannot be established " + execution.tradeId());
+      }
+    } else {
+      journal.remember(execution);
+      journal.accept(execution);
+    }
+    return Optional.empty();
+  }
+
+  private static boolean sameStreamReplay(
+      BrokerGateway.SourceExecution incoming, BrokerGateway.SourceExecution stored) {
+    return incoming.executedAt() == null
+        ? stored.executedAt() != null
+            && incoming.sourceOrderId().equals(stored.sourceOrderId())
+            && sameHistoryFieldsExceptTime(incoming, stored)
+        : samePersistedHistoryExecution(incoming, stored);
   }
 
   private void recover() {
     Instant boundary = journal.observationBoundary();
     if (boundary == null) {
+      clearHistoryRetry();
       journal.gap("Observation boundary has not been saved");
       return;
     }
@@ -255,18 +325,246 @@ final class SourceExecutionFeed implements AutoCloseable {
       journal.skip(execution, "Source timestamp recovery expired");
       pending.remove(execution.tradeId());
     }
+    if (historyRetryPending && System.nanoTime() - historyRetryAtNanos < 0) return;
     var history = gateway.history(boundary, clock.instant());
     boolean complete = history.complete();
     for (String gap : history.gaps()) journal.gap(gap);
+    var recoverable = new java.util.ArrayList<ResolvedHistoryExecution>();
+    var candidatesByTrade = new LinkedHashMap<String, BrokerGateway.SourceHistoryCandidate>();
+    for (var candidate : history.sourceCandidates())
+      candidatesByTrade.putIfAbsent(candidate.execution().tradeId(), candidate);
+    var knownCandidatesByOperation =
+        new LinkedHashMap<String, java.util.List<BrokerGateway.SourceHistoryCandidate>>();
+    var unresolvedByOperationId =
+        new LinkedHashMap<String, java.util.List<BrokerGateway.SourceHistoryCandidate>>();
+    boolean retryableHistoryFailure = history.retryableFailure();
+    Instant lookupThrough = clock.instant();
+    Instant lookupFrom = lookupThrough.minusSeconds(60);
+    resolvedHistoryByOperationId
+        .entrySet()
+        .removeIf(entry -> entry.getValue().latestExecution().isBefore(lookupFrom));
     for (var trade : history.executions()) {
-      String orderId = journal.sourceOrderId(source, trade.tradeId()).orElse("");
+      var historyCandidate = candidatesByTrade.get(trade.tradeId());
+      if (historyCandidate != null && !sameHistoryExecution(trade, historyCandidate.execution())) {
+        journal.gap("Conflicting source history candidate for trade " + trade.tradeId());
+        complete = false;
+        continue;
+      }
+      var alias = journal.sourceExecutionAlias(trade);
+      if (alias.status() == SourceFeedJournal.AliasStatus.CONFLICT) {
+        journal.gap("Conflicting durable source execution alias for trade " + trade.tradeId());
+        complete = false;
+        continue;
+      }
+      if (alias.status() == SourceFeedJournal.AliasStatus.MATCH) {
+        var canonical = alias.execution();
+        if (!samePersistedHistoryFields(trade, canonical)) {
+          journal.gap("Conflicting durable source execution alias for trade " + trade.tradeId());
+          complete = false;
+          continue;
+        }
+        recoverable.add(new ResolvedHistoryExecution(trade, canonical, alias.canonicalTradeId()));
+        addKnownCandidate(
+            knownCandidatesByOperation, historyCandidate, canonical, alias.canonicalTradeId());
+        continue;
+      }
+      var knownOrderId = journal.sourceOrderId(source, trade.tradeId());
+      if (knownOrderId.isPresent()) {
+        var remembered = journal.remembered(source, trade.tradeId()).orElse(null);
+        var canonical =
+            remembered == null
+                ? withSourceOrderId(trade, knownOrderId.get())
+                : withSourceOrderId(remembered, knownOrderId.get());
+        if (remembered != null
+            && !java.util.Objects.equals(remembered.sourceOrderId(), knownOrderId.get())) {
+          journal.gap("Conflicting known source history order for trade " + trade.tradeId());
+          complete = false;
+          continue;
+        }
+        if (remembered != null
+            && remembered.executedAt() == null
+            && trade.executedAt() != null
+            && sameHistoryFieldsExceptTime(trade, canonical)) {
+          if (!pending.containsKey(trade.tradeId())) {
+            // An exact replay of an already terminal raw event is not a new timestamp recovery.
+            continue;
+          }
+          var window = searchWindow(remembered);
+          if (window == SearchWindow.UNKNOWN) {
+            journal.gap(
+                "Original timestamp recovery window cannot be established " + trade.tradeId());
+            complete = false;
+            continue;
+          }
+          if (window == SearchWindow.EXPIRED) {
+            pending.remove(trade.tradeId());
+            journal.skip(remembered, "Source timestamp recovery expired");
+            continue;
+          }
+          if (trade.executedAt().isBefore(lookupFrom)
+              || trade.executedAt().isAfter(lookupThrough)) {
+            journal.gap("Source order identity unresolved for history trade " + trade.tradeId());
+            complete = false;
+            continue;
+          }
+          recoverable.add(
+              new ResolvedHistoryExecution(
+                  trade, withSourceOrderId(trade, knownOrderId.get()), trade.tradeId()));
+          continue;
+        }
+        if (!samePersistedHistoryFields(trade, canonical)) {
+          journal.gap("Conflicting known source history execution for trade " + trade.tradeId());
+          complete = false;
+          continue;
+        }
+        recoverable.add(new ResolvedHistoryExecution(trade, canonical, trade.tradeId()));
+        addKnownCandidate(knownCandidatesByOperation, historyCandidate, canonical, trade.tradeId());
+        continue;
+      }
+      if (historyCandidate == null
+          || historyCandidate.operationId().isBlank()
+          || !sameHistoryExecution(trade, historyCandidate.execution())) {
+        journal.gap("Source order identity unresolved for history trade " + trade.tradeId());
+        complete = false;
+        continue;
+      }
+      if (trade.executedAt() == null
+          || trade.executedAt().isBefore(lookupFrom)
+          || trade.executedAt().isAfter(lookupThrough)) {
+        journal.gap("Source order identity unresolved for history trade " + trade.tradeId());
+        complete = false;
+        continue;
+      }
+      unresolvedByOperationId
+          .computeIfAbsent(historyCandidate.operationId(), _ -> new java.util.ArrayList<>())
+          .add(historyCandidate);
+    }
+    for (var entry : unresolvedByOperationId.entrySet()) {
+      var candidates =
+          new java.util.ArrayList<>(
+              knownCandidatesByOperation.getOrDefault(entry.getKey(), java.util.List.of()));
+      candidates.addAll(entry.getValue());
+      String fingerprint = historyFingerprint(candidates);
+      var cached = resolvedHistoryByOperationId.get(entry.getKey());
+      BrokerGateway.SourceHistoryResolution resolution;
+      if (cached == null) {
+        resolution = gateway.resolveRecentSourceHistory(candidates);
+      } else if (!cached.fingerprint().equals(fingerprint)) {
+        resolvedHistoryByOperationId.remove(entry.getKey());
+        resolution =
+            new BrokerGateway.SourceHistoryResolution(
+                List.of(),
+                List.of(
+                    "Source history candidates changed after canonical lookup: " + entry.getKey()));
+      } else {
+        resolution = cached.resolution();
+      }
+      retryableHistoryFailure |= resolution.retryableFailure();
+      for (String gap : resolution.gaps()) {
+        journal.gap(gap);
+        complete = false;
+      }
+      if (resolution.gaps().isEmpty()
+          && resolution.executions().size() != entry.getValue().size()) {
+        journal.gap("Canonical source history result count mismatch: " + entry.getKey());
+        complete = false;
+        resolvedHistoryByOperationId.remove(entry.getKey());
+        continue;
+      }
+      if (resolution.executions().isEmpty()) {
+        if (resolution.gaps().isEmpty())
+          journal.gap("Canonical source history execution unavailable: " + entry.getKey());
+        complete = false;
+        resolvedHistoryByOperationId.remove(entry.getKey());
+        continue;
+      }
+      if (!resolution.gaps().isEmpty()) {
+        complete = false;
+        resolvedHistoryByOperationId.remove(entry.getKey());
+        continue;
+      }
+      var resolvedForOperation = new java.util.ArrayList<ResolvedHistoryExecution>();
+      var matchedRawTradeIds = new java.util.HashSet<String>();
+      boolean oneToOne = true;
+      for (var canonical : resolution.executions()) {
+        var matches =
+            candidates.stream()
+                .filter(candidate -> candidate.acceptedExecution() == null)
+                .filter(candidate -> sameHistoryFields(candidate.execution(), canonical))
+                .toList();
+        if (matches.size() != 1) {
+          journal.gap(
+              "Canonical source history execution does not identify one raw trade: "
+                  + canonical.tradeId());
+          complete = false;
+          oneToOne = false;
+          break;
+        }
+        var match = matches.getFirst();
+        if (!matchedRawTradeIds.add(match.execution().tradeId())) {
+          journal.gap(
+              "Canonical source history maps multiple stages to raw trade: "
+                  + match.execution().tradeId());
+          complete = false;
+          oneToOne = false;
+          break;
+        }
+        resolvedForOperation.add(
+            new ResolvedHistoryExecution(match.execution(), canonical, canonical.tradeId()));
+      }
+      if (!oneToOne || resolvedForOperation.size() != entry.getValue().size()) {
+        complete = false;
+        resolvedHistoryByOperationId.remove(entry.getKey());
+        continue;
+      }
+      recoverable.addAll(resolvedForOperation);
+      if (cached == null) {
+        Instant latestExecution =
+            candidates.stream()
+                .map(candidate -> candidate.execution().executedAt())
+                .max(Instant::compareTo)
+                .orElseThrow();
+        resolvedHistoryByOperationId.put(
+            entry.getKey(), new CachedSourceHistory(fingerprint, latestExecution, resolution));
+      }
+    }
+    var claimsByTradeId = new LinkedHashMap<String, ResolvedHistoryExecution>();
+    var ambiguousStages = new java.util.HashSet<String>();
+    for (var recovery : recoverable) {
+      // Raw, stage and stored execution IDs share the same durable account/trade namespace.
+      for (String tradeId :
+          new java.util.LinkedHashSet<>(
+              List.of(
+                  recovery.raw().tradeId(),
+                  recovery.canonicalTradeId(),
+                  recovery.canonical().tradeId()))) {
+        var previous = claimsByTradeId.putIfAbsent(tradeId, recovery);
+        if (previous != null && previous != recovery && !sameRecovery(previous, recovery)) {
+          ambiguousStages.add(previous.canonicalTradeId());
+          ambiguousStages.add(recovery.canonicalTradeId());
+          journal.gap("Ambiguous source history trade identity " + tradeId);
+          complete = false;
+        }
+      }
+    }
+    var processedRawIds = new java.util.HashSet<String>();
+    for (var recovery : recoverable) {
+      if (ambiguousStages.contains(recovery.canonicalTradeId())
+          || !processedRawIds.add(recovery.raw().tradeId())) continue;
+      var raw = recovery.raw();
+      var trade = recovery.canonical();
+      String orderId = trade.sourceOrderId();
       if (orderId.isBlank()) {
         journal.gap("Source order identity unresolved for history trade " + trade.tradeId());
         complete = false;
         continue;
       }
-      Instant received = journal.firstReceived(source, trade.tradeId(), clock.instant());
-      var candidate = journal.remembered(source, trade.tradeId()).orElse(null);
+      var candidate =
+          journal
+              .remembered(source, trade.tradeId())
+              .or(() -> journal.remembered(source, raw.tradeId()))
+              .orElse(recovery.canonical());
+      Instant received = journal.firstReceived(source, candidate.tradeId(), clock.instant());
       if (candidate != null
           && (!candidate.instrumentId().equals(trade.instrumentId())
               || candidate.side() != trade.side()
@@ -303,10 +601,137 @@ final class SourceExecutionFeed implements AutoCloseable {
               trade.currency(),
               trade.executedAt(),
               received);
-      journal.acceptRecovered(resolved);
+      if (!journal.acceptRecovered(raw, resolved, recovery.canonicalTradeId())) {
+        journal.gap("Conflicting durable source execution alias for trade " + raw.tradeId());
+        complete = false;
+        continue;
+      }
+      pending.remove(raw.tradeId());
       pending.remove(trade.tradeId());
     }
+    if (retryableHistoryFailure) scheduleHistoryRetry();
+    else clearHistoryRetry();
     if (complete && pending.isEmpty()) journal.recovered();
+  }
+
+  private BrokerGateway.SourceExecution withSourceOrderId(
+      BrokerGateway.SourceExecution execution, String sourceOrderId) {
+    return new BrokerGateway.SourceExecution(
+        execution.accountId(),
+        execution.tradeId(),
+        sourceOrderId,
+        execution.instrumentId(),
+        execution.side(),
+        execution.lots(),
+        execution.price(),
+        execution.currency(),
+        execution.executedAt(),
+        execution.receivedAt());
+  }
+
+  private static boolean sameHistoryExecution(
+      BrokerGateway.SourceExecution first, BrokerGateway.SourceExecution second) {
+    return first.accountId().equals(second.accountId())
+        && first.sourceOrderId().equals(second.sourceOrderId())
+        && sameHistoryFields(first, second);
+  }
+
+  private static boolean sameRecovery(
+      ResolvedHistoryExecution first, ResolvedHistoryExecution second) {
+    return first.canonicalTradeId().equals(second.canonicalTradeId())
+        && first.canonical().tradeId().equals(second.canonical().tradeId())
+        && sameHistoryFields(first.raw(), second.raw())
+        && samePersistedHistoryExecution(first.canonical(), second.canonical());
+  }
+
+  private static boolean samePersistedHistoryExecution(
+      BrokerGateway.SourceExecution first, BrokerGateway.SourceExecution second) {
+    return first.accountId().equals(second.accountId())
+        && first.sourceOrderId().equals(second.sourceOrderId())
+        && samePersistedHistoryFields(first, second);
+  }
+
+  private static boolean sameHistoryFields(
+      BrokerGateway.SourceExecution first, BrokerGateway.SourceExecution second) {
+    return sameHistoryFieldsExceptTime(first, second)
+        && java.util.Objects.equals(first.executedAt(), second.executedAt());
+  }
+
+  private static boolean samePersistedHistoryFields(
+      BrokerGateway.SourceExecution first, BrokerGateway.SourceExecution second) {
+    return sameHistoryFieldsExceptTime(first, second)
+        && java.util.Objects.equals(
+            PostgresTimestampPrecision.normalize(first.executedAt()),
+            PostgresTimestampPrecision.normalize(second.executedAt()));
+  }
+
+  private static boolean sameHistoryFieldsExceptTime(
+      BrokerGateway.SourceExecution first, BrokerGateway.SourceExecution second) {
+    return first.accountId().equals(second.accountId())
+        && first.instrumentId().equals(second.instrumentId())
+        && first.side() == second.side()
+        && first.lots().compareTo(second.lots()) == 0
+        && first.price().compareTo(second.price()) == 0
+        && first.currency().equalsIgnoreCase(second.currency());
+  }
+
+  private static void addKnownCandidate(
+      Map<String, List<BrokerGateway.SourceHistoryCandidate>> knownCandidatesByOperation,
+      BrokerGateway.SourceHistoryCandidate candidate,
+      BrokerGateway.SourceExecution canonical,
+      String canonicalTradeId) {
+    if (candidate == null || candidate.operationId().isBlank()) return;
+    knownCandidatesByOperation
+        .computeIfAbsent(candidate.operationId(), _ -> new java.util.ArrayList<>())
+        .add(
+            new BrokerGateway.SourceHistoryCandidate(
+                candidate.operationId(),
+                candidate.execution(),
+                withTradeId(canonical, canonicalTradeId),
+                candidate.operationFingerprint()));
+  }
+
+  private static BrokerGateway.SourceExecution withTradeId(
+      BrokerGateway.SourceExecution execution, String tradeId) {
+    return new BrokerGateway.SourceExecution(
+        execution.accountId(),
+        tradeId,
+        execution.sourceOrderId(),
+        execution.instrumentId(),
+        execution.side(),
+        execution.lots(),
+        execution.price(),
+        execution.currency(),
+        execution.executedAt(),
+        execution.receivedAt());
+  }
+
+  private static String historyFingerprint(
+      java.util.List<BrokerGateway.SourceHistoryCandidate> candidates) {
+    return candidates.stream()
+        .map(
+            candidate -> {
+              var execution = candidate.execution();
+              return String.join(
+                  "\u001f",
+                  candidate.operationId(),
+                  candidate.operationFingerprint(),
+                  execution.accountId(),
+                  execution.tradeId(),
+                  execution.instrumentId(),
+                  execution.side().name(),
+                  execution.lots().stripTrailingZeros().toPlainString(),
+                  execution.price().stripTrailingZeros().toPlainString(),
+                  execution.currency().toUpperCase(java.util.Locale.ROOT),
+                  execution.executedAt().toString(),
+                  candidate.acceptedExecution() == null
+                      ? ""
+                      : candidate.acceptedExecution().tradeId()
+                          + "\u001f"
+                          + candidate.acceptedExecution().sourceOrderId());
+            })
+        .sorted()
+        .collect(java.util.stream.Collectors.joining("\n"));
   }
 
   private enum SearchWindow {
@@ -330,10 +755,13 @@ final class SourceExecutionFeed implements AutoCloseable {
     if (closed || reconnecting) return;
     try {
       long maximum = acknowledged ? TimeUnit.SECONDS.toNanos(15) : TimeUnit.SECONDS.toNanos(5);
-      if (System.nanoTime() - (acknowledged ? lastFrameNanos : connectedAtNanos) > maximum) {
+      long nowNanos = System.nanoTime();
+      if (nowNanos - (acknowledged ? lastFrameNanos : connectedAtNanos) > maximum) {
         if (acknowledged) journal.connectionLost(BrokerConnectivityEvents.Cause.HEARTBEAT_TIMEOUT);
         disconnect("Source acknowledgement/heartbeat deadline exceeded");
-      } else if (!pending.isEmpty()) recover();
+      } else if (acknowledged
+          && (!pending.isEmpty() || (historyRetryPending && nowNanos - historyRetryAtNanos >= 0)))
+        recover();
     } catch (BrokerPersistenceFailure failure) {
       journal.persistenceUnavailable();
       disconnect("Source persistence unavailable");
@@ -341,6 +769,19 @@ final class SourceExecutionFeed implements AutoCloseable {
       if (isPersistenceFailure(failure)) journal.persistenceUnavailable();
       disconnect("Source recovery failed");
     }
+  }
+
+  private void scheduleHistoryRetry() {
+    historyRetryFailures = Math.min(historyRetryFailures + 1, 5);
+    long delaySeconds = Math.min(1L << (historyRetryFailures - 1), 15L);
+    historyRetryAtNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(delaySeconds);
+    historyRetryPending = true;
+  }
+
+  private void clearHistoryRetry() {
+    historyRetryPending = false;
+    historyRetryAtNanos = 0;
+    historyRetryFailures = 0;
   }
 
   private void disconnect(String reason) {

@@ -12,8 +12,8 @@ import ru.tinkoff.piapi.contract.v1.*;
 import ru.ttech.piapi.core.connector.*;
 
 /** Shared real SDK/TLS simulator fixture; certificates and token are synthetic and local only. */
-final class BrokerTlsTestSupport {
-  static Simulator open(Path directory, BindableService... services) throws Exception {
+public final class BrokerTlsTestSupport {
+  public static Simulator open(Path directory, BindableService... services) throws Exception {
     Path key = directory.resolve("key.pem"),
         cert = directory.resolve("cert.pem"),
         store = directory.resolve("simulator.p12");
@@ -105,18 +105,18 @@ final class BrokerTlsTestSupport {
     return new Simulator(server.build().start());
   }
 
-  static TInvestBrokerGateway gateway(int port, Clock clock, BrokerConnectivityEvents events)
+  public static TInvestBrokerGateway gateway(int port, Clock clock, BrokerConnectivityEvents events)
       throws Exception {
     return gateway(port, clock, events, BrokerQualifications.unconfirmed());
   }
 
-  static TInvestBrokerGateway gateway(
+  public static TInvestBrokerGateway gateway(
       int port, Clock clock, BrokerConnectivityEvents events, BrokerQualifications qualifications)
       throws Exception {
     return gateway(port, clock, events, qualifications, "source", "mirror");
   }
 
-  static TInvestBrokerGateway gateway(
+  public static TInvestBrokerGateway gateway(
       int port,
       Clock clock,
       BrokerConnectivityEvents events,
@@ -151,7 +151,7 @@ final class BrokerTlsTestSupport {
         factory, sourceAccount, mirrorAccount, clock, qualifications, events);
   }
 
-  static final BrokerConnectivityEvents NO_EVENTS =
+  public static final BrokerConnectivityEvents NO_EVENTS =
       new BrokerConnectivityEvents() {
         public void connectionLost(Cause cause) {}
 
@@ -160,14 +160,14 @@ final class BrokerTlsTestSupport {
         public void restoredCopyOpened() {}
       };
 
-  static final class Simulator implements AutoCloseable {
+  public static final class Simulator implements AutoCloseable {
     final Server server;
 
     Simulator(Server server) {
       this.server = server;
     }
 
-    int port() {
+    public int port() {
       return server.getPort();
     }
 

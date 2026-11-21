@@ -129,6 +129,11 @@ public class ControlService {
         Map.of("jakarta.persistence.lock.timeout", 5000));
   }
 
+  /** Serializes identity resolution with source admission in the caller's transaction. */
+  public void lockForSourceRecovery() {
+    lock();
+  }
+
   private Status view(ControlState s) {
     var values = candidates.accepted(s);
     return new Status(

@@ -7,6 +7,7 @@ import java.math.RoundingMode;
 import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicReference;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -246,6 +247,7 @@ public class TradingService implements UnsentIntentStop {
     CompletionService<ReadinessResult> completed =
         new ExecutorCompletionService<>(readinessExecutor);
     Map<Future<ReadinessResult>, PendingReadiness> pending = new IdentityHashMap<>();
+    var passFailure = new AtomicReference<RuntimeException>();
     int next = 0;
     QueuePosition lastSubmitted = null;
     boolean stopSubmitting = false;
@@ -265,7 +267,17 @@ public class TradingService implements UnsentIntentStop {
           CopyIntent intent = eligible.get(next);
           Future<ReadinessResult> future;
           try {
-            future = completed.submit(() -> inspect(gateway, intent));
+            future =
+                completed.submit(
+                    () -> {
+                      try {
+                        return inspect(gateway, intent);
+                      } catch (RuntimeException failure) {
+                        // Publish before the completion queue can expose a different ready peer.
+                        passFailure.compareAndSet(null, failure);
+                        throw failure;
+                      }
+                    });
           } catch (RejectedExecutionException saturated) {
             stopSubmitting = true;
             break;
@@ -318,8 +330,9 @@ public class TradingService implements UnsentIntentStop {
                 .thenComparingLong(result -> result.intent().prioritySequence)
                 .thenComparing(result -> result.intent().id, TradingService::compareQueueUuid));
         for (ReadinessResult result : results)
-          prepare(gateway, result.intent().id, result.preflight());
+          prepare(gateway, result.intent().id, result.preflight(), true, passFailure);
       }
+      checkReadinessFailure(passFailure);
     } catch (InterruptedException interrupted) {
       Thread.currentThread().interrupt();
       return;
@@ -498,9 +511,9 @@ public class TradingService implements UnsentIntentStop {
     BigDecimal reserved = BigDecimal.ZERO;
     for (var reservation :
         em.createQuery(
-                "from CopyIntent i where i.currency=:currency and i.reservedMoney>0",
+                "from CopyIntent i where upper(i.currency)=:currency and i.reservedMoney>0",
                 CopyIntent.class)
-            .setParameter("currency", currency)
+            .setParameter("currency", currency.toUpperCase(Locale.ROOT))
             .getResultList()) {
       BigDecimal reflected =
           resources.bankReflectedReservations().getOrDefault(reservation.id, BigDecimal.ZERO);
@@ -733,14 +746,21 @@ public class TradingService implements UnsentIntentStop {
   }
 
   private void prepare(BrokerGateway gateway, UUID id) {
-    prepare(gateway, id, null, false);
+    prepare(gateway, id, null, false, new AtomicReference<>());
   }
 
-  private void prepare(BrokerGateway gateway, UUID id, Preflight supplied) {
-    prepare(gateway, id, supplied, true);
+  private static void checkReadinessFailure(AtomicReference<RuntimeException> passFailure) {
+    var failure = passFailure.get();
+    if (failure != null) throw failure;
   }
 
-  private void prepare(BrokerGateway gateway, UUID id, Preflight supplied, boolean preflightDone) {
+  private void prepare(
+      BrokerGateway gateway,
+      UUID id,
+      Preflight supplied,
+      boolean preflightDone,
+      AtomicReference<RuntimeException> passFailure) {
+    checkReadinessFailure(passFailure);
     CopyIntent detached = tx.execute(_ -> em.find(CopyIntent.class, id));
     if (detached != null && "HALTED".equals(detached.status)) {
       retryHalted(gateway, detached);
@@ -862,6 +882,7 @@ public class TradingService implements UnsentIntentStop {
         tx.execute(
             _ -> {
               var currentGate = control.gate();
+              checkReadinessFailure(passFailure);
               CopyIntent i = em.find(CopyIntent.class, id, LockModeType.PESSIMISTIC_WRITE);
               if (!"WAITING".equals(i.status)
                   || !Objects.equals(i.side, detached.side)
@@ -1062,13 +1083,17 @@ public class TradingService implements UnsentIntentStop {
                   .orElse(true);
       // Evidence acquisition can block on a qualified collector file; include all of it in R59.
       long elapsedAfterCommit = System.nanoTime() - inspectionStartedNanos;
+      // The final atomic read admits this send in the same order as peer failure publication.
+      // A later failure stops further admissions while this already admitted RPC may be in flight.
       if (!processReady
           || !control.tradingReady()
           || elapsedAfterCommit < 0
           || elapsedAfterCommit > Duration.ofSeconds(5).toNanos()
           || !freshAge.allowed
-          || conversionExpired) {
+          || conversionExpired
+          || passFailure.get() != null) {
         knownUnsent(id, freshAge);
+        checkReadinessFailure(passFailure);
         return;
       }
       OrderEvidence evidence;

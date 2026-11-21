@@ -114,7 +114,7 @@ class InterfaceDemoIT {
   }
 
   @Test
-  void removeManifestCapturedOnV17AfterUpgradeToV19PreservesLaterControlColumns() {
+  void removeManifestCapturedOnV17AfterUpgradeToV20PreservesLaterControlColumns() {
     try (var postgres = new PostgreSQLContainer("postgres:17.11-alpine")) {
       postgres.start();
       Flyway.configure()
@@ -162,12 +162,42 @@ class InterfaceDemoIT {
           .dataSource(postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword())
           .load()
           .migrate();
+      assertThat(
+              db.queryForObject(
+                  "select version from flyway_schema_history where success order by installed_rank desc limit 1",
+                  String.class))
+          .isEqualTo("20");
       UUID notificationId = UUID.randomUUID();
       long journalBoundary = ownerJournalId + 17;
       db.update(
           "update control_state set recalculation_error_notification_id=?,recalculation_pause_journal_boundary=? where id=1",
           notificationId,
           journalBoundary);
+      assertThat(
+              db.queryForObject(
+                  "select to_regclass('public.source_execution_alias_execution_idx') is not null",
+                  Boolean.class))
+          .isTrue();
+      String ownedExecutionId = "legacy-v17-owned-execution";
+      String ownedTradeId = "legacy-v17-owned-trade";
+      db.update(
+          "insert into source_execution(id,account_id,trade_id,source_order_id,instrument_id,side,lots,price,currency,executed_at,received_at,disposition) values(?,?,?,?,?,'BUY',1,100,'RUB',clock_timestamp(),clock_timestamp(),'ACCEPTED')",
+          ownedExecutionId,
+          "source",
+          ownedTradeId,
+          "legacy-v17-order",
+          demoInstrument);
+      db.update(
+          "insert into source_execution_alias(account_id,alias_trade_id,execution_trade_id,canonical_trade_id,fingerprint) values(?,?,?,?,repeat('0',64))",
+          "source",
+          "legacy-v17-stream-alias",
+          ownedTradeId,
+          "legacy-v17-canonical-trade");
+      db.update(
+          "insert into orbita_demo_preview.owned(relation,row_id) values('source_execution',?)",
+          ownedExecutionId);
+      assertThat(db.queryForObject("select count(*) from source_execution_alias", Integer.class))
+          .isEqualTo(1);
 
       InterfaceDemoLedger.cleanup(db);
 
@@ -190,6 +220,8 @@ class InterfaceDemoIT {
                   "select count(*) from instrument_state where instrument_id=?",
                   Integer.class,
                   demoInstrument))
+          .isZero();
+      assertThat(db.queryForObject("select count(*) from source_execution_alias", Integer.class))
           .isZero();
       assertThat(
               db.queryForObject(
