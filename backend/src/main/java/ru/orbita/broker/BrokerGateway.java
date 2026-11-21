@@ -283,18 +283,37 @@ public interface BrokerGateway extends AutoCloseable {
     }
   }
 
+  record SourceHistoryCandidate(String operationId, SourceExecution execution) {}
+
   record History(
       List<SourceExecution> executions,
       List<String> gaps,
       Instant fromInclusive,
-      Instant throughInclusive) {
+      Instant throughInclusive,
+      List<SourceHistoryCandidate> sourceCandidates) {
     public History {
       executions = List.copyOf(executions);
       gaps = List.copyOf(gaps);
+      sourceCandidates = List.copyOf(sourceCandidates);
+    }
+
+    public History(
+        List<SourceExecution> executions,
+        List<String> gaps,
+        Instant fromInclusive,
+        Instant throughInclusive) {
+      this(executions, gaps, fromInclusive, throughInclusive, List.of());
     }
 
     public boolean complete() {
       return gaps.isEmpty();
+    }
+  }
+
+  record SourceHistoryResolution(List<SourceExecution> executions, List<String> gaps) {
+    public SourceHistoryResolution {
+      executions = List.copyOf(executions);
+      gaps = List.copyOf(gaps);
     }
   }
 
@@ -369,6 +388,13 @@ public interface BrokerGateway extends AutoCloseable {
   ResourceEvidence resources(OrderRequest request);
 
   History history(Instant fromInclusive, Instant throughInclusive);
+
+  /** Resolves recent, otherwise-unmatched operation history through canonical order stages. */
+  default SourceHistoryResolution resolveRecentSourceHistory(
+      List<SourceHistoryCandidate> candidates) {
+    return new SourceHistoryResolution(
+        List.of(), List.of("Canonical source history resolution is unavailable"));
+  }
 
   default History mirrorHistory(Instant fromInclusive, Instant throughInclusive) {
     return new History(

@@ -2,9 +2,13 @@ package ru.orbita.broker;
 
 import java.math.BigDecimal;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import ru.tinkoff.piapi.contract.v1.*;
@@ -596,6 +600,8 @@ public final class TInvestBrokerGateway implements BrokerGateway {
     var result = new java.util.LinkedHashMap<String, SourceExecution>();
     var gaps = new ArrayList<String>();
     var metadata = new java.util.HashMap<String, Instrument>();
+    var sourceCandidates = new LinkedHashMap<String, SourceHistoryCandidate>();
+    var conflictedTrades = new HashSet<String>();
     Instant window = from;
     do {
       Instant end =
@@ -652,6 +658,7 @@ public final class TInvestBrokerGateway implements BrokerGateway {
           }
           for (var trade : item.getTradesInfo().getTradesList()) {
             try {
+              if (conflictedTrades.contains(trade.getNum())) continue;
               if (trade.getNum().isBlank()
                   || trade.getQuantity() <= 0
                   || !trade.hasPrice()
@@ -677,13 +684,24 @@ public final class TInvestBrokerGateway implements BrokerGateway {
                       time,
                       clock.instant());
               var previous = result.putIfAbsent(trade.getNum(), execution);
-              if (previous != null
-                  && (!previous.instrumentId().equals(execution.instrumentId())
-                      || previous.side() != execution.side()
-                      || previous.lots().compareTo(execution.lots()) != 0
-                      || previous.price().compareTo(execution.price()) != 0
-                      || !previous.executedAt().equals(execution.executedAt())))
+              if (previous == null) {
+                sourceCandidates.put(
+                    trade.getNum(), new SourceHistoryCandidate(item.getId(), execution));
+              } else if (!previous.instrumentId().equals(execution.instrumentId())
+                  || previous.side() != execution.side()
+                  || previous.lots().compareTo(execution.lots()) != 0
+                  || previous.price().compareTo(execution.price()) != 0
+                  || !previous.executedAt().equals(execution.executedAt())) {
                 gaps.add("Conflicting history trade identity: " + trade.getNum());
+                result.remove(trade.getNum());
+                sourceCandidates.remove(trade.getNum());
+                conflictedTrades.add(trade.getNum());
+              } else {
+                var sourceCandidate = sourceCandidates.get(trade.getNum());
+                if (sourceCandidate != null
+                    && !sourceCandidate.operationId().equals(item.getId()))
+                  sourceCandidates.remove(trade.getNum());
+              }
             } catch (BrokerPersistenceFailure failure) {
               throw failure;
             } catch (RuntimeException incomplete) {
@@ -700,7 +718,145 @@ public final class TInvestBrokerGateway implements BrokerGateway {
       } while (true);
       window = end;
     } while (window.isBefore(through));
-    return new History(new ArrayList<>(result.values()), gaps, from, through);
+    return new History(
+        new ArrayList<>(result.values()),
+        gaps,
+        from,
+        through,
+        new ArrayList<>(sourceCandidates.values()));
+  }
+
+  @Override
+  public SourceHistoryResolution resolveRecentSourceHistory(
+      List<SourceHistoryCandidate> candidates) {
+    var groups = new LinkedHashMap<String, List<SourceHistoryCandidate>>();
+    var gaps = new ArrayList<String>();
+    Instant now = clock.instant();
+    Instant earliest = now.minus(Duration.ofSeconds(60));
+    for (var historyCandidate : candidates) {
+      var candidate = historyCandidate.execution();
+      String operationId = historyCandidate.operationId();
+      if (!sourceAccount.equals(candidate.accountId())
+          || operationId == null
+          || operationId.isBlank()
+          || candidate.executedAt() == null
+          || candidate.executedAt().isBefore(earliest)
+          || candidate.executedAt().isAfter(now)) {
+        gaps.add("Source history candidate is incomplete or outside the recent lookup window");
+        continue;
+      }
+      groups.computeIfAbsent(operationId, _ -> new ArrayList<>()).add(historyCandidate);
+    }
+
+    var executions = new ArrayList<SourceExecution>();
+    for (var entry : groups.entrySet()) {
+      String orderId = entry.getKey();
+      var operationTrades = entry.getValue();
+      var first = operationTrades.getFirst().execution();
+      if (operationTrades.stream()
+          .anyMatch(
+              candidate ->
+                  !candidate.execution().instrumentId().equals(first.instrumentId())
+                      || candidate.execution().side() != first.side()
+                      || !candidate.execution().currency().equalsIgnoreCase(first.currency()))) {
+        gaps.add("Conflicting source operation identity: " + orderId);
+        continue;
+      }
+
+      try {
+        var payload =
+            GetOrderStateRequest.newBuilder()
+                .setAccountId(sourceAccount)
+                .setOrderId(orderId)
+                .setPriceType(PriceType.PRICE_TYPE_CURRENCY)
+                .build();
+        var state =
+            read(
+                () ->
+                    factory
+                        .newSyncService(OrdersServiceGrpc::newBlockingStub)
+                        .callSyncMethod(
+                            stub ->
+                                stub.withDeadlineAfter(5, TimeUnit.SECONDS).getOrderState(payload)));
+        if (!state.getOrderId().equals(orderId)
+            || !state.getInstrumentUid().equals(first.instrumentId())
+            || state.getDirection() != direction(first.side())
+            || state.getStagesCount() != operationTrades.size()) {
+          gaps.add("GetOrderState source history identity/count mismatch: " + orderId);
+          continue;
+        }
+
+        var unmatched = new ArrayList<>(operationTrades);
+        var tradeIds = new HashSet<String>();
+        var resolved = new ArrayList<SourceExecution>();
+        long stageLots = 0;
+        boolean unambiguous = true;
+        for (var stage : state.getStagesList()) {
+          if (stage.getTradeId().isBlank()
+              || !tradeIds.add(stage.getTradeId())
+              || stage.getQuantity() <= 0
+              || !stage.hasPrice()
+              || !stage.hasExecutionTime()) {
+            unambiguous = false;
+            break;
+          }
+          Instant executedAt = instant(stage.getExecutionTime());
+          BigDecimal price = decimal(stage.getPrice().getUnits(), stage.getPrice().getNano());
+          BigDecimal lots = BigDecimal.valueOf(stage.getQuantity());
+          var matches =
+              unmatched.stream()
+                  .filter(
+                      candidate -> candidate.execution().lots().compareTo(lots) == 0)
+                  .filter(candidate -> candidate.execution().price().compareTo(price) == 0)
+                  .filter(candidate -> candidate.execution().executedAt().equals(executedAt))
+                  .filter(
+                      candidate ->
+                          candidate
+                              .execution()
+                              .currency()
+                              .equalsIgnoreCase(stage.getPrice().getCurrency()))
+                  .toList();
+          if (matches.size() != 1) {
+            unambiguous = false;
+            break;
+          }
+          var operation = matches.getFirst().execution();
+          unmatched.remove(matches.getFirst());
+          stageLots = Math.addExact(stageLots, stage.getQuantity());
+          resolved.add(
+              new SourceExecution(
+                  sourceAccount,
+                  stage.getTradeId(),
+                  orderId,
+                  state.getInstrumentUid(),
+                  first.side(),
+                  lots,
+                  price,
+                  stage.getPrice().getCurrency(),
+                  executedAt,
+                  operation.receivedAt()));
+        }
+        long operationLots =
+            operationTrades.stream()
+                .map(SourceHistoryCandidate::execution)
+                .map(SourceExecution::lots)
+                .reduce(BigDecimal.ZERO, BigDecimal::add)
+                .longValueExact();
+        if (!unambiguous
+            || !unmatched.isEmpty()
+            || stageLots != state.getLotsExecuted()
+            || operationLots != state.getLotsExecuted()) {
+          gaps.add("Ambiguous or conflicting GetOrderState source history: " + orderId);
+          continue;
+        }
+        executions.addAll(resolved);
+      } catch (BrokerPersistenceFailure failure) {
+        throw failure;
+      } catch (RuntimeException unavailableOrInvalid) {
+        gaps.add("GetOrderState source history unavailable or invalid: " + orderId);
+      }
+    }
+    return new SourceHistoryResolution(executions, gaps);
   }
 
   @Override

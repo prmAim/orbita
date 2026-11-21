@@ -372,6 +372,10 @@ class TInvestBrokerGatewayTest {
             if (historyVisible)
               page.addItems(
                   OperationItem.newBuilder()
+                      .setId(
+                          qualifiedTime && !delayedProvider
+                              ? "unstable-operation-17"
+                              : "source-order-1")
                       .setBrokerAccountId("source")
                       .setInstrumentUid("instrument-1")
                       .setType(OperationType.OPERATION_TYPE_BUY)
@@ -511,6 +515,522 @@ class TInvestBrokerGatewayTest {
         assertThat(unqualifiedWindow.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
         assertThat(accepted).isEmpty();
       }
+    }
+  }
+
+  @Test
+  void reconnectRecoversRecentExecutionCreatedDuringGapFromCanonicalOrderStages() throws Exception {
+    var at = java.time.Instant.now().minusSeconds(5);
+    var boundary = at.minusSeconds(10);
+    var operationsVisible = new java.util.concurrent.atomic.AtomicBoolean();
+    var accepted = new java.util.concurrent.LinkedBlockingQueue<BrokerGateway.SourceExecution>();
+    var gaps = new java.util.concurrent.LinkedBlockingQueue<String>();
+    var recovered = new java.util.concurrent.LinkedBlockingQueue<Boolean>();
+    var stateRequests = new java.util.concurrent.LinkedBlockingQueue<GetOrderStateRequest>();
+    var stream =
+        new OrdersStreamServiceGrpc.OrdersStreamServiceImplBase() {
+          volatile StreamObserver<TradesStreamResponse> live;
+          final java.util.concurrent.LinkedBlockingQueue<Integer> subscriptions =
+              new java.util.concurrent.LinkedBlockingQueue<>();
+          int count;
+
+          @Override
+          public void tradesStream(
+              TradesStreamRequest request, StreamObserver<TradesStreamResponse> out) {
+            live = out;
+            out.onNext(
+                TradesStreamResponse.newBuilder()
+                    .setSubscription(
+                        SubscriptionResponse.newBuilder()
+                            .setStatus(ResultSubscriptionStatus.RESULT_SUBSCRIPTION_STATUS_OK)
+                            .addAccounts("source"))
+                    .build());
+            subscriptions.add(++count);
+          }
+        };
+    var instruments =
+        new InstrumentsServiceGrpc.InstrumentsServiceImplBase() {
+          @Override
+          public void getInstrumentBy(
+              InstrumentRequest request, StreamObserver<InstrumentResponse> out) {
+            out.onNext(
+                InstrumentResponse.newBuilder()
+                    .setInstrument(
+                        ru.tinkoff.piapi.contract.v1.Instrument.newBuilder()
+                            .setUid("instrument-1")
+                            .setLot(10)
+                            .setCurrency("rub")
+                            .setMinPriceIncrement(Quotation.newBuilder().setNano(10000000)))
+                    .build());
+            out.onCompleted();
+          }
+        };
+    var operations =
+        new OperationsServiceGrpc.OperationsServiceImplBase() {
+          @Override
+          public void getOperationsByCursor(
+              GetOperationsByCursorRequest request,
+              StreamObserver<GetOperationsByCursorResponse> out) {
+            var page = GetOperationsByCursorResponse.newBuilder();
+            if (operationsVisible.get())
+              page.addItems(
+                  OperationItem.newBuilder()
+                      .setId("source-order-17")
+                      .setBrokerAccountId("source")
+                      .setInstrumentUid("instrument-1")
+                      .setType(OperationType.OPERATION_TYPE_BUY)
+                      .setTradesInfo(
+                          OperationItemTrades.newBuilder()
+                              .addTrades(
+                                  OperationItemTrade.newBuilder()
+                                      .setNum("operation-trade-17")
+                                      .setQuantity(30)
+                                      .setDate(TInvestBrokerGateway.timestamp(at))
+                                      .setPrice(
+                                          MoneyValue.newBuilder()
+                                              .setCurrency("rub")
+                                              .setUnits(101)
+                                              .setNano(500000000)))));
+            out.onNext(page.build());
+            out.onCompleted();
+          }
+        };
+    var orders =
+        new OrdersServiceGrpc.OrdersServiceImplBase() {
+          @Override
+          public void getOrderState(
+              GetOrderStateRequest request, StreamObserver<OrderState> out) {
+            stateRequests.add(request);
+            out.onNext(
+                OrderState.newBuilder()
+                    .setOrderId("source-order-17")
+                    .setInstrumentUid("instrument-1")
+                    .setDirection(OrderDirection.ORDER_DIRECTION_BUY)
+                    .setLotsRequested(3)
+                    .setLotsExecuted(3)
+                    .setExecutionReportStatus(
+                        OrderExecutionReportStatus.EXECUTION_REPORT_STATUS_FILL)
+                    .addStages(
+                        OrderStage.newBuilder()
+                            .setTradeId("canonical-trade-17")
+                            .setQuantity(3)
+                            .setExecutionTime(TInvestBrokerGateway.timestamp(at))
+                            .setPrice(
+                                MoneyValue.newBuilder()
+                                    .setCurrency("rub")
+                                    .setUnits(101)
+                                    .setNano(500000000)))
+                    .build());
+            out.onCompleted();
+          }
+        };
+    var journal =
+        new SourceFeedJournal() {
+          public java.time.Instant observationBoundary() {
+            return boundary;
+          }
+
+          public java.util.Optional<String> sourceOrderId(String account, String trade) {
+            return accepted.stream()
+                .filter(execution -> execution.accountId().equals(account))
+                .filter(execution -> execution.tradeId().equals(trade))
+                .map(BrokerGateway.SourceExecution::sourceOrderId)
+                .findFirst();
+          }
+
+          public java.util.Optional<BrokerGateway.SourceExecution> remembered(
+              String account, String trade) {
+            return accepted.stream()
+                .filter(execution -> execution.accountId().equals(account))
+                .filter(execution -> execution.tradeId().equals(trade))
+                .findFirst();
+          }
+
+          public java.util.List<BrokerGateway.SourceExecution> pendingTimestampRecovery() {
+            return List.of();
+          }
+
+          public java.time.Instant firstReceived(
+              String account, String trade, java.time.Instant received) {
+            return received;
+          }
+
+          public void remember(BrokerGateway.SourceExecution execution) {}
+
+          public void accept(BrokerGateway.SourceExecution execution) {
+            accepted.add(execution);
+          }
+
+          public void skip(BrokerGateway.SourceExecution execution, String reason) {
+            throw new AssertionError(reason);
+          }
+
+          public void gap(String reason) {
+            gaps.add(reason);
+          }
+
+          public void recovered() {
+            recovered.add(true);
+          }
+        };
+
+    try (var simulator = simulator(stream, instruments, operations, orders);
+        var gateway = gateway(simulator.server.getPort());
+        var feed = gateway.observe(journal)) {
+      assertThat(stream.subscriptions.poll(10, java.util.concurrent.TimeUnit.SECONDS)).isEqualTo(1);
+      assertThat(recovered.poll(10, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+      gaps.clear();
+
+      stream.live.onError(Status.UNAVAILABLE.asRuntimeException());
+      assertThat(gaps.poll(10, java.util.concurrent.TimeUnit.SECONDS))
+          .isEqualTo("Source stream disconnected");
+      operationsVisible.set(true);
+
+      assertThat(stream.subscriptions.poll(10, java.util.concurrent.TimeUnit.SECONDS)).isEqualTo(2);
+      var execution = accepted.poll(10, java.util.concurrent.TimeUnit.SECONDS);
+      assertThat(execution).isNotNull();
+      assertThat(execution.accountId()).isEqualTo("source");
+      assertThat(execution.tradeId()).isEqualTo("canonical-trade-17");
+      assertThat(execution.sourceOrderId()).isEqualTo("source-order-17");
+      assertThat(execution.instrumentId()).isEqualTo("instrument-1");
+      assertThat(execution.side()).isEqualTo(BrokerGateway.Side.BUY);
+      assertThat(execution.lots()).isEqualByComparingTo("3");
+      assertThat(execution.price()).isEqualByComparingTo("101.50");
+      assertThat(execution.currency()).isEqualTo("rub");
+      assertThat(execution.executedAt()).isEqualTo(at);
+      var lookup = stateRequests.poll(10, java.util.concurrent.TimeUnit.SECONDS);
+      assertThat(lookup).isNotNull();
+      assertThat(lookup.getAccountId()).isEqualTo("source");
+      assertThat(lookup.getOrderId()).isEqualTo("source-order-17");
+      assertThat(recovered.poll(10, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+      assertThat(accepted).isEmpty();
+    }
+  }
+
+  @Test
+  void reconnectKeepsAmbiguousRecentHistoryInGapWithoutAdmittingExecutions() throws Exception {
+    var at = java.time.Instant.now().minusSeconds(5);
+    var operationsVisible = new java.util.concurrent.atomic.AtomicBoolean();
+    var accepted = new java.util.concurrent.LinkedBlockingQueue<BrokerGateway.SourceExecution>();
+    var gaps = new java.util.concurrent.LinkedBlockingQueue<String>();
+    var recovered = new java.util.concurrent.LinkedBlockingQueue<Boolean>();
+    var stateRequests = new java.util.concurrent.LinkedBlockingQueue<GetOrderStateRequest>();
+    var stream =
+        new OrdersStreamServiceGrpc.OrdersStreamServiceImplBase() {
+          volatile StreamObserver<TradesStreamResponse> live;
+          final java.util.concurrent.LinkedBlockingQueue<Integer> subscriptions =
+              new java.util.concurrent.LinkedBlockingQueue<>();
+          int count;
+
+          @Override
+          public void tradesStream(
+              TradesStreamRequest request, StreamObserver<TradesStreamResponse> out) {
+            live = out;
+            out.onNext(
+                TradesStreamResponse.newBuilder()
+                    .setSubscription(
+                        SubscriptionResponse.newBuilder()
+                            .setStatus(ResultSubscriptionStatus.RESULT_SUBSCRIPTION_STATUS_OK)
+                            .addAccounts("source"))
+                    .build());
+            subscriptions.add(++count);
+          }
+        };
+    var instruments =
+        new InstrumentsServiceGrpc.InstrumentsServiceImplBase() {
+          @Override
+          public void getInstrumentBy(
+              InstrumentRequest request, StreamObserver<InstrumentResponse> out) {
+            out.onNext(
+                InstrumentResponse.newBuilder()
+                    .setInstrument(
+                        ru.tinkoff.piapi.contract.v1.Instrument.newBuilder()
+                            .setUid("instrument-1")
+                            .setLot(10)
+                            .setCurrency("rub")
+                            .setMinPriceIncrement(Quotation.newBuilder().setNano(10000000)))
+                    .build());
+            out.onCompleted();
+          }
+        };
+    var operations =
+        new OperationsServiceGrpc.OperationsServiceImplBase() {
+          @Override
+          public void getOperationsByCursor(
+              GetOperationsByCursorRequest request,
+              StreamObserver<GetOperationsByCursorResponse> out) {
+            var page = GetOperationsByCursorResponse.newBuilder();
+            if (operationsVisible.get())
+              page.addItems(
+                  OperationItem.newBuilder()
+                      .setId("source-order-ambiguous")
+                      .setBrokerAccountId("source")
+                      .setInstrumentUid("instrument-1")
+                      .setType(OperationType.OPERATION_TYPE_BUY)
+                      .setTradesInfo(
+                          OperationItemTrades.newBuilder()
+                              .addTrades(
+                                  OperationItemTrade.newBuilder()
+                                      .setNum("operation-trade-a")
+                                      .setQuantity(30)
+                                      .setDate(TInvestBrokerGateway.timestamp(at))
+                                      .setPrice(
+                                          MoneyValue.newBuilder()
+                                              .setCurrency("rub")
+                                              .setUnits(101)
+                                              .setNano(500000000)))
+                              .addTrades(
+                                  OperationItemTrade.newBuilder()
+                                      .setNum("operation-trade-b")
+                                      .setQuantity(30)
+                                      .setDate(TInvestBrokerGateway.timestamp(at))
+                                      .setPrice(
+                                          MoneyValue.newBuilder()
+                                              .setCurrency("rub")
+                                              .setUnits(101)
+                                              .setNano(500000000)))));
+            out.onNext(page.build());
+            out.onCompleted();
+          }
+        };
+    var orders =
+        new OrdersServiceGrpc.OrdersServiceImplBase() {
+          @Override
+          public void getOrderState(
+              GetOrderStateRequest request, StreamObserver<OrderState> out) {
+            stateRequests.add(request);
+            out.onNext(
+                OrderState.newBuilder()
+                    .setOrderId("source-order-ambiguous")
+                    .setInstrumentUid("instrument-1")
+                    .setDirection(OrderDirection.ORDER_DIRECTION_BUY)
+                    .setLotsRequested(6)
+                    .setLotsExecuted(6)
+                    .setExecutionReportStatus(
+                        OrderExecutionReportStatus.EXECUTION_REPORT_STATUS_FILL)
+                    .addStages(
+                        OrderStage.newBuilder()
+                            .setTradeId("canonical-trade-a")
+                            .setQuantity(3)
+                            .setExecutionTime(TInvestBrokerGateway.timestamp(at))
+                            .setPrice(
+                                MoneyValue.newBuilder()
+                                    .setCurrency("rub")
+                                    .setUnits(101)
+                                    .setNano(500000000)))
+                    .addStages(
+                        OrderStage.newBuilder()
+                            .setTradeId("canonical-trade-b")
+                            .setQuantity(3)
+                            .setExecutionTime(TInvestBrokerGateway.timestamp(at))
+                            .setPrice(
+                                MoneyValue.newBuilder()
+                                    .setCurrency("rub")
+                                    .setUnits(101)
+                                    .setNano(500000000)))
+                    .build());
+            out.onCompleted();
+          }
+        };
+    var journal =
+        new SourceFeedJournal() {
+          public java.time.Instant observationBoundary() {
+            return at.minusSeconds(20);
+          }
+
+          public java.util.Optional<String> sourceOrderId(String account, String trade) {
+            return java.util.Optional.empty();
+          }
+
+          public java.util.Optional<BrokerGateway.SourceExecution> remembered(
+              String account, String trade) {
+            return java.util.Optional.empty();
+          }
+
+          public java.util.List<BrokerGateway.SourceExecution> pendingTimestampRecovery() {
+            return List.of();
+          }
+
+          public java.time.Instant firstReceived(
+              String account, String trade, java.time.Instant received) {
+            return received;
+          }
+
+          public void remember(BrokerGateway.SourceExecution execution) {}
+
+          public void accept(BrokerGateway.SourceExecution execution) {
+            accepted.add(execution);
+          }
+
+          public void acceptRecovered(BrokerGateway.SourceExecution execution) {
+            accepted.add(execution);
+          }
+
+          public void skip(BrokerGateway.SourceExecution execution, String reason) {
+            throw new AssertionError(reason);
+          }
+
+          public void gap(String reason) {
+            gaps.add(reason);
+          }
+
+          public void recovered() {
+            recovered.add(true);
+          }
+        };
+
+    try (var simulator = simulator(stream, instruments, operations, orders);
+        var gateway = gateway(simulator.server.getPort());
+        var feed = gateway.observe(journal)) {
+      assertThat(stream.subscriptions.poll(10, java.util.concurrent.TimeUnit.SECONDS)).isEqualTo(1);
+      assertThat(recovered.poll(10, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+      gaps.clear();
+
+      stream.live.onError(Status.UNAVAILABLE.asRuntimeException());
+      assertThat(gaps.poll(10, java.util.concurrent.TimeUnit.SECONDS))
+          .isEqualTo("Source stream disconnected");
+      operationsVisible.set(true);
+
+      assertThat(stream.subscriptions.poll(10, java.util.concurrent.TimeUnit.SECONDS)).isEqualTo(2);
+      assertThat(gaps.poll(10, java.util.concurrent.TimeUnit.SECONDS))
+          .isEqualTo("Source subscription awaiting acknowledgement and history recovery");
+      assertThat(gaps.poll(10, java.util.concurrent.TimeUnit.SECONDS))
+          .isEqualTo("Ambiguous or conflicting GetOrderState source history: source-order-ambiguous");
+      assertThat(stateRequests)
+          .singleElement()
+          .satisfies(request -> assertThat(request.getOrderId()).isEqualTo("source-order-ambiguous"));
+      assertThat(accepted).isEmpty();
+      assertThat(recovered).isEmpty();
+    }
+  }
+
+  @Test
+  void orderTradesFrameWithoutTradesDoesNotAdmitAnExecution() throws Exception {
+    var now = java.time.Instant.now();
+    var subscriptions = new java.util.concurrent.LinkedBlockingQueue<Integer>();
+    var accepted = new java.util.concurrent.LinkedBlockingQueue<BrokerGateway.SourceExecution>();
+    var recovered = new java.util.concurrent.LinkedBlockingQueue<Boolean>();
+    var gaps = new java.util.concurrent.LinkedBlockingQueue<String>();
+    var frameProcessed = new java.util.concurrent.CountDownLatch(1);
+    var stream =
+        new OrdersStreamServiceGrpc.OrdersStreamServiceImplBase() {
+          volatile StreamObserver<TradesStreamResponse> live;
+
+          @Override
+          public void tradesStream(
+              TradesStreamRequest request, StreamObserver<TradesStreamResponse> out) {
+            live = out;
+            out.onNext(
+                TradesStreamResponse.newBuilder()
+                    .setSubscription(
+                        SubscriptionResponse.newBuilder()
+                            .setStatus(ResultSubscriptionStatus.RESULT_SUBSCRIPTION_STATUS_OK)
+                            .addAccounts("source"))
+                    .build());
+            subscriptions.add(1);
+          }
+        };
+    var instruments =
+        new InstrumentsServiceGrpc.InstrumentsServiceImplBase() {
+          @Override
+          public void getInstrumentBy(
+              InstrumentRequest request, StreamObserver<InstrumentResponse> out) {
+            out.onNext(
+                InstrumentResponse.newBuilder()
+                    .setInstrument(
+                        ru.tinkoff.piapi.contract.v1.Instrument.newBuilder()
+                            .setUid("instrument-1")
+                            .setLot(10)
+                            .setCurrency("rub")
+                            .setMinPriceIncrement(Quotation.newBuilder().setNano(10000000)))
+                    .build());
+            out.onCompleted();
+          }
+        };
+    var operations =
+        new OperationsServiceGrpc.OperationsServiceImplBase() {
+          @Override
+          public void getOperationsByCursor(
+              GetOperationsByCursorRequest request,
+              StreamObserver<GetOperationsByCursorResponse> out) {
+            out.onNext(GetOperationsByCursorResponse.getDefaultInstance());
+            out.onCompleted();
+          }
+        };
+    var journal =
+        new SourceFeedJournal() {
+          public java.time.Instant observationBoundary() {
+            return now.minusSeconds(1);
+          }
+
+          public java.util.Optional<String> sourceOrderId(String account, String trade) {
+            return java.util.Optional.empty();
+          }
+
+          public java.util.Optional<BrokerGateway.SourceExecution> remembered(
+              String account, String trade) {
+            return java.util.Optional.empty();
+          }
+
+          public java.util.List<BrokerGateway.SourceExecution> pendingTimestampRecovery() {
+            return List.of();
+          }
+
+          public java.time.Instant firstReceived(
+              String account, String trade, java.time.Instant received) {
+            return received;
+          }
+
+          public void remember(BrokerGateway.SourceExecution execution) {
+            throw new AssertionError("An order-only frame cannot remember a trade");
+          }
+
+          public void accept(BrokerGateway.SourceExecution execution) {
+            accepted.add(execution);
+          }
+
+          public void acceptRecovered(BrokerGateway.SourceExecution execution) {
+            accepted.add(execution);
+          }
+
+          public void skip(BrokerGateway.SourceExecution execution, String reason) {
+            throw new AssertionError(reason);
+          }
+
+          public void gap(String reason) {
+            gaps.add(reason);
+          }
+
+          public void recovered() {
+            recovered.add(true);
+          }
+
+          public void readSucceeded() {
+            frameProcessed.countDown();
+          }
+        };
+
+    try (var simulator = simulator(stream, instruments, operations);
+        var gateway = gateway(simulator.server.getPort());
+        var feed = gateway.observe(journal)) {
+      assertThat(subscriptions.poll(10, java.util.concurrent.TimeUnit.SECONDS)).isEqualTo(1);
+      assertThat(recovered.poll(10, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+      gaps.clear();
+
+      stream.live.onNext(
+          TradesStreamResponse.newBuilder()
+              .setOrderTrades(
+                  OrderTrades.newBuilder()
+                      .setAccountId("source")
+                      .setOrderId("source-order-without-executions")
+                      .setInstrumentUid("instrument-1")
+                      .setDirection(OrderDirection.ORDER_DIRECTION_BUY))
+              .build());
+
+      assertThat(frameProcessed.await(10, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+      assertThat(accepted).isEmpty();
+      assertThat(recovered).isEmpty();
+      assertThat(gaps).isEmpty();
     }
   }
 

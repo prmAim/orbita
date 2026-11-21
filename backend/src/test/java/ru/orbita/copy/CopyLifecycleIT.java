@@ -190,6 +190,58 @@ class CopyLifecycleIT {
     assertThat(broker.posts).isEqualTo(2);
   }
 
+  @org.junit.jupiter.params.ParameterizedTest(name = "streamFirst={0}")
+  @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+  void sameThreeLotExecutionInStreamAndSnapshotOrdersDoesNotDuplicatePositionOrReservation(
+      boolean streamFirst) {
+    runningAtFive();
+    broker.mirrorCapital = new BigDecimal("100000");
+    control.recalculate();
+    broker.fillEveryPost = false;
+    broker.partialNext = 2;
+    clock.now = clock.now.plusSeconds(1);
+    var execution = source("stream-snapshot-three-lots", Side.BUY, 3, clock.instant());
+
+    var first = streamFirst ? copies.accept(execution) : copies.acceptRecovered(execution);
+    assertThat(first.newLots()).isEqualTo(3);
+    trading.tick();
+
+    var reservedAfterPartialFill = copies.intents().getFirst().reservedMoney();
+    assertThat(copies.intents())
+        .singleElement()
+        .satisfies(
+            intent -> {
+              assertThat(intent.lots()).isEqualTo(3);
+              assertThat(intent.executedLots()).isEqualTo(2);
+              assertThat(intent.reservedMoney()).isPositive();
+            });
+    assertThat(copies.positions())
+        .singleElement()
+        .satisfies(position -> assertThat(position.copiedLots()).isEqualTo(2));
+    assertThat(broker.posts).isEqualTo(1);
+    assertThat(broker.sentRequests)
+        .singleElement()
+        .satisfies(request -> assertThat(request.lots()).isEqualTo(3));
+
+    var duplicate = streamFirst ? copies.acceptRecovered(execution) : copies.accept(execution);
+    trading.tick();
+
+    assertThat(duplicate.executionId()).isEqualTo(first.executionId());
+    assertThat(copies.intents())
+        .singleElement()
+        .satisfies(
+            intent -> {
+              assertThat(intent.lots()).isEqualTo(3);
+              assertThat(intent.executedLots()).isEqualTo(2);
+              assertThat(intent.reservedMoney()).isEqualByComparingTo(reservedAfterPartialFill);
+            });
+    assertThat(copies.positions())
+        .singleElement()
+        .satisfies(position -> assertThat(position.copiedLots()).isEqualTo(2));
+    assertThat(broker.posts).isEqualTo(1);
+    assertThat(broker.sentRequests).hasSize(1);
+  }
+
   @Test
   void correctedArtifactReplaysSavedNaturalInputsWithoutChangingOldResultsOrSending() {
     var old = savedNaturalInputsWithFormerSellFailure();
