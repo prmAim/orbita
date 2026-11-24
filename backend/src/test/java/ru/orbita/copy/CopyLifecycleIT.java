@@ -3646,6 +3646,12 @@ class CopyLifecycleIT {
 
   private void assertThirtyLotBuyCorrectionOutcome() {
     assertThat(
+            control.instruments().stream()
+                .filter(instrument -> instrument.instrumentId().equals("instrument")))
+        .singleElement()
+        .satisfies(instrument -> assertThat(instrument.paused()).isFalse());
+
+    assertThat(
             db.query(
                 """
                 SELECT executed_lots, skipped_lots
