@@ -255,6 +255,64 @@ class CopyLifecycleIT {
     assertThat(broker.sentRequests).hasSize(1);
   }
 
+  @org.junit.jupiter.params.ParameterizedTest(name = "legacyFullReserve={0}")
+  @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+  void partialBuyKeepsOriginalPerLotPrincipalAcrossMetadataChanges(boolean legacyFullReserve) {
+    runningAtFive();
+    broker.mirrorCapital = broker.sourceCapital;
+    control.recalculate();
+    broker.instrumentLotSize = 10;
+    broker.individualLotFills = true;
+    broker.partialNext = 3;
+    broker.postHook =
+        r -> {
+          var row =
+              db.queryForMap(
+                  "select buy_principal_per_lot, reserved_money from copy_intent where id=?",
+                  r.requestId());
+          assertThat((BigDecimal) row.get("buy_principal_per_lot")).isEqualByComparingTo("1005");
+          assertThat((BigDecimal) row.get("reserved_money")).isEqualByComparingTo("6032");
+        };
+    clock.now = clock.now.plusSeconds(1);
+    copies.accept(source("six-lot-buy", Side.BUY, 6, clock.instant()));
+    trading.dispatchReady();
+    var request = broker.sent;
+    assertThat(copies.intents().getFirst().reservedMoney()).isEqualByComparingTo("3017");
+
+    // A migrated V20 row can already have three booked lots and still hold all six lots' principal.
+    if (legacyFullReserve) {
+      db.update(
+          "update copy_intent set buy_principal_per_lot=null, reserved_money=6032 where id=?",
+          request.requestId());
+    }
+    broker.instrumentLotSize = 5;
+    var reads = new AtomicInteger();
+    broker.instrumentHook = reads::incrementAndGet;
+    broker.orders.put(
+        request.requestId(), broker.evidence(request, OrderStatus.PARTIALLY_FILLED, 4));
+    trading.reconcileOnly();
+    assertThat(copies.intents().getFirst().reservedMoney()).isEqualByComparingTo("2012");
+    assertThat(
+            db.queryForObject(
+                "select buy_principal_per_lot from copy_intent where id=?",
+                BigDecimal.class,
+                request.requestId()))
+        .isEqualByComparingTo("1005");
+
+    broker.instrumentHook =
+        () -> {
+          throw new AssertionError("Unary fill accounting must use the original reservation");
+        };
+    broker.orders.put(
+        request.requestId(), broker.evidence(request, OrderStatus.PARTIALLY_FILLED, 5));
+    trading.reconcileOnly();
+    trading.reconcileOnly();
+    assertThat(copies.intents().getFirst().reservedMoney()).isEqualByComparingTo("1007");
+    assertThat(copies.positions()).extracting(MirrorPosition.View::copiedLots).containsExactly(5L);
+    assertThat(reads.get()).isZero();
+    assertThat(broker.posts).isOne();
+  }
+
   @Test
   void correctedArtifactReplaysSavedNaturalInputsWithoutChangingOldResultsOrSending() {
     var old = savedNaturalInputsWithFormerSellFailure();

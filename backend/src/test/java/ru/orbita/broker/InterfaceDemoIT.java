@@ -114,7 +114,7 @@ class InterfaceDemoIT {
   }
 
   @Test
-  void removeManifestCapturedOnV17AfterUpgradeToV20PreservesLaterControlColumns() {
+  void removeManifestCapturedOnV17AfterUpgradeToV21PreservesLaterControlColumns() {
     try (var postgres = new PostgreSQLContainer("postgres:17.11-alpine")) {
       postgres.start();
       Flyway.configure()
@@ -166,7 +166,7 @@ class InterfaceDemoIT {
               db.queryForObject(
                   "select version from flyway_schema_history where success order by installed_rank desc limit 1",
                   String.class))
-          .isEqualTo("20");
+          .isEqualTo("21");
       UUID notificationId = UUID.randomUUID();
       long journalBoundary = ownerJournalId + 17;
       db.update(

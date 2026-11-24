@@ -39,6 +39,11 @@ class BuyResourceRejectionWholeChainIT {
     PROTECTED_POSITION_MISMATCH
   }
 
+  private enum FillDelivery {
+    STREAM_THEN_SNAPSHOT,
+    SNAPSHOT_THEN_STREAM
+  }
+
   @TempDir Path directory;
   private WholeChainBrokerSimulator bank;
   private CopyLifecycleIT.MutableClock clock;
@@ -401,6 +406,116 @@ class BuyResourceRejectionWholeChainIT {
         .singleElement()
         .satisfies(lots -> assertThat(lots).isEqualByComparingTo(BigDecimal.ONE));
     assertThat(bank.calls("PostOrder")).hasSize(2); // One opening BUY and one SELL.
+  }
+
+  @ParameterizedTest
+  @EnumSource(FillDelivery.class)
+  void sameMirrorFillInStreamAndSnapshotBooksTwoLotsAndKeepsOneLotReserved(FillDelivery order)
+      throws Exception {
+    bank.setLotSize(WholeChainBrokerSimulator.INSTRUMENT, 10);
+    prepare(true);
+    UUID request =
+        postSource("source-buy-3", "source-order", 3, WholeChainBrokerSimulator.PRICE, 0);
+    var attempt = orderRequest(request, 3, new BigDecimal("100.50"));
+    assertThat(bank.calls("PostOrder"))
+        .singleElement()
+        .satisfies(
+            call -> {
+              var post = (ru.tinkoff.piapi.contract.v1.PostOrderRequest) call.request();
+              assertThat(post.getOrderId()).isEqualTo(request.toString());
+              assertThat(post.getAccountId()).isEqualTo(attempt.accountId());
+              assertThat(post.getInstrumentId()).isEqualTo(attempt.instrumentId());
+              assertThat(post.getQuantity()).isEqualTo(3);
+            });
+    // The initial NEW links the exchange order ID carried by TradesStream to this intent.
+    bank.emitOrderState(request, null);
+    await(() -> count("ORDER_TRADE_LINK") == 1);
+    assertThat((BigDecimal) persisted(request).get("reserved_money")).isEqualByComparingTo("3017");
+    bank.fillOrder(request, 2, clock.instant());
+    var bankFills = bank.mirrorFillIds(request);
+    assertThat(bankFills).hasSize(1);
+    String fillId = bankFills.getFirst();
+    var journal = app.getBean(OrderEvidenceJournal.class);
+    long before = journal.highWater();
+    var deliveries =
+        order == FillDelivery.STREAM_THEN_SNAPSHOT
+            ? List.of(
+                OrderSdkEvidence.Source.TRADES_STREAM, OrderSdkEvidence.Source.GET_ORDER_STATE)
+            : List.of(
+                OrderSdkEvidence.Source.GET_ORDER_STATE, OrderSdkEvidence.Source.TRADES_STREAM);
+    for (var source : deliveries) {
+      if (source == OrderSdkEvidence.Source.TRADES_STREAM) bank.emitMirrorTrade(request, fillId);
+      else app.getBean(TradingService.class).reconcileOnly();
+      await(
+          () ->
+              journal.history(attempt).stream()
+                  .anyMatch(
+                      p ->
+                          p.sequence() > before
+                              && p.evidence().sdkEvidence().source() == source
+                              && journal.applied(p.sequence())));
+      assertPartialMirrorBooking(attempt, fillId);
+    }
+    var receipts =
+        journal.history(attempt).stream()
+            .filter(p -> p.sequence() > before)
+            .map(p -> p.evidence().sdkEvidence())
+            .toList();
+    assertThat(receipts).extracting(OrderSdkEvidence::source).containsExactlyElementsOf(deliveries);
+    for (var raw : receipts) {
+      assertThat(raw.responseOrderId()).isEqualTo(bank.brokerOrderId(request));
+      if (raw.source() == OrderSdkEvidence.Source.TRADES_STREAM) {
+        assertThat(raw.responseAccountId()).isEqualTo(attempt.accountId());
+        assertThat(raw.trades())
+            .extracting(OrderSdkEvidence.TradeFact::tradeId, OrderSdkEvidence.TradeFact::pieces)
+            .containsExactly(tuple(fillId, 20L));
+      } else {
+        assertThat(raw.responseRequestId()).isEqualTo(request.toString());
+        assertThat(raw.executedLots()).isEqualTo(2L);
+        assertThat(raw.stages())
+            .extracting(
+                ru.tinkoff.piapi.contract.v1.OrderStage::getTradeId,
+                ru.tinkoff.piapi.contract.v1.OrderStage::getQuantity)
+            .containsExactly(tuple(fillId, 2L));
+      }
+    }
+    assertThat(bank.mirrorFillIds(request)).containsExactly(fillId);
+    assertThat(bank.position(attempt.accountId(), attempt.instrumentId())).isEqualTo(2);
+    assertThat(bank.calls("PostOrder")).hasSize(1);
+  }
+
+  private void assertPartialMirrorBooking(OrderRequest attempt, String fillId) {
+    var copies = app.getBean(CopyService.class);
+    assertThat(copies.intents())
+        .extracting(
+            CopyIntent.View::id,
+            CopyIntent.View::status,
+            CopyIntent.View::lots,
+            CopyIntent.View::executedLots,
+            CopyIntent.View::skippedLots)
+        .containsExactly(tuple(attempt.requestId(), "ACTIVE", 3L, 2L, 0L));
+    assertThat(copies.positions())
+        .extracting(MirrorPosition.View::instrumentId, MirrorPosition.View::copiedLots)
+        .containsExactly(tuple(attempt.instrumentId(), 2L));
+    assertThat(
+            app.getBean(JdbcTemplate.class)
+                .queryForList(
+                    "select lots from broker_fill where intent_id=? and trade_id=?",
+                    BigDecimal.class,
+                    attempt.requestId(),
+                    fillId))
+        .singleElement()
+        .satisfies(lots -> assertThat(lots).isEqualByComparingTo("2"));
+    assertThat(
+            app.getBean(JdbcTemplate.class)
+                .queryForList(
+                    "select trade_id from broker_fill where intent_id=?",
+                    String.class,
+                    attempt.requestId()))
+        .containsExactly(fillId);
+    // One remaining lot of ten shares at the original limit, plus 1 RUB fee and 1 RUB extra.
+    assertThat((BigDecimal) persisted(attempt.requestId()).get("reserved_money"))
+        .isEqualByComparingTo("1007");
   }
 
   private Optional<String> pausedFor(OrderRequest attempt) {

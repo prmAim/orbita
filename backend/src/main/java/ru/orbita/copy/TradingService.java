@@ -974,10 +974,9 @@ public class TradingService implements UnsentIntentStop {
                 return null;
               }
               long resourceSkipped = currentRequested - allowed;
-              BigDecimal principal =
-                  i.limitPrice
-                      .multiply(BigDecimal.valueOf(instrument.lotSize()))
-                      .multiply(BigDecimal.valueOf(allowed));
+              BigDecimal principalPerLot =
+                  i.limitPrice.multiply(BigDecimal.valueOf(instrument.lotSize()));
+              BigDecimal principal = principalPerLot.multiply(BigDecimal.valueOf(allowed));
               BigDecimal fees =
                   resources.preliminaryCommission().add(resources.additionalCommissionReserve());
               var totalCurrency = ru.orbita.valuation.ExactRub.of(principal.add(fees));
@@ -1042,6 +1041,7 @@ public class TradingService implements UnsentIntentStop {
               }
               i.reservedMoney = "BUY".equals(i.side) ? principal.add(fees) : fees;
               i.commissionReserve = fees;
+              i.buyPrincipalPerLot = "BUY".equals(i.side) ? principalPerLot : null;
               i.reservedLots = "SELL".equals(i.side) ? allowed : 0;
               i.status = "SEND_STARTED";
               em.persist(
@@ -1118,6 +1118,7 @@ public class TradingService implements UnsentIntentStop {
             throw new IllegalStateException("Known-unsent barrier no longer matches");
           i.reservedMoney = BigDecimal.ZERO;
           i.commissionReserve = BigDecimal.ZERO;
+          i.buyPrincipalPerLot = null;
           i.reservedLots = 0;
           i.requestedLots = 0;
           if (i.acceptanceAttempt)
@@ -1460,6 +1461,7 @@ public class TradingService implements UnsentIntentStop {
             i.acceptanceOrderReconciled = false;
             i.acceptanceReconciled = false;
             i.status = i.cancellationPending ? "CANCEL_STARTED" : "ACTIVE";
+            if (evidence.status() == OrderStatus.PARTIALLY_FILLED) i.reserveRemainingBuyPrincipal();
             if (i.sentAt == null && !stream) {
               i.sentAt =
                   Objects.requireNonNull(
@@ -1521,6 +1523,13 @@ public class TradingService implements UnsentIntentStop {
     List<Fill> fills = new ArrayList<>();
     Set<String> unique = new HashSet<>();
     boolean valid = raw.lotSize() == null || raw.lotSize() == instrument.lotSize();
+    if (!raw.trades().isEmpty() && intent.buyPrincipalPerLot != null) {
+      // A later change in the lot definition cannot qualify piece counts for this attempt.
+      valid &=
+          intent.buyPrincipalPerLot.compareTo(
+                  intent.limitPrice.multiply(BigDecimal.valueOf(instrument.lotSize())))
+              == 0;
+    }
     for (var t : raw.trades()) {
       if (t.tradeId() == null
           || t.tradeId().isBlank()
