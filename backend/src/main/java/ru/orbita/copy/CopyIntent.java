@@ -50,6 +50,9 @@ public class CopyIntent {
   @Column(precision = 38, scale = 9)
   BigDecimal commissionReserve = BigDecimal.ZERO;
 
+  @Column(precision = 38, scale = 9)
+  BigDecimal buyPrincipalPerLot;
+
   long reservedLots;
   long executedLots;
   long skippedLots;
@@ -87,6 +90,33 @@ public class CopyIntent {
   BigDecimal actualCommission;
 
   protected CopyIntent() {}
+
+  BigDecimal originalBuyPrincipalPerLot() {
+    if (buyPrincipalPerLot != null) return buyPrincipalPerLot;
+    // Through V20, active BUY orders held the entire original principal plus fees.
+    if (requestedLots <= 0
+        || limitPrice == null
+        || limitPrice.signum() <= 0
+        || commissionReserve == null
+        || commissionReserve.signum() < 0
+        || reservedMoney == null) return null;
+    try {
+      var principal = reservedMoney.subtract(commissionReserve);
+      int lotSize =
+          principal.divide(limitPrice.multiply(BigDecimal.valueOf(requestedLots))).intValueExact();
+      return lotSize > 0 ? limitPrice.multiply(BigDecimal.valueOf(lotSize)) : null;
+    } catch (ArithmeticException unproven) {
+      return null;
+    }
+  }
+
+  void reserveRemainingBuyPrincipal() {
+    if (!"BUY".equals(side) || executedLots <= 0 || executedLots >= requestedLots) return;
+    buyPrincipalPerLot = originalBuyPrincipalPerLot();
+    if (buyPrincipalPerLot == null) return;
+    var remaining = BigDecimal.valueOf(requestedLots - executedLots);
+    reservedMoney = buyPrincipalPerLot.multiply(remaining).add(commissionReserve);
+  }
 
   static CopyIntent fromExecution(SourceExecutionEntity event, long lots, Instant now) {
     if (lots <= 0) throw new IllegalArgumentException("An intent requires positive lots");

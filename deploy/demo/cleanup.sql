@@ -36,9 +36,9 @@ begin
     select version into schema_version from public.flyway_schema_history where success order by installed_rank desc limit 1;
     if manifest_version=1 and schema_version is distinct from '15' then
         raise exception 'Remove the legacy version 1 preview on schema 15 before upgrading';
-    elsif manifest_version=2 and ((schema_version is distinct from '16' and schema_version is distinct from '17' and schema_version is distinct from '18' and schema_version is distinct from '19' and schema_version is distinct from '20') or to_regclass('public.account_read_document') is null
+    elsif manifest_version=2 and ((schema_version is distinct from '16' and schema_version is distinct from '17' and schema_version is distinct from '18' and schema_version is distinct from '19' and schema_version is distinct from '20' and schema_version is distinct from '21') or to_regclass('public.account_read_document') is null
        or to_regclass('public.account_read_freshness') is null or to_regclass('public.account_read_revision') is null) then
-        raise exception 'Version 2 preview requires qualified schema 16, 17, 18, 19 or 20 read tables';
+        raise exception 'Version 2 preview requires qualified schema 16, 17, 18, 19, 20 or 21 read tables';
     end if;
     -- Only the unfinished harness teardown may restore its snapshot. A later Remove must
     -- preserve subsequent owner state instead of replaying an old control snapshot.
@@ -68,7 +68,7 @@ begin
     end if;
 
     if manifest_version=2 then
-        -- These statements are planned only in v2/schema16-20. A v1/schema15 removal
+        -- These statements are planned only in v2/schema16-21. A v1/schema15 removal
         -- never resolves an absent account_read_* relation or row_snapshot column.
         foreach item slice 1 in array array[
             array['account_read_document','jsonb_build_array(t.account_id,t.kind,t.id)::text'],

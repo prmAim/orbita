@@ -60,8 +60,8 @@ public final class InterfaceDemoLedger {
             try (ResultSet row =
                 sql.executeQuery(
                     "select version from public.flyway_schema_history where success order by installed_rank desc limit 1")) {
-              if (!row.next() || !"20".equals(row.getString(1)))
-                throw new IllegalStateException("Demo requires the qualified schema version 20");
+              if (!row.next() || !"21".equals(row.getString(1)))
+                throw new IllegalStateException("Demo requires the qualified schema version 21");
             }
             for (var key : KEYS.entrySet())
               if (readRelation(key.getKey())) {

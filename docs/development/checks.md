@@ -14,7 +14,7 @@ python tools/check_demo_schema.py
 `deploy/demo/schema-compatibility.json` и реальные защитные условия в Java
 `InterfaceDemoLedger`, PowerShell Generate и SQL Remove. Текущая схема должна
 быть явно квалифицирована для Generate и Remove; сохраняются старые пары
-manifest 1/schema 15 и manifest 2/schema 16,17,18,19,20. Новая миграция сама по себе
+manifest 1/schema 15 и manifest 2/schema 16,17,18,19,20,21. Новая миграция сама по себе
 не подтверждает совместимость: проверка завершится с ненулевым кодом до
 сборок CI. При намеренном изменении guards обновите проверку и её регрессии.
 

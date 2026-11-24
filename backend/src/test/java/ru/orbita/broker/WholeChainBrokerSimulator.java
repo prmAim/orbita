@@ -74,6 +74,7 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
   private static final class Resources {
     BigDecimal money = new BigDecimal("10000");
     long buy = 100, sell = 100, nextFill = Long.MAX_VALUE;
+    int lotSize = 1;
   }
 
   private final Map<PositionKey, Long> positions = new HashMap<>();
@@ -251,6 +252,22 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
 
   public synchronized void setNextPostFill(long lots) {
     setNextPostFill(INSTRUMENT, lots);
+  }
+
+  public synchronized void setLotSize(String instrument, int lotSize) {
+    checkInstrument(instrument);
+    if (lotSize <= 0 || !executions.isEmpty() || !orders.isEmpty() || !externalOrders.isEmpty())
+      throw new IllegalArgumentException(
+          "Set a positive lot size before recording any trades or orders");
+    resources.get(instrument).lotSize = lotSize;
+  }
+
+  private synchronized int lotSize(String instrument) {
+    return resources.get(instrument).lotSize;
+  }
+
+  private long pieces(String instrument, long lots) {
+    return Math.multiplyExact(lots, lotSize(instrument));
   }
 
   public synchronized void setNextPostFill(String instrument, long lots) {
@@ -461,7 +478,7 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
             .filter(e -> e.account().equals(SOURCE) && e.id().equals(tradeId))
             .findFirst()
             .orElseThrow();
-    sendSource(execution);
+    emitSourceFrame(orderTrades(execution));
   }
 
   public synchronized void emitSource(
@@ -511,20 +528,19 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
     addExecution(execution);
   }
 
-  private void sendSource(Execution execution) {
-    emitSourceFrame(
-        OrderTrades.newBuilder()
-            .setAccountId(SOURCE)
-            .setOrderId(execution.order())
-            .setInstrumentUid(execution.instrument())
-            .setDirection(direction(execution.side()))
-            .addTrades(
-                OrderTrade.newBuilder()
-                    .setTradeId(execution.id())
-                    .setQuantity(execution.lots())
-                    .setPrice(TInvestBrokerGateway.quotation(execution.price()))
-                    .setDateTime(TInvestBrokerGateway.timestamp(execution.at())))
-            .build());
+  private OrderTrades orderTrades(Execution execution) {
+    return OrderTrades.newBuilder()
+        .setAccountId(execution.account())
+        .setOrderId(execution.order())
+        .setInstrumentUid(execution.instrument())
+        .setDirection(direction(execution.side()))
+        .addTrades(
+            OrderTrade.newBuilder()
+                .setTradeId(execution.id())
+                .setQuantity(pieces(execution.instrument(), execution.lots()))
+                .setPrice(TInvestBrokerGateway.quotation(execution.price()))
+                .setDateTime(TInvestBrokerGateway.timestamp(execution.at())))
+        .build();
   }
 
   public synchronized void emitSourceFrame(OrderTrades trades) {
@@ -534,6 +550,20 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
 
   public synchronized void fillOrder(UUID requestId, long additionalLots, Instant at) {
     fill(requireOrder(requestId), additionalLots, at);
+  }
+
+  public synchronized List<String> mirrorFillIds(UUID requestId) {
+    return requireOrder(requestId).fills.stream().map(Execution::id).toList();
+  }
+
+  public synchronized void emitMirrorTrade(UUID requestId, String tradeId) {
+    var fill =
+        requireOrder(requestId).fills.stream()
+            .filter(f -> f.id().equals(tradeId))
+            .findFirst()
+            .orElseThrow();
+    var frame = TradesStreamResponse.newBuilder().setOrderTrades(orderTrades(fill)).build();
+    for (var out : mirrorTrades) out.onNext(frame);
   }
 
   private static boolean terminalWithoutFill(OrderExecutionReportStatus status) {
@@ -568,7 +598,7 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
             .setTradeOrderId(order.bankId)
             .setInstrumentUid(order.request.getInstrumentId())
             .setDirection(order.request.getDirection())
-            .setLotSize(1)
+            .setLotSize(lotSize(order.request.getInstrumentId()))
             .setLotsRequested(order.request.getQuantity())
             .setLotsExecuted(order.filled())
             .setLotsLeft(
@@ -644,7 +674,7 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
 
   private BigDecimal securitiesValue(String account) {
     return SECURITIES.stream()
-        .map(s -> s.price().multiply(BigDecimal.valueOf(position(account, s.id()))))
+        .map(s -> s.price().multiply(BigDecimal.valueOf(pieces(s.id(), position(account, s.id())))))
         .reduce(BigDecimal.ZERO, BigDecimal::add);
   }
 
@@ -763,7 +793,7 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
                         .setUid(request.getId())
                         .setTicker(request.getId())
                         .setName("Синтетическая бумага " + request.getId())
-                        .setLot(1)
+                        .setLot(lotSize(request.getId()))
                         .setCurrency("rub")
                         .setInstrumentType("share")
                         .setInstrumentKind(InstrumentType.INSTRUMENT_TYPE_SHARE)
@@ -797,7 +827,9 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
                   PortfolioPosition.newBuilder()
                       .setInstrumentUid(security.id())
                       .setInstrumentType("share")
-                      .setQuantity(TInvestBrokerGateway.quotation(BigDecimal.valueOf(lots)))
+                      .setQuantity(
+                          TInvestBrokerGateway.quotation(
+                              BigDecimal.valueOf(pieces(security.id(), lots))))
                       .setCurrentPrice(money(security.price())));
           }
           reply(out, portfolio.build());
@@ -815,7 +847,7 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
                 .addMoney(currencyMoney("usd", new BigDecimal("5")))
                 .addBlocked(currencyMoney("usd", BigDecimal.ONE));
           for (var security : SECURITIES) {
-            long pieces = position(request.getAccountId(), security.id());
+            long pieces = pieces(security.id(), position(request.getAccountId(), security.id()));
             if (pieces != 0)
               result.addSecurities(
                   PositionsSecurities.newBuilder()
@@ -856,7 +888,7 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
                             .addTrades(
                                 OperationItemTrade.newBuilder()
                                     .setNum(execution.id())
-                                    .setQuantity(execution.lots())
+                                    .setQuantity(pieces(execution.instrument(), execution.lots()))
                                     .setPrice(money(execution.price()))
                                     .setDate(TInvestBrokerGateway.timestamp(execution.at())))));
           }
@@ -956,7 +988,10 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
                   request.getPrice().getUnits(), request.getPrice().getNano());
           long maxBuy =
               price.signum() > 0
-                  ? Math.min(limit.buy, cash.divideToIntegralValue(price).longValueExact())
+                  ? Math.min(
+                      limit.buy,
+                      cash.divideToIntegralValue(price.multiply(BigDecimal.valueOf(limit.lotSize)))
+                          .longValueExact())
                   : 0;
           reply(
               out,
@@ -983,7 +1018,8 @@ public final class WholeChainBrokerSimulator implements AutoCloseable {
         var principal =
             TInvestBrokerGateway.decimal(
                     request.getPrice().getUnits(), request.getPrice().getNano())
-                .multiply(BigDecimal.valueOf(request.getQuantity()));
+                .multiply(
+                    BigDecimal.valueOf(pieces(request.getInstrumentId(), request.getQuantity())));
         reply(
             out,
             GetOrderPriceResponse.newBuilder()
