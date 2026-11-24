@@ -17,6 +17,7 @@ import ru.orbita.control.*;
 import ru.orbita.journal.JournalEntry;
 import ru.orbita.notifications.NotificationPublisher;
 import ru.orbita.notifications.NotificationService;
+import ru.orbita.persistence.PostgresTimestampPrecision;
 
 /**
  * Persisted intent barrier is committed before every external trading action. Never retries
@@ -1322,6 +1323,25 @@ public class TradingService implements UnsentIntentStop {
             contradiction(i, "Broker execution exceeds intent or units are unqualified");
             return;
           }
+          boolean recordedFillsOnly = false;
+          if (stream && !raw.trades().isEmpty() && "BUY".equals(i.side)) {
+            var principal = i.originalBuyPrincipalPerLot();
+            // Migrated terminal orders retained at most their fees. Only a booked duplicate
+            // can corroborate the piece-to-lot conversion once the original basis is gone.
+            if (wasFinal && principal == null) {
+              if (evidence.lotsExecuted() > i.executedLots) {
+                contradiction(i, "Unconfirmed execution on migrated final BUY");
+                return;
+              }
+              recordedFillsOnly = true;
+            } else if (principal == null
+                || qualifiedLotSize == null
+                || principal.compareTo(i.limitPrice.multiply(BigDecimal.valueOf(qualifiedLotSize)))
+                    != 0) {
+              contradiction(i, "Mirror trade units contradict original buy reservation");
+              return;
+            }
+          }
           if (evidence.lotsExecuted() < i.executedLots) {
             if (evidence.status() == OrderStatus.FILLED
                 || evidence.status() == OrderStatus.CANCELLED
@@ -1335,6 +1355,13 @@ public class TradingService implements UnsentIntentStop {
                 fill.tradeId() == null
                     ? null
                     : em.find(BrokerFillEntity.class, i.id + ":" + fill.tradeId());
+            if (recordedFillsOnly
+                && (previous == null
+                    || !previous.executedAt.equals(
+                        PostgresTimestampPrecision.normalize(fill.executedAt())))) {
+              contradiction(i, "Unconfirmed trade on migrated final BUY");
+              return;
+            }
             if (fill.tradeId() == null
                 || fill.tradeId().isBlank()
                 || !incomingTradeIds.add(fill.tradeId())
@@ -1523,15 +1550,6 @@ public class TradingService implements UnsentIntentStop {
     List<Fill> fills = new ArrayList<>();
     Set<String> unique = new HashSet<>();
     boolean valid = raw.lotSize() == null || raw.lotSize() == instrument.lotSize();
-    if (!raw.trades().isEmpty() && "BUY".equals(intent.side)) {
-      // A later change in the lot definition cannot qualify piece counts for this attempt.
-      var originalPrincipal = intent.originalBuyPrincipalPerLot();
-      valid &=
-          originalPrincipal != null
-              && originalPrincipal.compareTo(
-                      intent.limitPrice.multiply(BigDecimal.valueOf(instrument.lotSize())))
-                  == 0;
-    }
     for (var t : raw.trades()) {
       if (t.tradeId() == null
           || t.tradeId().isBlank()
