@@ -3605,7 +3605,62 @@ class CopyLifecycleIT {
     trading.reconcileOnly();
     reconciliation.reconcile();
     recovery.recover();
+    assertThat(copies.positions())
+        .singleElement()
+        .satisfies(p -> assertThat(p.copiedLots()).isEqualTo(56));
     trading.dispatchReady();
+    trading.reconcileOnly();
+    assertThirtyLotBuyCorrectionOutcome();
+
+    var sourceRows = db.queryForList("SELECT * FROM source_execution ORDER BY accepted_sequence");
+    var intentRows = db.queryForList("SELECT * FROM copy_intent");
+    var executions =
+        db.query(
+            "SELECT * FROM source_execution ORDER BY accepted_sequence",
+            (row, index) ->
+                new SourceExecution(
+                    row.getString("account_id"),
+                    row.getString("trade_id"),
+                    row.getString("source_order_id"),
+                    row.getString("instrument_id"),
+                    Side.valueOf(row.getString("side")),
+                    row.getBigDecimal("lots"),
+                    row.getBigDecimal("price"),
+                    row.getString("currency"),
+                    row.getTimestamp("executed_at").toInstant(),
+                    row.getTimestamp("received_at").toInstant()));
+    assertThat(executions)
+        .extracting(SourceExecution::tradeId)
+        .containsExactly("allocation-first", "allocation-second", "allocation-sale");
+    executions.forEach(copies::accept);
+    trading.reconcileOnly();
+    reconciliation.reconcile();
+    recovery.recover();
+    trading.dispatchReady();
+    assertThirtyLotBuyCorrectionOutcome();
+    assertThat(db.queryForList("SELECT * FROM source_execution ORDER BY accepted_sequence"))
+        .isEqualTo(sourceRows);
+    assertThat(db.queryForList("SELECT * FROM copy_intent"))
+        .containsExactlyInAnyOrderElementsOf(intentRows);
+  }
+
+  private void assertThirtyLotBuyCorrectionOutcome() {
+    assertThat(
+            control.instruments().stream()
+                .filter(instrument -> instrument.instrumentId().equals("instrument")))
+        .singleElement()
+        .satisfies(instrument -> assertThat(instrument.paused()).isFalse());
+
+    assertThat(
+            db.query(
+                """
+                SELECT executed_lots, skipped_lots
+                FROM copy_intent
+                WHERE side = 'BUY' AND executed_lots + skipped_lots = 30
+                """,
+                (row, index) ->
+                    java.util.List.of(row.getLong("executed_lots"), row.getLong("skipped_lots"))))
+        .containsExactly(java.util.List.of(6L, 24L));
     assertThat(copies.intents().stream().filter(i -> i.side().equals("SELL")))
         .singleElement()
         .satisfies(i -> assertThat(i.executedLots()).isEqualTo(16));
