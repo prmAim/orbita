@@ -500,19 +500,14 @@ class BuyResourceRejectionWholeChainIT {
     assertThat(
             app.getBean(JdbcTemplate.class)
                 .queryForList(
-                    "select lots from broker_fill where intent_id=? and trade_id=?",
-                    BigDecimal.class,
-                    attempt.requestId(),
-                    fillId))
-        .singleElement()
-        .satisfies(lots -> assertThat(lots).isEqualByComparingTo("2"));
-    assertThat(
-            app.getBean(JdbcTemplate.class)
-                .queryForList(
-                    "select trade_id from broker_fill where intent_id=?",
-                    String.class,
+                    "select trade_id, lots from broker_fill where intent_id=?",
                     attempt.requestId()))
-        .containsExactly(fillId);
+        .singleElement()
+        .satisfies(
+            fill -> {
+              assertThat(fill.get("trade_id")).isEqualTo(fillId);
+              assertThat((BigDecimal) fill.get("lots")).isEqualByComparingTo("2");
+            });
     // One remaining lot of ten shares at the original limit, plus 1 RUB fee and 1 RUB extra.
     assertThat((BigDecimal) persisted(attempt.requestId()).get("reserved_money"))
         .isEqualByComparingTo("1007");

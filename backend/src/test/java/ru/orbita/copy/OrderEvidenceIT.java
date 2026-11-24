@@ -34,6 +34,43 @@ class OrderEvidenceIT {
   @Autowired ReconciliationService reconciliation;
   @Autowired PositionRecoveryService recovery;
 
+  @org.junit.jupiter.params.ParameterizedTest
+  @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+  void firstTradeStreamAfterLotSizeChangePreservesFullBuyReserve(boolean legacy) {
+    var request = send(3, 10);
+    trading.apply(state(request, OrderStatus.NEW, 0, 3, 0, null, "bank-order"), false);
+    assertThat(count("ORDER_TRADE_LINK")).isOne();
+    if (legacy)
+      db.update(
+          "update copy_intent set buy_principal_per_lot=null where id=?", request.requestId());
+    var reserve = copies.intents().getFirst().reservedMoney();
+    broker.instrumentLotSize = 5;
+    trading.apply(
+        OrderEvidenceFixtures.trade(
+            request, "changed-size-fill", 10, "bank-order", clock.instant()),
+        false);
+    assertThat(copies.intents())
+        .singleElement()
+        .satisfies(
+            i -> {
+              assertThat(i.status()).isEqualTo("UNKNOWN");
+              assertThat(i.executedLots()).isZero();
+              assertThat(i.reservedMoney()).isEqualByComparingTo(reserve);
+            });
+    assertThat(copies.positions()).allMatch(p -> p.copiedLots() == 0);
+    assertThat(
+            db.queryForObject(
+                "select count(*) from broker_fill where intent_id=?",
+                Long.class,
+                request.requestId()))
+        .isZero();
+    assertThat(count("ORDER_EVIDENCE_CONTRADICTION")).isOne();
+    assertThat(control.instruments())
+        .singleElement()
+        .satisfies(i -> assertThat(i.paused()).isTrue());
+    assertThat(broker.posts).isOne();
+  }
+
   @Test
   void earlierReceivedFillStateWithoutUuidPreventsZeroQualificationAndReplaysAfterExactLink() {
     var request = send(3, 1);

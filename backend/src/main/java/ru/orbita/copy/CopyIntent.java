@@ -91,23 +91,29 @@ public class CopyIntent {
 
   protected CopyIntent() {}
 
+  BigDecimal originalBuyPrincipalPerLot() {
+    if (buyPrincipalPerLot != null) return buyPrincipalPerLot;
+    // Through V20, active BUY orders held the entire original principal plus fees.
+    if (requestedLots <= 0
+        || limitPrice == null
+        || limitPrice.signum() <= 0
+        || commissionReserve == null
+        || commissionReserve.signum() < 0
+        || reservedMoney == null) return null;
+    try {
+      var principal = reservedMoney.subtract(commissionReserve);
+      int lotSize =
+          principal.divide(limitPrice.multiply(BigDecimal.valueOf(requestedLots))).intValueExact();
+      return lotSize > 0 ? limitPrice.multiply(BigDecimal.valueOf(lotSize)) : null;
+    } catch (ArithmeticException unproven) {
+      return null;
+    }
+  }
+
   void reserveRemainingBuyPrincipal() {
     if (!"BUY".equals(side) || executedLots <= 0 || executedLots >= requestedLots) return;
-    if (buyPrincipalPerLot == null) {
-      // Through V20, active partial BUY orders held the entire original principal plus fees.
-      if (limitPrice == null || limitPrice.signum() <= 0 || commissionReserve.signum() < 0) return;
-      try {
-        var principal = reservedMoney.subtract(commissionReserve);
-        int originalLotSize =
-            principal
-                .divide(limitPrice.multiply(BigDecimal.valueOf(requestedLots)))
-                .intValueExact();
-        if (originalLotSize <= 0) return;
-        buyPrincipalPerLot = limitPrice.multiply(BigDecimal.valueOf(originalLotSize));
-      } catch (ArithmeticException unproven) {
-        return;
-      }
-    }
+    buyPrincipalPerLot = originalBuyPrincipalPerLot();
+    if (buyPrincipalPerLot == null) return;
     var remaining = BigDecimal.valueOf(requestedLots - executedLots);
     reservedMoney = buyPrincipalPerLot.multiply(remaining).add(commissionReserve);
   }

@@ -1318,15 +1318,15 @@ public class TradingService implements UnsentIntentStop {
                           i.instrumentId, i.side, i.executedLots, i.lots, i.skippedLots, i.reason));
             return;
           }
+          if (evidence.lotsExecuted() > i.requestedLots || evidence.lotsExecuted() < 0) {
+            contradiction(i, "Broker execution exceeds intent or units are unqualified");
+            return;
+          }
           if (evidence.lotsExecuted() < i.executedLots) {
             if (evidence.status() == OrderStatus.FILLED
                 || evidence.status() == OrderStatus.CANCELLED
                 || evidence.status() == OrderStatus.REJECTED)
               contradiction(i, "Terminal evidence contradicts confirmed fills");
-            return;
-          }
-          if (evidence.lotsExecuted() > i.requestedLots || evidence.lotsExecuted() < 0) {
-            contradiction(i, "Broker execution exceeds intent or units are unqualified");
             return;
           }
           Set<String> incomingTradeIds = new HashSet<>();
@@ -1523,12 +1523,14 @@ public class TradingService implements UnsentIntentStop {
     List<Fill> fills = new ArrayList<>();
     Set<String> unique = new HashSet<>();
     boolean valid = raw.lotSize() == null || raw.lotSize() == instrument.lotSize();
-    if (!raw.trades().isEmpty() && intent.buyPrincipalPerLot != null) {
+    if (!raw.trades().isEmpty() && "BUY".equals(intent.side)) {
       // A later change in the lot definition cannot qualify piece counts for this attempt.
+      var originalPrincipal = intent.originalBuyPrincipalPerLot();
       valid &=
-          intent.buyPrincipalPerLot.compareTo(
-                  intent.limitPrice.multiply(BigDecimal.valueOf(instrument.lotSize())))
-              == 0;
+          originalPrincipal != null
+              && originalPrincipal.compareTo(
+                      intent.limitPrice.multiply(BigDecimal.valueOf(instrument.lotSize())))
+                  == 0;
     }
     for (var t : raw.trades()) {
       if (t.tradeId() == null
