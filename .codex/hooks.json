@@ -1,0 +1,41 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "C:\\Git\\orbita\\.venv\\Scripts\\python.exe -X utf8 C:\\Git\\orbita\\tools\\codex_langfuse_hook.py",
+            "statusMessage": "Tracing Orbita project chat in local Langfuse",
+            "type": "command",
+            "timeout": 12
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "command": "C:\\Git\\orbita\\.venv\\Scripts\\python.exe -X utf8 C:\\Git\\orbita\\tools\\codex_langfuse_hook.py",
+            "statusMessage": "Tracing Orbita project chat in local Langfuse",
+            "type": "command",
+            "timeout": 12
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^mcp__context7__(resolve_library_id|query_docs)$",
+        "hooks": [
+          {
+            "command": "C:\\Git\\orbita\\.venv\\Scripts\\python.exe -X utf8 C:\\Git\\orbita\\tools\\codex_langfuse_hook.py",
+            "statusMessage": "Tracing Orbita project chat in local Langfuse",
+            "type": "command",
+            "timeout": 12
+          }
+        ]
+      }
+    ]
+  }
+}
